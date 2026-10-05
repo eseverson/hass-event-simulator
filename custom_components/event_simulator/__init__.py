@@ -29,6 +29,7 @@ from .const import (
     PANEL_URL_PATH,
     PANEL_WEBCOMPONENT,
 )
+from .store import DATA_STORE, ScenarioStore
 
 _DATA_VIEW_REGISTERED = f"{DOMAIN}_view_registered"
 
@@ -60,6 +61,9 @@ def _module_url(version: str, panel_js: Path) -> str:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    store = ScenarioStore(hass)
+    await store.async_load()
+    hass.data[DATA_STORE] = store
     websocket.async_register(hass)
     await _async_register_panel(hass)
     return True
@@ -67,6 +71,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     frontend.async_remove_panel(hass, PANEL_URL_PATH, warn_if_unknown=False)
+    hass.data.pop(DATA_STORE, None)
     return True
 
 

@@ -15,6 +15,7 @@ from homeassistant.helpers import config_validation as cv
 from . import history
 from .const import DOMAIN
 from .history import SimulatorError
+from .store import DATA_STORE, SCENARIO_FIELDS, ScenarioStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,6 +45,10 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_automations)
     websocket_api.async_register_command(hass, ws_automation)
     websocket_api.async_register_command(hass, ws_history)
+    websocket_api.async_register_command(hass, ws_scenarios_list)
+    websocket_api.async_register_command(hass, ws_scenarios_get)
+    websocket_api.async_register_command(hass, ws_scenarios_save)
+    websocket_api.async_register_command(hass, ws_scenarios_delete)
     # event_simulator/simulate is registered here once the runner exists.
 
 
@@ -81,3 +86,54 @@ async def ws_history(hass, connection, msg: dict[str, Any]) -> None:
         msg["id"],
         await history.async_get_timeline(hass, msg["entity_ids"], msg["start"], msg["end"]),
     )
+
+
+def _store(hass: HomeAssistant) -> ScenarioStore:
+    if (store := hass.data.get(DATA_STORE)) is None:
+        raise SimulatorError("not_loaded", "Event Simulator is not set up")
+    return store
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/scenarios/list"})
+@websocket_api.async_response
+@_wrap
+async def ws_scenarios_list(hass, connection, msg: dict[str, Any]) -> None:
+    connection.send_result(msg["id"], _store(hass).summaries())
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): f"{DOMAIN}/scenarios/get", vol.Required("scenario_id"): str}
+)
+@websocket_api.async_response
+@_wrap
+async def ws_scenarios_get(hass, connection, msg: dict[str, Any]) -> None:
+    connection.send_result(msg["id"], _store(hass).get(msg["scenario_id"]))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/scenarios/save",
+        vol.Optional("scenario_id"): str,
+        **SCENARIO_FIELDS,
+    }
+)
+@websocket_api.async_response
+@_wrap
+async def ws_scenarios_save(hass, connection, msg: dict[str, Any]) -> None:
+    connection.send_result(
+        msg["id"], await _store(hass).async_save_scenario(msg, msg.get("scenario_id"))
+    )
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): f"{DOMAIN}/scenarios/delete", vol.Required("scenario_id"): str}
+)
+@websocket_api.async_response
+@_wrap
+async def ws_scenarios_delete(hass, connection, msg: dict[str, Any]) -> None:
+    await _store(hass).async_delete(msg["scenario_id"])
+    connection.send_result(msg["id"])
