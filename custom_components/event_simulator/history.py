@@ -55,6 +55,11 @@ _QUOTED_LITERAL = re.compile(r"""['"]([^'"\n]{1,100})['"]""")
 # hides the rest, so literals naming an existing entity are added too.
 _QUOTED_ENTITY_ID = re.compile(r"""['"]([a-z0-9_]+\.[a-z0-9_]+)['"]""")
 
+# Options that may name an entity instead of a literal: a time trigger's or time condition's `at` / `after` / `before` (input_datetime, timestamp sensor), a numeric_state threshold, a zone condition's zone. HA's `referenced_entities` reads only `entity_id` (and misses even that for platform conditions such as `zone`, whose validated config nests it under `options`), so a replay would lack these states and, say, a time trigger on an input_datetime would never fire.
+_ENTITY_VALUED_KEYS = frozenset({"entity_id", "at", "after", "before", "above", "below", "zone"})
+# A state condition's `state` names an entity only for these domains (HA's own `INPUT_ENTITY_ID`); anything else is a literal state.
+_INPUT_ENTITY_ID = re.compile(r"^input_(?:select|text|number|boolean|datetime)\.[\da-z_]+$")
+
 
 class SimulatorError(Exception):
     """A request the simulator refuses, with a code for the websocket error."""
@@ -128,6 +133,7 @@ def async_get_automation(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
     config = entity.raw_config or {}
     referenced = set(entity.referenced_entities)
     referenced |= _template_entities(hass, _template_strings(config))
+    referenced |= _entity_valued_options(config)
     return {"config": config, "referenced_entities": sorted(referenced)}
 
 
@@ -464,6 +470,32 @@ def _template_strings(node: Any) -> Iterator[str]:
     elif isinstance(node, list):
         for value in node:
             yield from _template_strings(value)
+
+
+def _entity_valued_options(node: Any) -> set[str]:
+    """Entity ids given as the value of an option that also takes a literal (see `_ENTITY_VALUED_KEYS`), anywhere in the config."""
+    found: set[str] = set()
+    stack = [node]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, list):
+            stack.extend(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        for key, value in item.items():
+            if key in _ENTITY_VALUED_KEYS or key == "state":
+                values = value if isinstance(value, list) else [value]
+                for candidate in values:
+                    if isinstance(candidate, dict):  # `at: {entity_id: ..., offset: ...}`
+                        candidate = candidate.get("entity_id")
+                    if not isinstance(candidate, str) or not valid_entity_id(candidate):
+                        continue
+                    if key != "state" or _INPUT_ENTITY_ID.match(candidate):
+                        found.add(candidate)
+            if isinstance(value, (dict, list)):
+                stack.append(value)
+    return found
 
 
 def _template_entities(hass: HomeAssistant, templates: Iterable[str]) -> set[str]:

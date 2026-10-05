@@ -289,3 +289,53 @@ async def test_timeline_refuses_too_many_events(
         )
 
     assert err.value.code == "too_many_events"
+
+
+async def test_referenced_entities_include_entity_valued_options(hass: HomeAssistant):
+    """Entities named as a time, a threshold, a zone or a state to match are timeline inputs too.
+
+    HA's own `referenced_entities` only reads `entity_id`, so without these a time trigger on an input_datetime never fires in a replay.
+    """
+    config = {
+        "id": "entity_options",
+        "alias": "Entity options",
+        "triggers": [
+            {"trigger": "time", "at": ["input_datetime.alarm", "07:00:00"]},
+            {"trigger": "time", "at": {"entity_id": "sensor.next_alarm", "offset": "-00:05:00"}},
+            {"trigger": "numeric_state", "entity_id": "sensor.temp", "above": "input_number.high"},
+        ],
+        "conditions": [
+            {"condition": "time", "after": "input_datetime.wake", "before": "sensor.bedtime"},
+            {"condition": "numeric_state", "entity_id": "sensor.temp", "below": "number.cap"},
+            {"condition": "state", "entity_id": "input_select.mode", "state": "input_select.wanted"},
+            {"condition": "zone", "entity_id": "person.me", "zone": "zone.work"},
+            {"condition": "sun", "after": "sunrise"},
+        ],
+        "actions": [
+            {
+                "wait_for_trigger": [{"trigger": "time", "at": "input_datetime.deadline"}],
+                "timeout": 60,
+            },
+            {"action": "notify.notify", "data": {"message": "at 07:00"}},
+        ],
+    }
+    assert await async_setup_component(hass, "automation", {"automation": [config]})
+    await hass.async_block_till_done()
+
+    result = history.async_get_automation(hass, "automation.entity_options")
+
+    assert result["referenced_entities"] == [
+        "input_datetime.alarm",
+        "input_datetime.deadline",
+        "input_datetime.wake",
+        "input_number.high",
+        "input_select.mode",
+        "input_select.wanted",
+        "number.cap",
+        "person.me",
+        "sensor.bedtime",
+        "sensor.next_alarm",
+        "sensor.temp",
+        "zone.work",
+    ]
+
