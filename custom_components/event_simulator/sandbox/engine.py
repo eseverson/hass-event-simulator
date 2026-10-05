@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import voluptuous as vol
+# Home Assistant before voluptuous: from 2026.9 importing `homeassistant` aliases `voluptuous` to probatio, which then raises the validation errors. Imported the other way round, `vol` here is the real voluptuous, `vol.Invalid` misses them, and an invalid automation crashes the replay.
 from homeassistant import bootstrap, config_entries, loader
 from homeassistant.components import labs
 from homeassistant.components.automation import DATA_COMPONENT as AUTOMATION_COMPONENT
@@ -72,6 +72,7 @@ from homeassistant.helpers.json import ExtendedJSONEncoder
 from homeassistant.helpers.trace import trace_id_get
 from homeassistant.loader import IntegrationNotFound, async_get_integration
 from homeassistant.setup import async_setup_component
+import voluptuous as vol  # noqa: I001 - after homeassistant, see above
 from voluptuous.humanize import humanize_error
 
 from .vclock import VirtualClock, patch_homeassistant_clock
