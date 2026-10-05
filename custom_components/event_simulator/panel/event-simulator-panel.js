@@ -278,8 +278,89 @@ export function normalizeResult(raw) {
       raw: c,
     }))
     .filter((c) => Number.isFinite(c.t));
-  const warnings = (Array.isArray(r.warnings) ? r.warnings : []).map((w) => (typeof w === "string" ? w : JSON.stringify(w)));
+  const warnings = (Array.isArray(r.warnings) ? r.warnings : []).map(normalizeWarning);
   return { runs, calls, warnings };
+}
+
+/* A result warning as {code, message, at}: `at` in ms or null. The engine sends
+ * {code, message, at}; a bare string or any other shape still comes out readable. */
+export function normalizeWarning(w) {
+  if (typeof w === "string") return { code: "", message: w, at: null };
+  if (!isObject(w)) return { code: "", message: JSON.stringify(w) ?? String(w), at: null };
+  const at = parseTime(w.at);
+  const message = w.message == null ? JSON.stringify(w) : String(w.message);
+  return { code: w.code == null ? "" : String(w.code), message, at: Number.isFinite(at) ? at : null };
+}
+
+/* What each engine warning code means, as a group heading (see sandbox/engine.py). */
+export const WARNING_LABELS = {
+  event_outside_window: "Events outside the window were skipped",
+  initial_state_after_start: "Initial states recorded after the window start",
+  initial_state_ignored: "The automation's initial_state was ignored",
+  late_attach: "The automation attached late",
+  run_unfinished: "Runs still going when the replay stopped",
+  unknown_service: "Service calls to services this instance does not have",
+  log: "Home Assistant logged warnings or errors",
+  log_truncated: "More log messages were left out",
+};
+
+/* A heading for a warning code nobody listed: `some_code` -> "Some code". */
+export function warningLabel(code) {
+  if (!code) return "Other warnings";
+  if (WARNING_LABELS[code]) return WARNING_LABELS[code];
+  const words = String(code).replace(/[_-]+/g, " ").trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+/* Warnings grouped by code, groups in order of first appearance, each group's items in
+ * time order (untimed ones first, as they come from checking the scenario before the
+ * replay starts). [{code, label, items: [{code, message, at}]}] */
+export function groupWarnings(warnings) {
+  const groups = new Map();
+  for (const raw of warnings || []) {
+    const w = isObject(raw) && "code" in raw && "message" in raw && (raw.at === null || typeof raw.at === "number") ? raw : normalizeWarning(raw);
+    if (!groups.has(w.code)) groups.set(w.code, { code: w.code, label: warningLabel(w.code), items: [] });
+    groups.get(w.code).items.push(w);
+  }
+  const key = (w) => (w.at == null ? -Infinity : w.at);
+  return [...groups.values()].map((g) => ({ ...g, items: g.items.slice().sort((a, b) => key(a) - key(b)) }));
+}
+
+/* Headings for the error codes a simulate call can fail with (runner.py, websocket.py,
+ * the child's structured refusals). */
+const RUN_ERROR_TITLES = {
+  timeout: "The replay took too long and was stopped",
+  sandbox_failed: "The sandbox crashed",
+  output_too_large: "The replay produced too much output",
+  invalid_scenario: "The sandbox refused the scenario",
+  invalid_automation: "The automation config is not valid",
+  internal_error: "The sandbox hit an internal error",
+  too_many_events: "Too many state changes to replay",
+  too_many_entities: "Too many entities to replay",
+  too_large: "The scenario is too large to replay",
+  invalid_window: "The window is not valid",
+  invalid_format: "Home Assistant refused the request",
+  unknown_command: "Simulation is not available",
+};
+
+/* A failed simulate call, from the rejection callWS hands back (or a structured `error`
+ * in a result): {title, message, code, stderr}. */
+export function describeRunError(err) {
+  if (err?.code === "unknown_command") {
+    return {
+      title: RUN_ERROR_TITLES.unknown_command,
+      message:
+        "This build of the integration cannot run simulations yet: the backend has no event_simulator/simulate command. Update the integration and restart Home Assistant.",
+      code: "unknown_command",
+      stderr: "",
+    };
+  }
+  const nested = isObject(err?.error) ? err.error : null;
+  const code = String(err?.code ?? nested?.code ?? "") || null;
+  let message = err?.message ?? nested?.message ?? (typeof err?.error === "string" ? err.error : null);
+  if (message == null) message = typeof err === "string" ? err : err == null ? "" : String(err);
+  const stderr = String(err?.stderr_tail ?? nested?.stderr_tail ?? err?.stderr ?? "").replace(/\s+$/, "");
+  return { title: (code && RUN_ERROR_TITLES[code]) || "The run failed", message: String(message), code, stderr };
 }
 
 /* Service calls a run made: matched by the run's index, or by its id when it has one. */
@@ -598,6 +679,114 @@ export class EditHistory {
   }
 }
 
+// ---- saved scenarios (pure) -------------------------------------------------
+//
+// A saved scenario (store.py) is the panel's state on the server: the automation config
+// Run would send (edited or not) and the entity it came from, the window, the tracks
+// in order, and each track's timeline. Timelines are saved with their `edited` marks so
+// a loaded scenario draws its edited changes exactly as they were.
+
+export const MAX_SCENARIO_NAME = 100; // store.MAX_NAME_LENGTH
+
+/* The body of event_simulator/scenarios/save for the panel's current state. Times go
+ * out as UTC ISO strings with a `Z`, the offset the store insists on. */
+export function scenarioPayload({ name, entityId, automation, start, end, tracks }) {
+  const initial_states = {};
+  const events = [];
+  for (const track of tracks) {
+    if (track.initial) initial_states[track.entity_id] = track.initial;
+    for (const ev of track.events) events.push(ev);
+  }
+  events.sort((a, b) => parseTime(a.at) - parseTime(b.at));
+  return {
+    name: String(name ?? "").trim(),
+    automation_entity_id: entityId || null,
+    automation,
+    start: new Date(start).toISOString(),
+    end: new Date(end).toISOString(),
+    entity_ids: tracks.map((t) => t.entity_id),
+    initial_states,
+    events,
+  };
+}
+
+/* The tracks a saved scenario describes: [{entity_id, initial, events}] in its
+ * `entity_ids` order, then any entity that only appears in its timeline. Each track's
+ * events keep their saved order among equal times. */
+export function tracksFromScenario(scenario) {
+  const ids = [...(Array.isArray(scenario?.entity_ids) ? scenario.entity_ids : [])];
+  const initials = isObject(scenario?.initial_states) ? scenario.initial_states : {};
+  const events = (Array.isArray(scenario?.events) ? scenario.events : []).filter((ev) => isObject(ev) && ev.entity_id);
+  for (const id of [...Object.keys(initials), ...events.map((ev) => ev.entity_id)]) if (!ids.includes(id)) ids.push(id);
+  return ids.map((entity_id) => ({
+    entity_id,
+    initial: initials[entity_id] || null,
+    events: events.filter((ev) => ev.entity_id === entity_id).sort((a, b) => parseTime(a.at) - parseTime(b.at)),
+  }));
+}
+
+/* A comparable key for a state write, whatever format its time strings arrived in. */
+function itemKey(item) {
+  return stableStringify({ ...item, at: parseTime(item.at) });
+}
+
+/* A loaded timeline with every unedited item swapped for the equal item of the recorded
+ * history, so the identity checks of timelineEdited and the editor treat it as recorded.
+ * Items marked `edited`, and recorded ones history no longer has, stay as loaded. */
+export function adoptRecorded(loaded, recorded) {
+  if (!recorded) return loaded;
+  const pool = new Map();
+  for (const ev of recorded.events) {
+    const key = itemKey(ev);
+    if (!pool.has(key)) pool.set(key, []);
+    pool.get(key).push(ev);
+  }
+  const events = loaded.events.map((ev) => (ev.edited ? ev : pool.get(itemKey(ev))?.shift() ?? ev));
+  const initial =
+    loaded.initial && recorded.initial && !loaded.initial.edited && stableStringify(loaded.initial) === stableStringify(recorded.initial)
+      ? recorded.initial
+      : loaded.initial;
+  return { initial, events };
+}
+
+/* What "unsaved changes" compares: everything a save would write except the name. */
+export function scenarioFingerprint(payload) {
+  const { name, ...rest } = payload;
+  return stableStringify(rest);
+}
+
+/* A scenario name as typed: {ok, value} or {ok: false, error}. */
+export function checkScenarioName(text) {
+  const value = String(text ?? "").trim();
+  if (!value) return { ok: false, error: "Give the scenario a name." };
+  if (value.length > MAX_SCENARIO_NAME) return { ok: false, error: `Names can be at most ${MAX_SCENARIO_NAME} characters.` };
+  return { ok: true, value };
+}
+
+/* Friendly text for a failed scenarios/* command, by its error code. */
+export function scenarioErrorMessage(err, action = "save") {
+  const code = err?.code;
+  const detail = err?.message ? ` (${err.message})` : "";
+  switch (code) {
+    case "not_found":
+      return "That scenario no longer exists; it may have been deleted in another window. The list is refreshed.";
+    case "invalid_window":
+      return "The window is not valid: it must end after it starts and be at most 7 days long.";
+    case "too_large":
+      return `This scenario is too large to save: at most 50,000 state changes and 50 tracks${detail}.`;
+    case "too_many":
+      return "There are already 100 saved scenarios. Delete one before saving another.";
+    case "invalid_format":
+      return `Home Assistant did not accept the scenario's data${detail}.`;
+    case "unknown_command":
+      return "This build of the integration cannot save scenarios. Update it and restart Home Assistant.";
+    default: {
+      const verb = { save: "save", load: "load", delete: "delete", list: "list" }[action] || action;
+      return `Could not ${verb} the scenario${action === "list" ? "s" : ""}: ${err?.message || err || "unknown error"}`;
+    }
+  }
+}
+
 // ---- panel ----------------------------------------------------------------
 
 const HOUR = 3600e3;
@@ -709,6 +898,20 @@ class EventSimulatorPanel extends Base {
     this._cfgEl = null; // the ha-yaml-editor or textarea
     this._cfgDraft = null;
     this._cfgError = null;
+    // Saved scenarios. `_scenario` is the one loaded or last saved ({scenario_id, name});
+    // `_savedPrint` the scenarioFingerprint of the panel state it was saved or loaded as.
+    this._scenarios = null; // summaries from scenarios/list, once loaded
+    this._scenariosOpen = false;
+    this._scenario = null;
+    this._savedPrint = null;
+    this._saveForm = null; // {name, asNew}: the name prompt, while open
+    this._scError = null;
+    this._scInfo = null;
+    this._scBusy = false;
+    this._confirm = null; // {kind: "delete" | "load", id}
+    this._printCache = null;
+    this._focusName = false; // focus the name prompt on the next render
+    this._open = {}; // open state of <details data-key>, kept across redraws
   }
 
   set hass(hass) {
@@ -752,6 +955,7 @@ class EventSimulatorPanel extends Base {
       this._yamlState = ok ? "ready" : "unavailable";
       this._renderConfig();
     });
+    this._listScenarios();
     try {
       this._automations = await this._hass.callWS({ type: "event_simulator/automations" });
       this._loading = null;
@@ -812,21 +1016,14 @@ class EventSimulatorPanel extends Base {
     this._loading = `Loading history for ${ids.length} ${ids.length === 1 ? "entity" : "entities"}…`;
     this._render();
     try {
-      const timeline = await this._hass.callWS({
-        type: "event_simulator/history",
-        entity_ids: ids,
-        start: new Date(this._window.start).toISOString(),
-        end: new Date(this._window.end).toISOString(),
-      });
+      const byEntity = await this._fetchHistory(ids);
       if (token !== this._requestToken) return;
-      const byEntity = new Map(ids.map((id) => [id, []]));
-      for (const ev of timeline.events || []) byEntity.get(ev.entity_id)?.push(ev);
       for (const track of this._tracks) {
-        if (!byEntity.has(track.entity_id)) continue;
-        track.initial = timeline.initial_states?.[track.entity_id] || null;
-        // Stable sort: the editing helpers rely on time order, same-instant writes keep theirs.
-        track.events = byEntity.get(track.entity_id).sort((a, b) => parseTime(a.at) - parseTime(b.at));
-        track.recorded = { initial: track.initial, events: track.events };
+        const recorded = byEntity.get(track.entity_id);
+        if (!recorded) continue;
+        track.initial = recorded.initial;
+        track.events = recorded.events;
+        track.recorded = recorded;
         this._prepareTrack(track);
       }
     } catch (e) {
@@ -835,6 +1032,28 @@ class EventSimulatorPanel extends Base {
     }
     this._loading = null;
     this._render();
+  }
+
+  /* Recorded timelines of `ids` in the current window: Map entity_id -> {initial, events}. */
+  async _fetchHistory(ids) {
+    const timeline = await this._hass.callWS({
+      type: "event_simulator/history",
+      entity_ids: ids,
+      start: new Date(this._window.start).toISOString(),
+      end: new Date(this._window.end).toISOString(),
+    });
+    const byEntity = new Map(ids.map((id) => [id, []]));
+    for (const ev of timeline.events || []) byEntity.get(ev.entity_id)?.push(ev);
+    return new Map(
+      ids.map((id) => [
+        id,
+        {
+          initial: timeline.initial_states?.[id] || null,
+          // Stable sort: the editing helpers rely on time order, same-instant writes keep theirs.
+          events: byEntity.get(id).sort((a, b) => parseTime(a.at) - parseTime(b.at)),
+        },
+      ])
+    );
   }
 
   _prepareTrack(track) {
@@ -1083,6 +1302,7 @@ class EventSimulatorPanel extends Base {
     }
     this._markStale();
     this._updateConfigStatus();
+    this._updateDirty();
     // Run's enabled state and hint live in the main area; redraw it only on a change of state.
     if (before[0] !== (this._cfgDraft !== null) || before[1] !== !!this._cfgError) this._render();
   }
@@ -1205,24 +1425,239 @@ class EventSimulatorPanel extends Base {
     try {
       const raw = await this._hass.callWS({ type: "event_simulator/simulate", scenario });
       if (raw && raw.error && !Array.isArray(raw.runs)) {
-        this._runError = { message: String(raw.error), stderr: raw.stderr_tail || "" };
+        this._runError = describeRunError({ ...(isObject(raw.error) ? raw.error : { message: String(raw.error) }), stderr_tail: raw.stderr_tail });
       } else {
         this._result = normalizeResult(raw);
         this._resultStale = false;
         this._selectedRun = this._result.runs[0]?.index ?? null;
       }
     } catch (e) {
-      this._runError =
-        e?.code === "unknown_command"
-          ? {
-              message:
-                "This build of the integration cannot run simulations yet: the backend has no event_simulator/simulate command. Update the integration and restart Home Assistant.",
-              code: e.code,
-            }
-          : { message: e?.message || String(e), code: e?.code || null, stderr: e?.stderr_tail || "" };
+      this._runError = describeRunError(e);
     }
     this._running = false;
     this._render();
+  }
+
+
+  // ---- saved scenarios --------------------------------------------------------
+
+  _payload(name = "") {
+    return scenarioPayload({
+      name,
+      entityId: this._entityId,
+      automation: this._runConfig(),
+      start: this._window.start,
+      end: this._window.end,
+      tracks: this._tracks,
+    });
+  }
+
+  /* scenarioFingerprint of the current state. Timelines are immutable and replaced on
+   * every edit, so the costly part is cached on their identity. */
+  _fingerprint() {
+    const parts = [this._entityId, this._window.start, this._window.end, ...this._tracks.flatMap((t) => [t.entity_id, t.initial, t.events])];
+    const c = this._printCache;
+    if (!c || c.parts.length !== parts.length || c.parts.some((x, i) => x !== parts[i]) || c.config !== this._runConfig()) {
+      this._printCache = { parts, config: this._runConfig(), print: scenarioFingerprint(this._payload()) };
+    }
+    return this._printCache.print;
+  }
+
+  /* "saved", "dirty", "new" (never saved) or null (nothing to save yet). */
+  _saveState() {
+    if (!this._automation) return null;
+    if (!this._scenario) return "new";
+    return this._fingerprint() === this._savedPrint ? "saved" : "dirty";
+  }
+
+  _canSave() {
+    return !!this._automation && !this._loading && !this._cfgError && !this._scBusy;
+  }
+
+  /* The save-state chip, redrawn on its own while the config editor is typed in. */
+  _updateDirty() {
+    const chip = this.shadowRoot.getElementById("sc-state");
+    if (!chip) return;
+    const state = this._saveState();
+    const [cls, text, title] = {
+      saved: ["pass", "saved", "Matches the saved scenario"],
+      dirty: ["edited", "unsaved changes", "Differs from the saved scenario; Save to keep the changes"],
+      new: ["none", "not saved", "Save keeps this automation, window, tracks and edits as a named scenario"],
+    }[state] || ["", "", ""];
+    chip.hidden = !state;
+    chip.className = `chip ${cls}`;
+    chip.textContent = text;
+    chip.title = title;
+  }
+
+  async _listScenarios() {
+    try {
+      this._scenarios = await this._hass.callWS({ type: "event_simulator/scenarios/list" });
+    } catch (e) {
+      this._scenarios = this._scenarios || [];
+      this._scError = scenarioErrorMessage(e, "list");
+    }
+    this._render();
+  }
+
+  _defaultName() {
+    const alias = this._automation?.config?.alias || this._entityId || "Scenario";
+    const d = new Date(this._window.start);
+    return `${alias} — ${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })}`.slice(0, MAX_SCENARIO_NAME);
+  }
+
+  /* Save: overwrite the loaded scenario, or ask for a name when there is none. */
+  _onSave(asNew) {
+    this._scError = null;
+    this._scInfo = null;
+    this._confirm = null;
+    if (!asNew && this._scenario) return this._saveScenario(false, this._scenario.name);
+    const base = this._scenario ? `${this._scenario.name} (copy)` : this._defaultName();
+    this._saveForm = { name: base.slice(0, MAX_SCENARIO_NAME), asNew };
+    this._focusName = true;
+    this._render();
+  }
+
+  async _saveScenario(asNew, name) {
+    if (!this._canSave()) return;
+    const check = checkScenarioName(name);
+    if (!check.ok) {
+      this._scError = check.error;
+      return this._render();
+    }
+    const payload = this._payload(check.value);
+    const overwrite = !asNew && this._scenario ? this._scenario.scenario_id : null;
+    this._scBusy = true;
+    this._scError = null;
+    this._render();
+    try {
+      const summary = await this._hass.callWS({
+        type: "event_simulator/scenarios/save",
+        ...payload,
+        ...(overwrite ? { scenario_id: overwrite } : {}),
+      });
+      this._scenario = { scenario_id: summary.scenario_id, name: summary.name };
+      this._savedPrint = scenarioFingerprint(payload);
+      this._saveForm = null;
+      this._scInfo = `Saved “${summary.name}”.`;
+    } catch (e) {
+      this._scError = scenarioErrorMessage(e, "save");
+      if (e?.code === "not_found" && overwrite) {
+        // Deleted elsewhere: what is on screen is now an unsaved scenario.
+        this._scenario = null;
+        this._savedPrint = null;
+        this._scError = "The loaded scenario was deleted elsewhere, so there is nothing to overwrite. Use Save as to keep this one.";
+      }
+    }
+    this._scBusy = false;
+    await this._listScenarios();
+  }
+
+  async _loadScenario(id, confirmed = false) {
+    if (!confirmed && this._saveState() === "dirty") {
+      this._confirm = { kind: "load", id };
+      return this._render();
+    }
+    this._confirm = null;
+    this._scError = null;
+    this._scInfo = null;
+    this._saveForm = null;
+    this._scBusy = true;
+    this._render();
+    let record;
+    try {
+      record = await this._hass.callWS({ type: "event_simulator/scenarios/get", scenario_id: id });
+    } catch (e) {
+      this._scBusy = false;
+      this._scError = scenarioErrorMessage(e, "load");
+      if (e?.code === "not_found") return this._listScenarios();
+      return this._render();
+    }
+    const token = ++this._requestToken;
+    const start = parseTime(record.start);
+    const end = parseTime(record.end);
+    const entityId = record.automation_entity_id || "";
+    this._entityId = entityId;
+    this._automation = null;
+    this._tracks = [];
+    this._clearResult();
+    this._clearEdits();
+    this._cfgDraft = null;
+    this._cfgError = null;
+    this._error = null;
+    this._notice = null;
+    this._preset = null;
+    this._window = { start, end };
+    this._view = [start, end];
+    this._scenario = { scenario_id: record.scenario_id, name: record.name };
+    this._savedPrint = null;
+    this._loading = `Loading scenario “${record.name}”…`;
+    this._renderConfig();
+    this._render();
+    const notices = [];
+    let live = null;
+    if (entityId) {
+      try {
+        live = await this._hass.callWS({ type: "event_simulator/automation", entity_id: entityId });
+      } catch (e) {
+        notices.push(`${entityId} could not be loaded (${e.message || e}), so the scenario runs its saved config.`);
+      }
+    }
+    if (token !== this._requestToken) return;
+    const saved = isObject(record.automation) ? record.automation : {};
+    this._automation = live || { config: saved, referenced_entities: [] };
+    // The saved config is what Run sent; against the live automation it is an edit or not.
+    this._cfgDraft = stableStringify(saved) === stableStringify(this._automation.config) ? null : saved;
+    this._renderConfig();
+    const loaded = tracksFromScenario(record);
+    let recorded = new Map();
+    if (loaded.length) {
+      try {
+        recorded = await this._fetchHistory(loaded.map((t) => t.entity_id));
+      } catch (e) {
+        notices.push(`The recorded history could not be loaded (${e.message || e}), so the tracks cannot be compared with it or reset to it.`);
+      }
+    }
+    if (token !== this._requestToken) return;
+    this._tracks = loaded.map((track) => {
+      const history = recorded.get(track.entity_id) || null;
+      const timeline = adoptRecorded(track, history);
+      const out = { entity_id: track.entity_id, ...timeline, recorded: history || timeline };
+      this._prepareTrack(out);
+      return out;
+    });
+    this._savedPrint = this._fingerprint();
+    this._loading = null;
+    this._scBusy = false;
+    this._scInfo = `Loaded “${record.name}”.`;
+    this._notice = notices.join(" ") || null;
+    this._render();
+  }
+
+  async _deleteScenario(id, confirmed = false) {
+    if (!confirmed) {
+      this._confirm = { kind: "delete", id };
+      return this._render();
+    }
+    this._confirm = null;
+    this._scError = null;
+    this._scInfo = null;
+    this._scBusy = true;
+    this._render();
+    const name = this._scenarios?.find((s) => s.scenario_id === id)?.name || "the scenario";
+    try {
+      await this._hass.callWS({ type: "event_simulator/scenarios/delete", scenario_id: id });
+      this._scInfo = `Deleted “${name}”.`;
+    } catch (e) {
+      if (e?.code !== "not_found") this._scError = scenarioErrorMessage(e, "delete");
+    }
+    if (this._scenario?.scenario_id === id) {
+      // What is on screen stays; it is just no longer saved anywhere.
+      this._scenario = null;
+      this._savedPrint = null;
+    }
+    this._scBusy = false;
+    await this._listScenarios();
   }
 
   // ---- rendering ----------------------------------------------------------
@@ -1235,11 +1670,18 @@ class EventSimulatorPanel extends Base {
       this.shadowRoot.addEventListener("change", (ev) => this._onChange(ev));
       this.shadowRoot.addEventListener("input", (ev) => this._onInput(ev));
       this.shadowRoot.addEventListener("keydown", (ev) => this._onKeydown(ev));
+      // `toggle` does not bubble; capture still sees it. Keeps <details> open across redraws.
+      this.shadowRoot.addEventListener("toggle", (ev) => {
+        const key = ev.target?.dataset?.key;
+        if (key) this._open[key] = ev.target.open;
+      }, true);
     }
     const root = this.shadowRoot.getElementById("root");
     const addValue = root.querySelector("#add-track")?.value || "";
     // The timeline keeps keyboard focus across a redraw, so Delete and Ctrl+Z keep working.
     const timelineFocused = this.shadowRoot.activeElement?.id === "tl-wrap";
+    const nameInput = this.shadowRoot.activeElement?.id === "sc-name" ? this.shadowRoot.activeElement : null;
+    const caret = nameInput ? [nameInput.selectionStart, nameInput.selectionEnd] : null;
     root.innerHTML = this._html();
     this.shadowRoot.getElementById("detail").innerHTML = this._detailCard();
     const add = root.querySelector("#add-track");
@@ -1252,6 +1694,24 @@ class EventSimulatorPanel extends Base {
     this._bindTimeline();
     this._renderTimeline();
     if (timelineFocused) this.shadowRoot.getElementById("tl-wrap")?.focus({ preventScroll: true });
+    const name = this.shadowRoot.getElementById("sc-name");
+    if (name && (caret || this._focusName)) {
+      const scroll = this._focusName;
+      // A new ha-card renders its slot asynchronously; until then its content cannot take focus.
+      Promise.resolve(name.closest("ha-card")?.updateComplete).then(() => {
+        if (!name.isConnected) return;
+        name.focus({ preventScroll: !scroll });
+        if (caret) name.setSelectionRange(...caret);
+        else name.select();
+      });
+    }
+    this._focusName = false;
+    this._updateDirty();
+  }
+
+  /* `open` for a <details data-key>, remembered across redraws. */
+  _openAttr(key, byDefault = false) {
+    return (this._open[key] ?? byDefault) ? "open" : "";
   }
 
   _html() {
@@ -1300,13 +1760,94 @@ class EventSimulatorPanel extends Base {
             </button>
             <span class="muted small">${esc(this._runHint())}</span>
           </div>
+          ${this._scenarioHtml()}
         </div>
       </ha-card>`;
   }
 
+  /* The saved-scenario controls: current name and save state, Save / Save as, the name
+   * prompt, inline errors, and the list to load or delete from. */
+  _scenarioHtml() {
+    const list = this._scenarios;
+    const busy = this._scBusy;
+    const canSave = this._canSave();
+    const current = this._scenario;
+    const saveTitle = this._cfgError
+      ? "Fix or revert the automation config first"
+      : current
+        ? `Overwrite “${current.name}”`
+        : "Save as a named scenario";
+    const form = this._saveForm
+      ? `<div class="sc-form">
+          <input id="sc-name" maxlength="${MAX_SCENARIO_NAME}" value="${esc(this._saveForm.name)}" placeholder="Scenario name" aria-label="Scenario name" autocomplete="off">
+          <button class="primary small-btn" data-action="sc-save-name" ${canSave ? "" : "disabled"}>${this._saveForm.asNew && current ? "Save as new" : "Save"}</button>
+          <button data-action="sc-cancel">Cancel</button>
+        </div>`
+      : "";
+    const confirmLoad =
+      this._confirm?.kind === "load"
+        ? `<div class="alert warning sc-confirm"><div>Loading replaces what is on screen, and it has unsaved changes${current ? ` to “${esc(current.name)}”` : ""}.</div>
+            <button data-action="sc-load-confirm" data-id="${esc(this._confirm.id)}">Discard and load</button>
+            <button data-action="sc-confirm-cancel">Keep editing</button></div>`
+        : "";
+    const messages = [
+      this._scError ? `<div class="err small sc-msg" role="alert">${esc(this._scError)}</div>` : "",
+      this._scInfo ? `<div class="muted small sc-msg">${esc(this._scInfo)}</div>` : "",
+    ].join("");
+    const count = list ? ` (${list.length})` : "";
+    return `
+      <div class="sc">
+        <div class="sc-row">
+          <span class="label">Scenario</span>
+          <strong class="sc-name">${current ? esc(current.name) : `<span class="muted">Unsaved</span>`}</strong>
+          <span id="sc-state" class="chip" hidden></span>
+          <span class="sc-actions">
+            <button data-action="sc-save" ${canSave ? "" : "disabled"} title="${esc(saveTitle)}">Save</button>
+            <button data-action="sc-save-as" ${canSave ? "" : "disabled"} title="Save under a new name">Save as…</button>
+            <button data-action="sc-toggle" aria-expanded="${this._scenariosOpen}">${this._scenariosOpen ? "Hide" : "Saved scenarios"}${count}</button>
+            ${busy ? `<span class="spinner"></span>` : ""}
+          </span>
+        </div>
+        ${form}${messages}${confirmLoad}
+        ${this._scenariosOpen ? this._scenarioListHtml() : ""}
+      </div>`;
+  }
+
+  _scenarioListHtml() {
+    const list = this._scenarios;
+    if (list === null) return `<div class="muted small">Loading saved scenarios…</div>`;
+    if (!list.length) return `<div class="muted small sc-empty">No saved scenarios yet. Save keeps the automation config (edited or not), the window, the tracks and every edit to them.</div>`;
+    const rows = list
+      .map((sc) => {
+        const id = sc.scenario_id;
+        const isCurrent = this._scenario?.scenario_id === id;
+        const deleting = this._confirm?.kind === "delete" && this._confirm.id === id;
+        const start = parseTime(sc.start);
+        const end = parseTime(sc.end);
+        const auto = sc.alias || sc.automation_entity_id || "no automation";
+        const actions = deleting
+          ? `<span class="err small">Delete “${esc(sc.name)}”?</span>
+             <button class="danger" data-action="sc-delete-confirm" data-id="${esc(id)}">Delete</button>
+             <button data-action="sc-confirm-cancel">Cancel</button>`
+          : `<button data-action="sc-load" data-id="${esc(id)}" ${this._scBusy ? "disabled" : ""}>${isCurrent ? "Reload" : "Load"}</button>
+             <button data-action="sc-delete" data-id="${esc(id)}" ${this._scBusy ? "disabled" : ""} title="Delete this saved scenario">Delete</button>`;
+        return `
+          <li class="${isCurrent ? "current" : ""}">
+            <div class="sc-info">
+              <strong>${esc(sc.name)}</strong>${isCurrent ? ` <span class="chip none">loaded</span>` : ""}
+              <span class="muted small">${esc(auto)} · ${esc(this._fullTime(start))} – ${esc(this._fullTime(end))} (${esc(formatDuration(end - start))}) · ${sc.entity_ids?.length ?? 0} track${sc.entity_ids?.length === 1 ? "" : "s"}, ${sc.event_count} change${sc.event_count === 1 ? "" : "s"}</span>
+              <span class="muted small">Saved ${esc(this._fullTime(parseTime(sc.updated)))}</span>
+            </div>
+            <div class="sc-row-actions">${actions}</div>
+          </li>`;
+      })
+      .join("");
+    return `<ul class="sc-list">${rows}</ul>`;
+  }
+
   _runHint() {
     if (this._running) return "Replaying the window in the sandbox…";
-    if (!this._entityId) return "Pick an automation to load its entities.";
+    if (!this._entityId && !this._automation) return "Pick an automation to load its entities.";
     if (!this._automation) return "";
     if (this._cfgError) return "The edited automation config does not parse; fix it or revert it below.";
     const events = this._tracks.reduce((n, t) => n + t.events.length, 0);
@@ -1332,7 +1873,12 @@ class EventSimulatorPanel extends Base {
       )
       .join("");
     const placeholder = `<option value="" ${this._entityId ? "" : "selected"}>${list.length ? "Choose an automation…" : "No match"}</option>`;
-    return placeholder + opts;
+    // A loaded scenario may name an automation this instance no longer has.
+    const gone =
+      this._entityId && !(this._automations || []).some((a) => a.entity_id === this._entityId)
+        ? `<option value="${esc(this._entityId)}" selected>${esc(this._entityId)} (not on this instance)</option>`
+        : "";
+    return placeholder + gone + opts;
   }
 
   _timelineCard() {
@@ -1342,7 +1888,7 @@ class EventSimulatorPanel extends Base {
       this._loading ? `<div class="alert info"><span class="spinner"></span>${esc(this._loading)}</div>` : "",
       this._runErrorHtml(),
     ].join("");
-    if (!this._entityId) {
+    if (!this._entityId && !this._automation) {
       return `<ha-card><div class="card-content">${banner}<div class="empty">Choose an automation above. Its triggers, conditions and templates decide which entities get a track.</div></div></ha-card>`;
     }
     const entityOptions = this._entityDatalist();
@@ -1393,11 +1939,41 @@ class EventSimulatorPanel extends Base {
       .join("");
   }
 
+  /* A failed run: what went wrong in words, and the code and the child's last log lines
+   * in a collapsible block. */
   _runErrorHtml() {
     const e = this._runError;
     if (!e) return "";
-    const stderr = e.stderr ? `<details><summary>Sandbox output</summary><pre>${esc(e.stderr)}</pre></details>` : "";
-    return `<div class="alert error"><div><strong>Run failed.</strong> ${esc(e.message)}${e.code && e.code !== "unknown_command" ? ` <span class="mono small">(${esc(e.code)})</span>` : ""}${stderr}</div></div>`;
+    const lines = e.stderr ? e.stderr.split("\n").length : 0;
+    const details =
+      e.code && e.code !== "unknown_command"
+        ? `<details class="failure" data-key="run-error" ${this._openAttr("run-error")}>
+            <summary>Details: error code <span class="mono">${esc(e.code)}</span>${lines ? `, last ${lines} line${lines === 1 ? "" : "s"} the sandbox logged` : ""}</summary>
+            ${e.stderr ? `<pre class="stderr">${esc(e.stderr)}</pre>` : `<div class="small muted">The sandbox logged nothing before it stopped.</div>`}
+          </details>`
+        : "";
+    return `<div class="alert error run-error"><div class="alert-body"><strong>${esc(e.title)}</strong><div class="msg">${esc(e.message)}</div>${details}</div></div>`;
+  }
+
+  /* Result warnings, grouped by code, each with the virtual time it happened at. */
+  _warningsHtml(warnings) {
+    if (!warnings.length) return "";
+    const LIMIT = 50;
+    const groups = groupWarnings(warnings)
+      .map((g) => {
+        const items = g.items
+          .slice(0, LIMIT)
+          .map((w) => `<li>${w.at != null ? `<span class="mono small w-at">${esc(this._fullTime(w.at))}</span> ` : ""}<span class="w-msg">${esc(w.message)}</span></li>`)
+          .join("");
+        const more = g.items.length > LIMIT ? `<li class="muted">…and ${g.items.length - LIMIT} more</li>` : "";
+        const key = `warn:${g.code}`;
+        return `<details class="wgroup" data-key="${esc(key)}" ${this._openAttr(key, g.items.length <= 3)}>
+            <summary><span class="w-label">${esc(g.label)}</span> <span class="chip none">${g.items.length}</span></summary>
+            <ul>${items}${more}</ul>
+          </details>`;
+      })
+      .join("");
+    return `<div class="alert warning"><div class="alert-body"><strong>${warnings.length} warning${warnings.length === 1 ? "" : "s"} from the replay</strong>${groups}</div></div>`;
   }
 
   /* The inline editor for the selected event (or initial state) of a track. */
@@ -1676,9 +2252,7 @@ class EventSimulatorPanel extends Base {
   _detailCard() {
     const result = this._result;
     if (!result) return "";
-    const warnings = result.warnings.length
-      ? `<div class="alert warning"><div><strong>Warnings</strong><ul>${result.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul></div></div>`
-      : "";
+    const warnings = this._warningsHtml(result.warnings);
     const run = result.runs.find((r) => r.index === this._selectedRun);
     if (!run) {
       const text = result.runs.length ? "Click a run marker on the Runs row to see what happened." : "The automation did not run in this window.";
@@ -2060,6 +2634,26 @@ class EventSimulatorPanel extends Base {
       this._select(null);
       this._render();
     } else if (action === "cfg-revert") this._revertConfig();
+    else if (action === "sc-save") this._onSave(false);
+    else if (action === "sc-save-as") this._onSave(true);
+    else if (action === "sc-save-name") this._saveScenario(!!this._saveForm?.asNew, this.shadowRoot.getElementById("sc-name")?.value);
+    else if (action === "sc-cancel") {
+      this._saveForm = null;
+      this._scError = null;
+      this._render();
+    } else if (action === "sc-toggle") {
+      this._scenariosOpen = !this._scenariosOpen;
+      this._confirm = null;
+      if (this._scenariosOpen) this._listScenarios();
+      else this._render();
+    } else if (action === "sc-load") this._loadScenario(el.dataset.id);
+    else if (action === "sc-load-confirm") this._loadScenario(el.dataset.id, true);
+    else if (action === "sc-delete") this._deleteScenario(el.dataset.id);
+    else if (action === "sc-delete-confirm") this._deleteScenario(el.dataset.id, true);
+    else if (action === "sc-confirm-cancel") {
+      this._confirm = null;
+      this._render();
+    }
   }
 
   _stepRun(delta) {
@@ -2093,6 +2687,10 @@ class EventSimulatorPanel extends Base {
       // Kept so a re-render (a history load, a run finishing) does not wipe unapplied input.
       const value = (name) => this.shadowRoot.getElementById(name)?.value;
       this._edDraft = { key: `${this._sel.entity_id}#${this._sel.index}`, time: value("ed-time"), state: value("ed-state"), attrs: value("ed-attrs") };
+      return;
+    }
+    if (id === "sc-name" && this._saveForm) {
+      this._saveForm.name = ev.target.value;
       return;
     }
     if (id !== "auto-filter") return;
@@ -2131,6 +2729,16 @@ class EventSimulatorPanel extends Base {
     if (["ed-time", "ed-state"].includes(ev.target.id) && ev.key === "Enter") {
       ev.preventDefault();
       return this._applyEditor();
+    }
+    if (ev.target.id === "sc-name") {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        this._saveScenario(!!this._saveForm?.asNew, ev.target.value);
+      } else if (ev.key === "Escape") {
+        this._saveForm = null;
+        this._render();
+      }
+      return;
     }
     if (ev.key !== "Enter") return;
     if (ev.target.id === "add-track") {
@@ -2269,6 +2877,32 @@ class EventSimulatorPanel extends Base {
       .call { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; padding: 6px 8px; border-radius: 6px; background: var(--secondary-background-color); word-break: break-all; }
       .raw { margin-top: 16px; }
       .raw summary { cursor: pointer; color: var(--secondary-text-color); }
+      .alert-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1; }
+      .run-error .msg { color: var(--primary-text-color); }
+      .run-error details summary, .wgroup summary { cursor: pointer; }
+      .run-error details summary { color: var(--secondary-text-color); font-size: 0.9em; }
+      .run-error pre.stderr { margin: 6px 0 0; }
+      .wgroup ul { margin: 4px 0 4px; padding-left: 20px; }
+      .wgroup li { margin: 2px 0; word-break: break-word; }
+      .w-at { color: var(--secondary-text-color); margin-right: 8px; white-space: nowrap; }
+      .w-label { font-weight: 500; }
+      .sc { flex: 1 1 100%; display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--divider-color); padding-top: 12px; min-width: 0; }
+      .sc-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-width: 0; }
+      .sc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; max-width: 100%; }
+      .sc-actions { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-left: auto; }
+      .sc-actions button { padding: 4px 12px; }
+      .sc-form { display: flex; gap: 6px; flex-wrap: wrap; }
+      .sc-form input { flex: 1 1 220px; }
+      .sc-confirm { margin: 0; flex-wrap: wrap; }
+      .sc-confirm > div { flex: 1 1 240px; }
+      .sc-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; max-height: 360px; overflow: auto; }
+      .sc-list li { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 6px; background: var(--secondary-background-color); }
+      .sc-list li.current { box-shadow: inset 3px 0 0 var(--primary-color); }
+      .sc-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 260px; word-break: break-word; }
+      .sc-row-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+      .sc-row-actions button { padding: 3px 10px; }
+      button.danger { background: var(--error-color, #db4437); border-color: var(--error-color, #db4437); color: var(--text-primary-color, #fff); }
+      button.danger:hover:not([disabled]) { background: var(--error-color, #db4437); filter: brightness(1.1); }
       @media (max-width: 600px) {
         .page { padding: 8px; }
         .card-content { padding: 12px; }

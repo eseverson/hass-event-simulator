@@ -213,7 +213,10 @@ test("result parsing is defensive and keeps run indexes for service calls", () =
   assert.equal(r.calls.length, 1);
   assert.deepEqual(callsForRun(r.calls, r.runs[0]).map((c) => c.service), ["turn_on"]);
   assert.deepEqual(callsForRun(r.calls, r.runs[1]), []);
-  assert.deepEqual(r.warnings, ["unknown service light.nope", '{"code":1}']);
+  assert.deepEqual(r.warnings, [
+    { code: "", message: "unknown service light.nope", at: null },
+    { code: "1", message: '{"code":1}', at: null },
+  ]);
   assert.deepEqual(normalizeResult(null), { runs: [], calls: [], warnings: [] });
   assert.deepEqual(normalizeResult({ runs: "x", service_calls: {}, warnings: 3 }), { runs: [], calls: [], warnings: [] });
 });
