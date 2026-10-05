@@ -121,11 +121,20 @@ async def test_timeline_has_start_state_and_changes_in_window(
         hass, ["sensor.temp", "binary_sensor.door", "sensor.never_recorded"], start, end
     )
 
-    # The recorder reports a start state stamped at the window start, not when it
-    # really changed, so initial states carry only what the scenario format needs.
+    # Entities with nothing recorded before the window are left out.
     assert timeline["initial_states"] == {
-        "sensor.temp": {"state": "19", "attributes": {"unit_of_measurement": "°C"}},
-        "binary_sensor.door": {"state": "off", "attributes": {}},
+        "sensor.temp": {
+            "state": "19",
+            "attributes": {"unit_of_measurement": "°C"},
+            "last_changed": (base + timedelta(minutes=5)).isoformat(),
+            "last_updated": (base + timedelta(minutes=5)).isoformat(),
+        },
+        "binary_sensor.door": {
+            "state": "off",
+            "attributes": {},
+            "last_changed": base.isoformat(),
+            "last_updated": base.isoformat(),
+        },
     }
     at_door = (start + timedelta(minutes=1)).isoformat()
     at_temp = (start + timedelta(minutes=2)).isoformat()
@@ -149,6 +158,58 @@ async def test_timeline_has_start_state_and_changes_in_window(
         },
     ]
 
+
+
+async def test_initial_states_carry_when_the_state_really_changed(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+):
+    """Not the window start the recorder clamps a start state to (issue #10)."""
+    start = dt_util.utcnow().replace(microsecond=0) + timedelta(hours=3)
+    freezer.move_to(start - timedelta(hours=2))
+    hass.states.async_set("binary_sensor.door", "off")
+    hass.states.async_set("sensor.temp", "18", {"unit_of_measurement": "°C"})
+    freezer.move_to(start - timedelta(hours=1))
+    hass.states.async_set("sensor.temp", "18", {"unit_of_measurement": "°F"})
+    freezer.move_to(start + timedelta(minutes=1))
+    await async_wait_recording_done(hass)
+
+    timeline = await history.async_get_timeline(
+        hass, ["binary_sensor.door", "sensor.temp"], start, start + timedelta(hours=1)
+    )
+
+    two_hours_before = (start - timedelta(hours=2)).isoformat()
+    assert timeline["initial_states"]["binary_sensor.door"] == {
+        "state": "off",
+        "attributes": {},
+        "last_changed": two_hours_before,
+        "last_updated": two_hours_before,
+    }
+    # attribute-only change: last_updated moves, last_changed stays put
+    assert timeline["initial_states"]["sensor.temp"] == {
+        "state": "18",
+        "attributes": {"unit_of_measurement": "°F"},
+        "last_changed": two_hours_before,
+        "last_updated": (start - timedelta(hours=1)).isoformat(),
+    }
+    assert timeline["events"] == []
+
+
+async def test_single_entity_initial_state_carries_its_timestamps(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+):
+    start = dt_util.utcnow().replace(microsecond=0) + timedelta(hours=3)
+    freezer.move_to(start - timedelta(hours=2))
+    hass.states.async_set("binary_sensor.door", "off")
+    freezer.move_to(start + timedelta(minutes=1))
+    await async_wait_recording_done(hass)
+
+    timeline = await history.async_get_timeline(
+        hass, ["binary_sensor.door"], start, start + timedelta(hours=1)
+    )
+
+    assert timeline["initial_states"]["binary_sensor.door"]["last_changed"] == (
+        start - timedelta(hours=2)
+    ).isoformat()
 
 async def test_timeline_with_no_entities_is_empty(hass: HomeAssistant):
     now = dt_util.utcnow()

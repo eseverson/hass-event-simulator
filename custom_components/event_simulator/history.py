@@ -13,10 +13,17 @@ from functools import partial
 import re
 from typing import Any
 
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
 from homeassistant.components.automation import DATA_COMPONENT
 from homeassistant.components.recorder import get_instance
-from homeassistant.components.recorder.history import get_significant_states
+from homeassistant.components.recorder.db_schema import States
+from homeassistant.components.recorder.history import (
+    get_significant_states_with_session,
+)
 from homeassistant.core import HomeAssistant, State, callback, valid_entity_id
+from homeassistant.helpers.recorder import session_scope
 from homeassistant.helpers.template import Template, is_template_string
 from homeassistant.util import dt as dt_util
 
@@ -86,11 +93,13 @@ async def async_get_timeline(
 ) -> dict[str, Any]:
     """The state of each entity at `start`, plus every state write in [start, end).
 
-    Returned as the scenario's `initial_states` and `events`. Entities with nothing
-    recorded before `start` have no initial state; the recorder is the only source.
-    Initial states are `{state, attributes}` only: the recorder stamps a start state
-    with the window start rather than with when it really changed, so passing those
-    timestamps on would present a guess as history.
+    Returned as the scenario's `initial_states` and `events`. An initial state is
+    `{state, attributes, last_changed, last_updated}`, the timestamps ISO UTC and
+    taken from the recorded row itself: the recorder's own start state is stamped
+    with the window start, which would make a `for:` early in the window see a
+    state that has held for hours as brand new. Entities with nothing recorded
+    before `start` are left out of `initial_states`; the recorder is the only
+    source, and a made-up start state would present a guess as history.
     """
     start, end = dt_util.as_utc(start), dt_util.as_utc(end)
     if len(entity_ids) > MAX_ENTITIES:
@@ -107,18 +116,8 @@ async def async_get_timeline(
     if not entity_ids:
         return {"initial_states": {}, "events": []}
 
-    states = await get_instance(hass).async_add_executor_job(
-        partial(
-            get_significant_states,
-            hass,
-            start,
-            end,
-            list(entity_ids),
-            include_start_time_state=True,
-            significant_changes_only=False,
-            minimal_response=False,
-            no_attributes=False,
-        )
+    states, stamps = await get_instance(hass).async_add_executor_job(
+        partial(_read_recorder, hass, list(entity_ids), start, end)
     )
 
     initial_states: dict[str, dict[str, Any]] = {}
@@ -126,13 +125,16 @@ async def async_get_timeline(
     for entity_id, entity_states in states.items():
         for state in entity_states:
             assert isinstance(state, State)
-            if state.last_updated <= start:
+            if state.last_updated > start:
+                changes.append(state)
+            elif (stamp := stamps.get(entity_id)) is not None:
+                last_changed, last_updated = stamp
                 initial_states[entity_id] = {
                     "state": state.state,
                     "attributes": dict(state.attributes),
+                    "last_changed": last_changed.isoformat(),
+                    "last_updated": last_updated.isoformat(),
                 }
-            else:
-                changes.append(state)
     if len(changes) > MAX_EVENTS:
         raise SimulatorError(
             "too_many_events",
@@ -152,6 +154,72 @@ async def async_get_timeline(
         for state in changes
     ]
     return {"initial_states": initial_states, "events": events}
+
+
+def _read_recorder(
+    hass: HomeAssistant, entity_ids: list[str], start: datetime, end: datetime
+) -> tuple[dict[str, list[Any]], dict[str, tuple[datetime, datetime]]]:
+    """Recorder executor: the window's states, and when each start state was set.
+
+    Both reads share one session so the timestamps describe the same rows the
+    start states came from.
+    """
+    with session_scope(hass=hass, read_only=True) as session:
+        states = get_significant_states_with_session(
+            hass,
+            session,
+            start,
+            end,
+            entity_ids,
+            include_start_time_state=True,
+            significant_changes_only=False,
+            minimal_response=False,
+            no_attributes=False,
+        )
+        starting = [
+            entity_id
+            for entity_id, entity_states in states.items()
+            if entity_states and entity_states[0].last_updated <= start
+        ]
+        return states, _start_state_stamps(hass, session, starting, start)
+
+
+def _start_state_stamps(
+    hass: HomeAssistant, session: Session, entity_ids: list[str], start: datetime
+) -> dict[str, tuple[datetime, datetime]]:
+    """`(last_changed, last_updated)` of each entity's last row before `start`.
+
+    The same row the recorder picks for a start state (latest `last_updated_ts`
+    strictly before `start`), read for the timestamps the recorder replaces with
+    `start`. One limit-1 reverse scan of the (metadata_id, last_updated_ts) index
+    per entity, the lookup the recorder itself uses for a single entity; the
+    recorder stores `last_changed_ts` as NULL when it equals `last_updated_ts`.
+    """
+    metadata_ids = get_instance(hass).states_meta_manager.get_many(
+        entity_ids, session, False
+    )
+    start_ts = start.timestamp()
+    stamps: dict[str, tuple[datetime, datetime]] = {}
+    for entity_id, metadata_id in metadata_ids.items():
+        if metadata_id is None:
+            continue
+        row = session.execute(
+            select(States.last_updated_ts, States.last_changed_ts)
+            .where(
+                States.metadata_id == metadata_id,
+                States.last_updated_ts < start_ts,
+            )
+            .order_by(States.last_updated_ts.desc())
+            .limit(1)
+        ).first()
+        if row is None:
+            continue
+        last_updated_ts, last_changed_ts = row
+        stamps[entity_id] = (
+            dt_util.utc_from_timestamp(last_changed_ts or last_updated_ts),
+            dt_util.utc_from_timestamp(last_updated_ts),
+        )
+    return stamps
 
 
 def _alias(entity: Any) -> str:

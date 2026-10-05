@@ -100,7 +100,14 @@ async def test_history(
 
     assert msg["success"]
     assert msg["result"] == {
-        "initial_states": {"binary_sensor.door": {"state": "off", "attributes": {}}},
+        "initial_states": {
+            "binary_sensor.door": {
+                "state": "off",
+                "attributes": {},
+                "last_changed": (start - timedelta(seconds=30)).isoformat(),
+                "last_updated": (start - timedelta(seconds=30)).isoformat(),
+            }
+        },
         "events": [
             {
                 "at": at.isoformat(),
