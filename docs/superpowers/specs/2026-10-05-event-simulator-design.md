@@ -34,7 +34,7 @@ Integration domain `event_simulator`, layout mirroring `hass-integration-pins` (
    - `event_simulator/automations` → `[{entity_id, alias, id}]`
    - `event_simulator/automation` `{entity_id}` → `{config, referenced_entities}`
    - `event_simulator/history` `{entity_ids, start, end}` → timeline tracks
-   - `event_simulator/simulate` `{scenario}` → result (or `{error, stderr_tail}`)
+   - `event_simulator/simulate` `{scenario}` → result. `scenario.automation` may be a config object or YAML text (custom tags such as `!include` / `!secret` are refused); `core` and `services` default to the live instance's. Window and size caps match `history`. Failures are websocket errors `{code, message}`: the child's own refusal (`invalid_scenario`, `invalid_automation`), or a runner failure (`timeout`, `sandbox_failed`, `output_too_large`) whose error also carries `stderr_tail`. At most two replays run at once; a replay is killed after 300 s or when the request goes away.
 
 6. **Panel (`panel/event-simulator-panel.js`).** Single vanilla web component, no build step. Flow: choose automation → window (default: last 24 h) → tracks load from history for referenced entities (add/remove tracks by entity id) → Run. Timeline: one row per entity (state segments for discrete, a line for numeric), a shared time axis with zoom/pan, editable events (drag to shift, click to edit value/attributes, add, delete), a results row with run markers (fired / stopped by condition / errored) and service-call ticks. Selecting a run shows its trigger, condition results and the recorded calls; the raw trace is expandable. The automation config can be edited in a YAML textarea for what-ifs, without saving to the live instance.
 

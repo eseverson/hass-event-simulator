@@ -21,7 +21,7 @@ from homeassistant.util.hass_dict import HassKey
 from homeassistant.util.ulid import ulid_now
 
 from .const import DOMAIN
-from .history import MAX_ENTITIES, MAX_EVENTS, SimulatorError
+from .history import MAX_ENTITIES, MAX_EVENTS, SimulatorError, check_window
 
 STORAGE_KEY = f"{DOMAIN}.scenarios"
 STORAGE_VERSION = 1
@@ -130,8 +130,7 @@ class ScenarioStore:
 
 
 def _check_limits(body: dict[str, Any]) -> None:
-    if _parse(body["end"]) <= _parse(body["start"]):
-        raise SimulatorError("invalid_window", "The window must end after it starts")
+    check_window(_parse(body["start"]), _parse(body["end"]))
     if (count := len(body.get("events") or ())) > MAX_EVENTS:
         raise SimulatorError(
             "too_large", f"A scenario holds at most {MAX_EVENTS} events; this one has {count}"

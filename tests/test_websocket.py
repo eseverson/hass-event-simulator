@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import sys
 from unittest.mock import patch
 
 from freezegun.api import FrozenDateTimeFactory
@@ -16,6 +17,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 
+from custom_components.event_simulator import history
 from custom_components.event_simulator.const import DOMAIN
 
 AUTOMATION = {
@@ -316,6 +318,211 @@ async def test_scenario_save_rejects_too_many_events(
     assert msg["error"]["code"] == "too_large"
 
 
+SIMULATE = {
+    "version": 1,
+    "start": "2026-10-04T00:00:00+00:00",
+    "end": "2026-10-04T06:00:00+00:00",
+    "automation": AUTOMATION,
+    "initial_states": {
+        "binary_sensor.door": {"state": "off", "attributes": {}},
+        "sun.sun": {"state": "below_horizon", "attributes": {}},
+    },
+    "events": [
+        {"at": "2026-10-04T01:00:00+00:00", "entity_id": "binary_sensor.door", "state": "on", "attributes": {}},
+        {"at": "2026-10-04T01:05:00+00:00", "entity_id": "binary_sensor.door", "state": "off", "attributes": {}},
+    ],
+}
+
+AUTOMATION_YAML = """
+id: door_light
+alias: Door light
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.door
+    to: "on"
+actions:
+  - action: light.turn_on
+    target:
+      entity_id: light.porch
+"""
+
+
+async def test_simulate(hass: HomeAssistant, setup, hass_ws_client):
+    """End to end through the real sandbox child."""
+    client = await hass_ws_client(hass)
+
+    msg = await _call(client, {"type": "event_simulator/simulate", "scenario": SIMULATE})
+
+    assert msg["success"], msg
+    result = msg["result"]
+    assert result["error"] is None
+    [run] = result["runs"]
+    assert run["outcome"] == "fired"
+    assert run["started"].startswith("2026-10-04T01:00:00")
+    [call] = result["service_calls"]
+    assert (call["domain"], call["service"]) == ("light", "turn_on")
+    assert call["target"] == {"entity_id": ["light.porch"]}
+    assert call["run"] == run["id"]  # how the panel ties calls to runs
+    # services were filled in from the live instance, which has no light.turn_on
+    assert [w["code"] for w in result["warnings"]] == ["unknown_service"]
+
+
+async def test_simulate_yaml_automation(hass: HomeAssistant, setup, hass_ws_client):
+    client = await hass_ws_client(hass)
+
+    msg = await _call(
+        client,
+        {
+            "type": "event_simulator/simulate",
+            "scenario": {**SIMULATE, "automation": AUTOMATION_YAML},
+        },
+    )
+
+    assert msg["success"], msg
+    assert [run["outcome"] for run in msg["result"]["runs"]] == ["fired"]
+
+
+async def test_simulate_fills_core_and_services(hass: HomeAssistant, setup, hass_ws_client):
+    client = await hass_ws_client(hass)
+    seen = {}
+
+    async def fake_run(hass, scenario, **kwargs):
+        seen.update(scenario)
+        return {"version": 1, "error": None, "runs": [], "service_calls": [], "warnings": []}
+
+    with patch("custom_components.event_simulator.runner.async_run_scenario", fake_run):
+        msg = await _call(
+            client,
+            {"type": "event_simulator/simulate", "scenario": {**SIMULATE, "automation": AUTOMATION_YAML}},
+        )
+
+    assert msg["success"], msg
+    assert seen["core"] == history.async_core_config(hass)
+    assert "turn_on" in seen["services"]["automation"]
+    assert seen["automation"]["triggers"][0]["to"] == "on"
+    assert seen["start"] == "2026-10-04T00:00:00+00:00"
+
+
+async def test_simulate_keeps_a_given_core(hass: HomeAssistant, setup, hass_ws_client):
+    client = await hass_ws_client(hass)
+    seen = {}
+    core = {"time_zone": "Asia/Tokyo", "latitude": 35.0, "longitude": 139.0, "elevation": 0, "unit_system": "metric"}
+
+    async def fake_run(hass, scenario, **kwargs):
+        seen.update(scenario)
+        return {"version": 1, "error": None, "runs": [], "service_calls": [], "warnings": []}
+
+    with patch("custom_components.event_simulator.runner.async_run_scenario", fake_run):
+        msg = await _call(
+            client, {"type": "event_simulator/simulate", "scenario": {**SIMULATE, "core": core}}
+        )
+
+    assert msg["success"], msg
+    assert seen["core"] == core
+
+
+@pytest.mark.parametrize(
+    ("yaml_text", "needle"),
+    [
+        ("triggers: !include /etc/hostname\nactions: []", "!include"),
+        ("alias: !secret door\ntriggers: []\nactions: []", "!secret"),
+        ("alias: !env_var HOME\ntriggers: []\nactions: []", "!env_var"),
+        ("alias: !!python/object:os.system x\ntriggers: []\nactions: []", "python/object"),
+        ("triggers: [", "parse"),
+        ("- just\n- a list", "mapping"),
+    ],
+)
+async def test_simulate_rejects_bad_yaml(
+    hass: HomeAssistant, setup, hass_ws_client, yaml_text, needle
+):
+    client = await hass_ws_client(hass)
+
+    msg = await _call(
+        client,
+        {"type": "event_simulator/simulate", "scenario": {**SIMULATE, "automation": yaml_text}},
+    )
+
+    assert not msg["success"]
+    assert msg["error"]["code"] == "invalid_automation"
+    assert needle in msg["error"]["message"]
+
+
+async def test_simulate_rejects_a_yaml_alias_bomb(hass: HomeAssistant, setup, hass_ws_client):
+    client = await hass_ws_client(hass)
+    lines = ["a0: &a0 [x, x, x, x, x, x, x, x, x, x]"]
+    lines += [f"a{n}: &a{n} [{', '.join([f'*a{n - 1}'] * 10)}]" for n in range(1, 9)]
+
+    msg = await _call(
+        client,
+        {"type": "event_simulator/simulate", "scenario": {**SIMULATE, "automation": "\n".join(lines)}},
+    )
+
+    assert not msg["success"]
+    assert msg["error"]["code"] == "invalid_automation"
+    assert "too large" in msg["error"]["message"]
+
+
+async def test_simulate_invalid_automation(hass: HomeAssistant, setup, hass_ws_client):
+    """The child's structured refusal comes back as a websocket error."""
+    client = await hass_ws_client(hass)
+
+    msg = await _call(
+        client,
+        {
+            "type": "event_simulator/simulate",
+            "scenario": {**SIMULATE, "automation": {"triggers": [{"trigger": "nope"}], "actions": []}},
+        },
+    )
+
+    assert not msg["success"]
+    assert msg["error"]["code"] == "invalid_automation"
+
+
+@pytest.mark.parametrize(
+    ("change", "code"),
+    [
+        ({"end": "2026-10-03T00:00:00+00:00"}, "invalid_window"),
+        ({"end": "2026-10-14T00:00:00+00:00"}, "window_too_long"),
+        ({"start": "yesterday"}, "invalid_format"),
+        ({"automation": 5}, "invalid_format"),
+        ({"events": [SIMULATE["events"][0]] * 3}, "too_many_events"),
+        (
+            {"initial_states": {f"sensor.s{n}": {"state": "1"} for n in range(3)}},
+            "too_many_entities",
+        ),
+        ({"automation": "alias: " + "x" * 300}, "too_large"),
+    ],
+)
+async def test_simulate_validates(
+    hass: HomeAssistant, setup, hass_ws_client, change, code
+):
+    client = await hass_ws_client(hass)
+
+    with (
+        patch("custom_components.event_simulator.websocket.MAX_EVENTS", 2),
+        patch("custom_components.event_simulator.websocket.MAX_ENTITIES", 3),
+        patch("custom_components.event_simulator.websocket.MAX_YAML_CHARS", 200),
+    ):
+        msg = await _call(
+            client, {"type": "event_simulator/simulate", "scenario": {**SIMULATE, **change}}
+        )
+
+    assert not msg["success"]
+    assert msg["error"]["code"] == code
+
+
+async def test_simulate_sandbox_crash(hass: HomeAssistant, setup, hass_ws_client):
+    client = await hass_ws_client(hass)
+    crash = [sys.executable, "-c", "import sys; sys.stderr.write('Traceback: boom'); sys.exit(1)"]
+
+    with patch("custom_components.event_simulator.runner.child_command", return_value=crash):
+        msg = await _call(client, {"type": "event_simulator/simulate", "scenario": SIMULATE})
+
+    assert not msg["success"]
+    assert msg["error"]["code"] == "sandbox_failed"
+    assert msg["error"]["stderr_tail"] == "Traceback: boom"
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -331,6 +538,7 @@ async def test_scenario_save_rejects_too_many_events(
             "start": "2026-10-04T00:00:00+00:00",
             "end": "2026-10-05T00:00:00+00:00",
         },
+        {"type": "event_simulator/simulate", "scenario": SIMULATE},
     ],
 )
 async def test_non_admin_is_refused(

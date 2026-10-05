@@ -45,6 +45,16 @@ class SimulatorError(Exception):
         self.code = code
 
 
+def check_window(start: datetime, end: datetime) -> None:
+    """Refuse a window that is empty, reversed, or longer than MAX_WINDOW."""
+    if end <= start:
+        raise SimulatorError("invalid_window", "The window must end after it starts")
+    if end - start > MAX_WINDOW:
+        raise SimulatorError(
+            "window_too_long", f"The window is longer than the limit of {MAX_WINDOW}"
+        )
+
+
 @callback
 def async_core_config(hass: HomeAssistant) -> dict[str, Any]:
     """The scenario `core` block: what the sandbox copies from this instance."""
@@ -107,12 +117,7 @@ async def async_get_timeline(
             "too_many_entities",
             f"{len(entity_ids)} entities requested; the limit is {MAX_ENTITIES}",
         )
-    if end <= start:
-        raise SimulatorError("invalid_window", "The window must end after it starts")
-    if end - start > MAX_WINDOW:
-        raise SimulatorError(
-            "window_too_long", f"The window is longer than the limit of {MAX_WINDOW}"
-        )
+    check_window(start, end)
     if not entity_ids:
         return {"initial_states": {}, "events": []}
 

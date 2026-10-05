@@ -142,6 +142,13 @@ async def test_save_refuses_an_inverted_window(store: ScenarioStore):
     assert err.value.code == "invalid_window"
 
 
+async def test_save_refuses_a_window_too_long_to_replay(store: ScenarioStore):
+    """The same window cap as history and simulate, so a saved scenario can always run."""
+    with pytest.raises(SimulatorError) as err:
+        await store.async_save_scenario({**SCENARIO, "end": "2026-10-20T00:00:00+00:00"})
+    assert err.value.code == "window_too_long"
+
+
 async def test_delete_removes_it(store: ScenarioStore):
     saved = await store.async_save_scenario(dict(SCENARIO))
 
