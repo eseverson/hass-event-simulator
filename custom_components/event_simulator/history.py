@@ -135,7 +135,19 @@ def async_get_automation(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
     referenced = set(entity.referenced_entities)
     referenced |= _template_entities(hass, _template_strings(config))
     referenced |= _entity_valued_options(config)
-    return {"config": config, "referenced_entities": sorted(referenced)}
+    return {"config": config, "referenced_entities": sorted(_entity_ids(hass, referenced))}
+
+
+def _entity_ids(hass: HomeAssistant, references: Iterable[str]) -> set[str]:
+    """Entity ids for `references`: device triggers and conditions name their entity by its registry id, which HA's `referenced_entities` passes on as is. One that resolves to no entity is dropped; the history and simulate commands take entity ids only."""
+    ent_reg = er.async_get(hass)
+    found = set()
+    for reference in references:
+        if valid_entity_id(reference):
+            found.add(reference)
+        elif (entity_id := er.async_resolve_entity_id(ent_reg, reference)) is not None:
+            found.add(entity_id)
+    return found
 
 
 async def async_get_timeline(

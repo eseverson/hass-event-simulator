@@ -12,9 +12,11 @@ from pytest_homeassistant_custom_component.components.recorder.common import (
 
 from homeassistant.components import labs
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.event_simulator import history
 from custom_components.event_simulator.history import SimulatorError
@@ -377,3 +379,32 @@ async def test_timeline_restores_unrecorded_attributes_from_the_live_state(
     assert changed["attributes"]["has_date"] is False
     [plain] = [e for e in timeline["events"] if e["entity_id"] == "sensor.plain"]
     assert plain["attributes"] == {}
+
+
+async def test_referenced_entities_resolve_registry_ids(hass: HomeAssistant):
+    """A device trigger or condition names its entity by registry id; the panel gets the entity id, which history and simulate accept."""
+    entry = MockConfigEntry(domain="test")
+    entry.add_to_hass(hass)
+    device = dr.async_get(hass).async_get_or_create(config_entry_id=entry.entry_id, identifiers={("test", "door")})
+    door = er.async_get(hass).async_get_or_create(
+        "binary_sensor", "test", "door", config_entry=entry, device_id=device.id, suggested_object_id="side_door"
+    )
+    config = {
+        "id": "registry_ids",
+        "alias": "Registry ids",
+        "triggers": [{"trigger": "state", "entity_id": "binary_sensor.motion", "to": "on"}],
+        "actions": [
+            {
+                "if": [
+                    {"condition": "device", "device_id": device.id, "domain": "binary_sensor", "entity_id": door.id, "type": "is_open"},
+                ],
+                "then": [{"action": "notify.notify", "data": {"message": "open"}}],
+            },
+        ],
+    }
+    assert await async_setup_component(hass, "automation", {"automation": [config]})
+    await hass.async_block_till_done()
+
+    result = history.async_get_automation(hass, "automation.registry_ids")
+
+    assert result["referenced_entities"] == ["binary_sensor.motion", "binary_sensor.side_door"]
