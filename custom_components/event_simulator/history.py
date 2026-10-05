@@ -24,13 +24,31 @@ from homeassistant.components.recorder.history import (
     get_significant_states_with_session,
 )
 from homeassistant.core import HomeAssistant, State, callback, valid_entity_id
+from homeassistant.helpers import (
+    area_registry as ar,
+    device_registry as dr,
+    entity_registry as er,
+    floor_registry as fr,
+    label_registry as lr,
+)
+from homeassistant.helpers.json import json_bytes
 from homeassistant.helpers.recorder import session_scope
 from homeassistant.helpers.template import Template, is_template_string
 from homeassistant.util import dt as dt_util
+from homeassistant.util.json import json_loads
 
 MAX_ENTITIES = 50
 MAX_WINDOW = timedelta(days=7)
 MAX_EVENTS = 50_000
+# Registry snapshot caps: an area or label on a big install can pull in hundreds of
+# entities, and each entry is around a kilobyte of scenario.
+MAX_SNAPSHOT_ENTITIES = 500
+MAX_SNAPSHOT_DEVICES = 250
+
+# Config keys whose values name registry items (targets, device automations, ...).
+_REGISTRY_REF_KEYS = ("area_id", "device_id", "floor_id", "label_id")
+# A quoted literal in a template: a candidate area/floor/label id or name, or device id.
+_QUOTED_LITERAL = re.compile(r"""['"]([^'"\n]{1,100})['"]""")
 
 # A quoted literal shaped like an entity id inside a template. Rendering finds the
 # entities a template touches on today's states, but a short-circuited `and`/`if`
@@ -174,6 +192,191 @@ async def async_get_timeline(
         for state in changes
     ]
     return {"initial_states": initial_states, "events": events}
+
+
+@callback
+def async_registry_snapshot(
+    hass: HomeAssistant, config: dict[str, Any], entity_ids: Iterable[str]
+) -> dict[str, Any]:
+    """The scenario `registry` block: the registry entries the automation can see.
+
+    Covers `entity_ids` (the timeline and referenced entities, kept first and in
+    order), whatever the config names by `area_id` / `device_id` / `floor_id` /
+    `label_id` (targets, device triggers and conditions) or by an entity registry
+    id, and areas, floors, labels and devices that templates name in a quoted
+    literal (`area_entities('Kitchen')`). Areas expand to their entities (directly
+    or through a device, as `area_entities()` does), floors to their areas, devices
+    to their entities, labels to what carries them. Then every entity's device and
+    area, every area's floor, and every label any of them carries come along.
+
+    Entries are in the registries' own storage format, with `versions` saying which
+    one, so the sandbox loads them through the registries' normal load path. Config
+    entries travel as `{entry_id, domain, title}` stubs, never their data. Past
+    `MAX_SNAPSHOT_ENTITIES` / `MAX_SNAPSHOT_DEVICES` the rest is dropped and counted
+    in `truncated`, which the sandbox reports as a warning.
+    """
+    ent_reg = er.async_get(hass)
+    dev_reg = dr.async_get(hass)
+    area_reg = ar.async_get(hass)
+    floor_reg = fr.async_get(hass)
+    label_reg = lr.async_get(hass)
+
+    refs: dict[str, set[str]] = {key: set() for key in _REGISTRY_REF_KEYS}
+    uuid_refs: set[str] = set()
+    _collect_registry_refs(config, refs, uuid_refs)
+    for literal in _template_literals(_template_strings(config)):
+        if dev_reg.async_get(literal) is not None:
+            refs["device_id"].add(literal)
+        if area := (area_reg.async_get_area(literal) or area_reg.async_get_area_by_name(literal)):
+            refs["area_id"].add(area.id)
+        if floor := (floor_reg.async_get_floor(literal) or floor_reg.async_get_floor_by_name(literal)):
+            refs["floor_id"].add(floor.floor_id)
+        if label := (label_reg.async_get_label(literal) or label_reg.async_get_label_by_name(literal)):
+            refs["label_id"].add(label.label_id)
+
+    entities: dict[str, er.RegistryEntry] = {}
+    devices: dict[str, dr.DeviceEntry] = {}
+    area_ids: set[str] = set()
+    truncated = {"entities": 0, "devices": 0}
+
+    def add_entity(entry: er.RegistryEntry | None) -> None:
+        if entry is None or entry.entity_id in entities:
+            return
+        if len(entities) >= MAX_SNAPSHOT_ENTITIES:
+            truncated["entities"] += 1
+            return
+        entities[entry.entity_id] = entry
+
+    def add_device(device: dr.DeviceEntry | None) -> None:
+        if device is None or device.id in devices:
+            return
+        if len(devices) >= MAX_SNAPSHOT_DEVICES:
+            truncated["devices"] += 1
+            return
+        devices[device.id] = device
+
+    for entity_id in entity_ids:
+        add_entity(ent_reg.async_get(entity_id))
+    for uuid in sorted(uuid_refs):
+        add_entity(ent_reg.async_get(uuid))
+    for device_id in sorted(refs["device_id"]):
+        if (device := dev_reg.async_get(device_id)) is not None:
+            add_device(device)
+            for entry in er.async_entries_for_device(ent_reg, device_id, True):
+                add_entity(entry)
+    expanded_areas = set(refs["area_id"])
+    for floor_id in sorted(refs["floor_id"]):
+        expanded_areas |= {area.id for area in ar.async_entries_for_floor(area_reg, floor_id)}
+    for area_id in sorted(expanded_areas):
+        if area_reg.async_get_area(area_id) is None:
+            continue
+        area_ids.add(area_id)
+        for entry in er.async_entries_for_area(ent_reg, area_id):
+            add_entity(entry)
+        for device in dr.async_entries_for_area(dev_reg, area_id):
+            add_device(device)
+            for entry in er.async_entries_for_device(ent_reg, device.id):
+                if entry.area_id is None:
+                    add_entity(entry)
+    for label_id in sorted(refs["label_id"]):
+        for entry in er.async_entries_for_label(ent_reg, label_id):
+            add_entity(entry)
+        for device in dr.async_entries_for_label(dev_reg, label_id):
+            add_device(device)
+        area_ids |= {area.id for area in ar.async_entries_for_label(area_reg, label_id)}
+
+    # Closure: what the chosen entries point at.
+    for entry in list(entities.values()):
+        if entry.device_id:
+            add_device(dev_reg.async_get(entry.device_id))
+        if entry.area_id:
+            area_ids.add(entry.area_id)
+    for device in devices.values():
+        if device.area_id:
+            area_ids.add(device.area_id)
+    areas = [area for area_id in sorted(area_ids) if (area := area_reg.async_get_area(area_id))]
+    floor_ids = set(refs["floor_id"]) | {area.floor_id for area in areas if area.floor_id}
+    label_ids = set(refs["label_id"])
+    for item in (*entities.values(), *devices.values(), *areas):
+        label_ids |= item.labels
+    entry_ids = {entry.config_entry_id for entry in entities.values() if entry.config_entry_id}
+    for device in devices.values():
+        entry_ids |= device.config_entries
+
+    snapshot: dict[str, Any] = {
+        "versions": {
+            "entities": [er.STORAGE_VERSION_MAJOR, er.STORAGE_VERSION_MINOR],
+            "devices": [dr.STORAGE_VERSION_MAJOR, dr.STORAGE_VERSION_MINOR],
+            "areas": [ar.STORAGE_VERSION_MAJOR, ar.STORAGE_VERSION_MINOR],
+            "floors": [fr.STORAGE_VERSION_MAJOR, fr.STORAGE_VERSION_MINOR],
+            "labels": [lr.STORAGE_VERSION_MAJOR, lr.STORAGE_VERSION_MINOR],
+        },
+        "entities": [_fragment(entry.as_storage_fragment) for entry in entities.values()],
+        "devices": [_fragment(device.as_storage_fragment) for device in devices.values()],
+        # Areas, floors and labels have no per-entry storage form; their registries'
+        # save data is small and filtered here.
+        "areas": [
+            area
+            for area in area_reg._data_to_save()["areas"]  # noqa: SLF001
+            if area["id"] in area_ids
+        ],
+        "floors": [
+            floor
+            for floor in floor_reg._data_to_save()["floors"]  # noqa: SLF001
+            if floor["floor_id"] in floor_ids
+        ],
+        "labels": [
+            label
+            for label in label_reg._data_to_save()["labels"]  # noqa: SLF001
+            if label["label_id"] in label_ids
+        ],
+        "config_entries": [
+            {"entry_id": entry.entry_id, "domain": entry.domain, "title": entry.title}
+            for entry_id in sorted(entry_ids)
+            if (entry := hass.config_entries.async_get_entry(entry_id)) is not None
+        ],
+    }
+    if any(truncated.values()):
+        snapshot["truncated"] = {kind: count for kind, count in truncated.items() if count}
+    return snapshot
+
+
+def _fragment(fragment: Any) -> dict[str, Any]:
+    """A storage `json_fragment` back as a plain dict."""
+    return json_loads(json_bytes(fragment))
+
+
+def _collect_registry_refs(
+    node: Any, refs: dict[str, set[str]], uuid_refs: set[str]
+) -> None:
+    """Registry ids named anywhere in the config, plus entity registry ids (UUIDs)."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in refs:
+                refs[key] |= {
+                    item
+                    for item in (value if isinstance(value, list) else [value])
+                    if isinstance(item, str) and not is_template_string(item)
+                }
+            elif key == "entity_id":
+                uuid_refs |= {
+                    item
+                    for item in (value if isinstance(value, list) else [value])
+                    if isinstance(item, str) and not valid_entity_id(item)
+                }
+            _collect_registry_refs(value, refs, uuid_refs)
+    elif isinstance(node, list):
+        for value in node:
+            _collect_registry_refs(value, refs, uuid_refs)
+
+
+def _template_literals(templates: Iterable[str]) -> set[str]:
+    return {
+        literal.strip()
+        for text in templates
+        for literal in _QUOTED_LITERAL.findall(text)
+        if literal.strip()
+    }
 
 
 def _read_recorder(
