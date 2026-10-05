@@ -69,13 +69,14 @@ async def test_snapshot_expands_targets_and_template_references(hass: HomeAssist
         "actions": [
             {"action": "light.turn_on", "target": {"area_id": ["bedroom"], "label_id": "night"}},
             {"action": "notify.notify", "data": {"message": "{{ area_entities('Office') }} {{ floor_areas('upstairs') }}"}},
+            {"condition": "template", "value_template": "{{ states('sensor.outside') | float(0) > 3 }}"},
         ],
     }
     snapshot = history.async_registry_snapshot(hass, config, [])
 
     # Bedroom via area_id (its lamp through the device), Office by name in a template (desk via device),
-    # the door by registry id, and everything labelled `night`.
-    assert ids(snapshot, "entities", "entity_id") == ["binary_sensor.door", "light.desk", "light.lamp"]
+    # the door by registry id, everything labelled `night`, and an entity a template names.
+    assert ids(snapshot, "entities", "entity_id") == ["binary_sensor.door", "light.desk", "light.lamp", "sensor.outside"]
     assert ids(snapshot, "devices", "id") == sorted([home["lamp_dev"], home["desk_dev"]])
     assert ids(snapshot, "areas", "id") == ["bedroom", "office"]
     assert ids(snapshot, "floors", "floor_id") == ["upstairs"]

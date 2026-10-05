@@ -200,11 +200,11 @@ def async_registry_snapshot(
 ) -> dict[str, Any]:
     """The scenario `registry` block: the registry entries the automation can see.
 
-    Covers `entity_ids` (the timeline and referenced entities, kept first and in
-    order), whatever the config names by `area_id` / `device_id` / `floor_id` /
-    `label_id` (targets, device triggers and conditions) or by an entity registry
-    id, and areas, floors, labels and devices that templates name in a quoted
-    literal (`area_entities('Kitchen')`). Areas expand to their entities (directly
+    Covers `entity_ids` (the timeline, kept first and in order), the entities the
+    config names by entity id or entity registry id (also as a quoted literal in a
+    template), whatever it names by `area_id` / `device_id` / `floor_id` /
+    `label_id` (targets, device triggers and conditions), and areas, floors, labels
+    and devices that templates name in a quoted literal (`area_entities('Kitchen')`). Areas expand to their entities (directly
     or through a device, as `area_entities()` does), floors to their areas, devices
     to their entities, labels to what carries them. Then every entity's device and
     area, every area's floor, and every label any of them carries come along.
@@ -222,9 +222,12 @@ def async_registry_snapshot(
     label_reg = lr.async_get(hass)
 
     refs: dict[str, set[str]] = {key: set() for key in _REGISTRY_REF_KEYS}
-    uuid_refs: set[str] = set()
-    _collect_registry_refs(config, refs, uuid_refs)
+    entity_refs: set[str] = set()
+    _collect_registry_refs(config, refs, entity_refs)
     for literal in _template_literals(_template_strings(config)):
+        if valid_entity_id(literal):
+            entity_refs.add(literal)
+            continue
         if dev_reg.async_get(literal) is not None:
             refs["device_id"].add(literal)
         if area := (area_reg.async_get_area(literal) or area_reg.async_get_area_by_name(literal)):
@@ -257,8 +260,8 @@ def async_registry_snapshot(
 
     for entity_id in entity_ids:
         add_entity(ent_reg.async_get(entity_id))
-    for uuid in sorted(uuid_refs):
-        add_entity(ent_reg.async_get(uuid))
+    for entity_id_or_uuid in sorted(entity_refs):
+        add_entity(ent_reg.async_get(entity_id_or_uuid))
     for device_id in sorted(refs["device_id"]):
         if (device := dev_reg.async_get(device_id)) is not None:
             add_device(device)
@@ -347,9 +350,9 @@ def _fragment(fragment: Any) -> dict[str, Any]:
 
 
 def _collect_registry_refs(
-    node: Any, refs: dict[str, set[str]], uuid_refs: set[str]
+    node: Any, refs: dict[str, set[str]], entity_refs: set[str]
 ) -> None:
-    """Registry ids named anywhere in the config, plus entity registry ids (UUIDs)."""
+    """Registry ids named anywhere in the config, plus entity ids and entity registry ids."""
     if isinstance(node, dict):
         for key, value in node.items():
             if key in refs:
@@ -359,15 +362,15 @@ def _collect_registry_refs(
                     if isinstance(item, str) and not is_template_string(item)
                 }
             elif key == "entity_id":
-                uuid_refs |= {
+                entity_refs |= {
                     item
                     for item in (value if isinstance(value, list) else [value])
-                    if isinstance(item, str) and not valid_entity_id(item)
+                    if isinstance(item, str) and not is_template_string(item)
                 }
-            _collect_registry_refs(value, refs, uuid_refs)
+            _collect_registry_refs(value, refs, entity_refs)
     elif isinstance(node, list):
         for value in node:
-            _collect_registry_refs(value, refs, uuid_refs)
+            _collect_registry_refs(value, refs, entity_refs)
 
 
 def _template_literals(templates: Iterable[str]) -> set[str]:
