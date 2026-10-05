@@ -346,6 +346,10 @@ def _parse_registry(value: Any, warnings: list[dict[str, Any]]) -> dict[str, Any
         if not (isinstance(version, list) and len(version) == 2 and all(isinstance(part, int) and not isinstance(part, bool) for part in version)):
             raise ScenarioError("invalid_scenario", f"registry.versions.{kind} must be [major, minor]")
         parsed["versions"][kind] = version
+    store_data = value.get("store_data") or {}
+    if not isinstance(store_data, dict) or not all(kind in _REGISTRY_STORES and isinstance(data, dict) for kind, data in store_data.items()):
+        raise ScenarioError("invalid_scenario", "registry.store_data must map registry kinds to objects")
+    parsed["store_data"] = store_data
     truncated = value.get("truncated") or {}
     if not isinstance(truncated, dict):
         raise ScenarioError("invalid_scenario", "registry.truncated must be an object")
@@ -374,7 +378,8 @@ def _write_registry_storage(config_dir: str, registry: dict[str, Any], stamp: da
     for kind, (key, items_key, deleted_key, _) in _REGISTRY_STORES.items():
         if not registry[kind]:
             continue
-        data: dict[str, Any] = {items_key: registry[kind]}
+        # The rest of the live store's data first: a registry at its current version reads its keys without a migration to fill them in.
+        data: dict[str, Any] = {**registry["store_data"].get(kind, {}), items_key: registry[kind]}
         if deleted_key:
             data[deleted_key] = []
         write(key, registry["versions"][kind], data)

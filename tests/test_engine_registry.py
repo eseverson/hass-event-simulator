@@ -6,6 +6,8 @@ Registries are built here with HA's own APIs, snapshotted with `history.async_re
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -21,6 +23,7 @@ from homeassistant.helpers import (
 )
 
 from custom_components.event_simulator import history
+from custom_components.event_simulator.sandbox import engine
 
 from .test_engine import calls, run_child, summary, utc
 from .test_engine_fidelity import scenario
@@ -159,3 +162,73 @@ async def test_integration_specific_device_trigger_is_refused_by_name(hass: Home
     message = result["error"]["message"]
     assert "zha" in message
     assert "triggers/0" in message
+
+
+async def test_stores_carry_every_key_the_live_registry_saves(
+    hass: HomeAssistant, registries, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """A registry at its current storage version reads every key of its save data with no migration to fill them in.
+
+    Home Assistant 2026.9 added `settings` to the entity registry's store and `child_devices` to the device registry's; a store written with only the entry lists failed to load (`KeyError: 'child_devices'`), so every scenario with a registry snapshot came back `invalid_scenario`. Stand-ins for such keys here, so the check holds on any version.
+    """
+    added = {
+        er.EntityRegistry: {"settings": {"entity_id_parts": None}, "future_key": {"x": 1}},
+        dr.DeviceRegistry: {"child_devices": []},
+    }
+    for registry_class, extra in added.items():
+        original = registry_class._data_to_save
+        monkeypatch.setattr(
+            registry_class, "_data_to_save", lambda self, original=original, extra=extra: {**original(self), **extra}
+        )
+
+    snapshot = history.async_registry_snapshot(hass, {}, ["binary_sensor.hall_motion"])
+    assert snapshot["store_data"] == {
+        "entities": {"settings": {"entity_id_parts": None}, "future_key": {"x": 1}},
+        "devices": {"child_devices": []},
+    }
+
+    registry = engine._parse_registry(json.loads(json.dumps(snapshot)), [])
+    engine._write_registry_storage(str(tmp_path), registry, utc("2026-10-04T00:00:00+00:00"))
+    entities = json.loads((tmp_path / ".storage" / er.STORAGE_KEY).read_text())["data"]
+    devices = json.loads((tmp_path / ".storage" / dr.STORAGE_KEY).read_text())["data"]
+    assert entities["settings"] == {"entity_id_parts": None}
+    assert entities["future_key"] == {"x": 1}
+    assert [entity["entity_id"] for entity in entities["entities"]] == ["binary_sensor.hall_motion"]
+    assert entities["deleted_entities"] == []
+    assert devices["child_devices"] == []
+    assert [device["id"] for device in devices["devices"]] == [registries["sensor"].id]
+
+
+@pytest.mark.skipif(not hasattr(dr, "ChildDeviceEntry"), reason="child devices arrived in Home Assistant 2026.9")
+async def test_child_device_replays_with_its_parent(hass: HomeAssistant, registries):
+    """A child device travels in the device store's `child_devices`, its parent along with it, and templates in the replay see both."""
+    dev_reg = dr.async_get(hass)
+    hue = registries["motion"].config_entry_id
+    child = dev_reg.async_get_or_create_child(
+        config_entry_id=hue, identifiers={("hue", "sensor1-porch")}, name="Porch sensor", parent_device_id=registries["sensor"].id
+    )
+    porch = er.async_get(hass).async_get_or_create(
+        "binary_sensor", "hue", "porch1", config_entry=MockConfigEntry(domain="hue", entry_id=hue), device_id=child.id, suggested_object_id="porch_motion"
+    )
+    snapshot = history.async_registry_snapshot(hass, {}, [porch.entity_id])
+    assert [device["id"] for device in snapshot["devices"]] == [registries["sensor"].id]
+    assert [device["id"] for device in snapshot["store_data"]["devices"]["child_devices"]] == [child.id]
+
+    result = await replay(
+        hass,
+        {
+            "triggers": [{"trigger": "state", "entity_id": porch.entity_id, "to": "on"}],
+            "actions": [{"action": "notify.notify", "data": {"message": "{{ device_attr(device_id('binary_sensor.porch_motion'), 'name') }}"}}],
+        },
+        [porch.entity_id],
+        initial_states={porch.entity_id: {"state": "off", "attributes": MOTION}},
+        events=[{**event, "entity_id": porch.entity_id} for event in MOTION_EVENTS],
+    )
+    assert result["error"] is None, result["error"]
+    assert result["service_calls"][0]["data"]["message"] == "Porch sensor"
+
+
+async def test_store_data_must_be_objects_per_registry():
+    for bad in ("x", {"entities": []}, {"nonsense": {}}):
+        with pytest.raises(engine.ScenarioError, match="store_data"):
+            engine._parse_registry({"store_data": bad}, [])

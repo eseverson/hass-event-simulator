@@ -279,6 +279,9 @@ def async_registry_snapshot(
     def add_device(device: dr.DeviceEntry | None) -> None:
         if device is None or device.id in devices:
             return
+        # A child device (Home Assistant 2026.9+) is stored apart from devices and cannot load without its parent.
+        if (parent_id := getattr(device, "parent_device_id", None)) is not None:
+            add_device(dev_reg.async_get(parent_id))
         if len(devices) >= MAX_SNAPSHOT_DEVICES:
             truncated["devices"] += 1
             return
@@ -332,6 +335,7 @@ def async_registry_snapshot(
     for device in devices.values():
         entry_ids |= device.config_entries
 
+    children = [device for device in devices.values() if getattr(device, "parent_device_id", None)]
     snapshot: dict[str, Any] = {
         "versions": {
             "entities": [er.STORAGE_VERSION_MAJOR, er.STORAGE_VERSION_MINOR],
@@ -341,7 +345,11 @@ def async_registry_snapshot(
             "labels": [lr.STORAGE_VERSION_MAJOR, lr.STORAGE_VERSION_MINOR],
         },
         "entities": [_fragment(entry.as_storage_fragment) for entry in entities.values()],
-        "devices": [_fragment(device.as_storage_fragment) for device in devices.values()],
+        "devices": [
+            _fragment(device.as_storage_fragment)
+            for device in devices.values()
+            if not getattr(device, "parent_device_id", None)
+        ],
         # Areas, floors and labels have no per-entry storage form; their registries'
         # save data is small and filtered here.
         "areas": [
@@ -365,9 +373,24 @@ def async_registry_snapshot(
             if (entry := hass.config_entries.async_get_entry(entry_id)) is not None
         ],
     }
+    # The rest of each store's data (the entity registry's `settings`, the device registry's `child_devices`, ...), so the child writes stores in exactly the shape this Home Assistant loads: its registries read these keys unconditionally once the store is at the current version.
+    snapshot["store_data"] = {
+        "entities": _store_data(ent_reg, "entities", "deleted_entities"),
+        "devices": _store_data(dev_reg, "devices", "deleted_devices"),
+    }
+    if "child_devices" in snapshot["store_data"]["devices"]:
+        snapshot["store_data"]["devices"]["child_devices"] = [
+            _fragment(device.as_storage_fragment) for device in children
+        ]
     if any(truncated.values()):
         snapshot["truncated"] = {kind: count for kind, count in truncated.items() if count}
     return snapshot
+
+
+def _store_data(registry: Any, *skip: str) -> dict[str, Any]:
+    """A registry's save data other than the `skip` keys (its entry lists, which the snapshot filters)."""
+    data = registry._data_to_save()  # noqa: SLF001
+    return {key: _fragment(value) for key, value in data.items() if key not in skip}
 
 
 def _fragment(fragment: Any) -> dict[str, Any]:
