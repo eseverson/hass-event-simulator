@@ -38,3 +38,19 @@ jobs:
 
       - name: Run the test suite
         run: pytest -q
+
+  panel:
+    name: panel (node --test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Node 22 loads the panel's .js as an ES module without a package.json saying so.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Check and test the panel module
+        run: |
+          node --check custom_components/event_simulator/panel/event-simulator-panel.js
+          node --test tests/panel/*.test.mjs
