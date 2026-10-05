@@ -19,6 +19,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.loader import async_get_integration
 
+from . import websocket
 from .const import (
     DOMAIN,
     PANEL_ICON,
@@ -59,6 +60,7 @@ def _module_url(version: str, panel_js: Path) -> str:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    websocket.async_register(hass)
     await _async_register_panel(hass)
     return True
 
