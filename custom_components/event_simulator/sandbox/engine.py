@@ -4,8 +4,8 @@ Runs in the child process (see `__main__.py`). `run_scenario(scenario)` is the w
 
 Timeline of a replay (all virtual time, see `vclock.py`)
 --------------------------------------------------------
-1. `start - BOOT_LEAD`: a `HomeAssistant` boots on the virtual loop with a temporary config dir (deleted afterwards). It loads the base registries, sets up only the `homeassistant` and `labs` integrations (turning on the scenario's `core.preview_features`, so Labs-gated triggers and conditions validate as they do live), then runs `async_start`; the automation integration and whatever it pulls in (`trace`, `blueprint`, trigger/condition platforms) come later. No recorder, http, frontend or network-facing integrations, and `skip_pip` is on, so nothing is installed or fetched. `BOOT_LEAD` absorbs any timers boot waits on, so the window starts with everything settled.
-2. `start`: initial states are seeded with their recorded `last_changed` / `last_updated` (`StateMachine.async_set(..., timestamp=...)`; an attribute-only update is reproduced by a second write at `last_updated`); states without them are stamped `start`, the same clamp the recorder applies. Then the automation is validated with HA's own automation schema (invalid -> structured `invalid_automation` error) and set up. It attaches after `async_start`, so a `homeassistant: start` trigger does not fire, and at `start` exactly, so a time trigger at the window start does.
+1. `start - BOOT_LEAD`: a `HomeAssistant` boots on the virtual loop with a temporary config dir (deleted afterwards). The scenario's `registry` snapshot is written into that dir's `.storage` first, so the entity/device/area/floor/label registries load it through their own load path (config entries as disabled stubs, never set up); registered entities with no initial state get HA's own `unavailable` placeholder at start, as live HA gives entities whose integration did not load. It loads the base registries, sets up only the `homeassistant` and `labs` integrations (turning on the scenario's `core.preview_features`, so Labs-gated triggers and conditions validate as they do live), then runs `async_start`; the automation integration and whatever it pulls in (`trace`, `blueprint`, trigger/condition platforms) come later. No recorder, http, frontend or network-facing integrations, and `skip_pip` is on, so nothing is installed or fetched. `BOOT_LEAD` absorbs any timers boot waits on, so the window starts with everything settled.
+2. `start`: initial states are seeded with their recorded `last_changed` / `last_updated` (`StateMachine.async_set(..., timestamp=...)`; an attribute-only update is reproduced by a second write at `last_updated`); states without them are stamped `start`, the same clamp the recorder applies. Then the automation is checked for platforms the sandbox cannot run (custom integrations' triggers/conditions, integration-specific device automations -> `unsupported_automation`, naming each by config path), validated with HA's own automation schema (invalid -> structured `invalid_automation` error) and set up. It attaches after `async_start`, so a `homeassistant: start` trigger does not fire, and at `start` exactly, so a time trigger at the window start does.
 3. `[start, end)`: timeline events are written with `async_set` at their `at`; events at the same instant are written in list order. Every service call is intercepted at the `ServiceRegistry` (see `RecordingServiceRegistry`): recorded, answered with success (an empty response when one is asked for), and never executed, so recorded calls change no state.
 4. `end`: the automation's triggers are detached (`async_turn_off(stop_actions=False)`), so nothing new starts; the window is half-open and a run triggered at `end` itself is discarded. Runs already in flight (a `delay`, a `wait_for_trigger`, a queue) keep going for up to `overrun_seconds` of virtual time (default `DEFAULT_OVERRUN`, at most `MAX_OVERRUN`); a run still going at that bound is reported with outcome `unfinished` and a warning. Then HA is stopped.
 
@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import shutil
 import tempfile
@@ -58,8 +59,18 @@ from homeassistant.core import (
 )
 from homeassistant.core_config import async_process_ha_core_config
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import (
+    area_registry,
+    condition as condition_helper,
+    device_registry,
+    entity_registry,
+    floor_registry,
+    label_registry,
+)
+from homeassistant.helpers import trigger as trigger_helper
 from homeassistant.helpers.json import ExtendedJSONEncoder
 from homeassistant.helpers.trace import trace_id_get
+from homeassistant.loader import IntegrationNotFound, async_get_integration
 from homeassistant.setup import async_setup_component
 from voluptuous.humanize import humanize_error
 
@@ -89,6 +100,20 @@ _SEED_MARKER = "event_simulator_seed"
 DEFAULT_SEED = 0
 # Cap on HA log records surfaced as warnings.
 _MAX_LOG_WARNINGS = 50
+# The registry snapshot (scenario `registry`): kind -> (storage key, list key in the stored data, the registry's own deleted-items key, current (major, minor) version).
+_REGISTRY_STORES: dict[str, tuple[str, str, str | None, tuple[int, int]]] = {
+    "entities": (entity_registry.STORAGE_KEY, "entities", "deleted_entities", (entity_registry.STORAGE_VERSION_MAJOR, entity_registry.STORAGE_VERSION_MINOR)),
+    "devices": (device_registry.STORAGE_KEY, "devices", "deleted_devices", (device_registry.STORAGE_VERSION_MAJOR, device_registry.STORAGE_VERSION_MINOR)),
+    "areas": (area_registry.STORAGE_KEY, "areas", None, (area_registry.STORAGE_VERSION_MAJOR, area_registry.STORAGE_VERSION_MINOR)),
+    "floors": (floor_registry.STORAGE_KEY, "floors", None, (floor_registry.STORAGE_VERSION_MAJOR, floor_registry.STORAGE_VERSION_MINOR)),
+    "labels": (label_registry.STORAGE_KEY, "labels", None, (label_registry.STORAGE_VERSION_MAJOR, label_registry.STORAGE_VERSION_MINOR)),
+}
+# Upper bound on registry entries a scenario may carry (the live side caps far lower).
+MAX_REGISTRY_ITEMS = 10_000
+# Device automation platforms the sandbox can run: those of entity-domain integrations (binary_sensor, light, sensor, ...), which work from the entity and device registries alone. Integration-specific ones (zha, mqtt, hue, ...) need that integration running.
+_GENERIC_DEVICE_AUTOMATION_TYPE = "entity"
+# Config keys never searched for triggers/conditions: service-call payloads and variables.
+_PAYLOAD_KEYS = frozenset({"data", "data_template", "target", "variables", "event_data", "event_data_template", "response_variable", "metadata", "for_each"})
 
 
 class ScenarioError(Exception):
@@ -127,6 +152,7 @@ class _Scenario:
     overrun: timedelta
     seed: int
     preview_features: list[tuple[str, str]] = field(default_factory=list)
+    registry: dict[str, Any] = field(default_factory=dict)
     warnings: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -155,6 +181,7 @@ def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
     clock = VirtualClock(parsed.start - BOOT_LEAD)
     config_dir = tempfile.mkdtemp(prefix="event_simulator_")
     try:
+        _write_registry_storage(config_dir, parsed.registry, parsed.start - BOOT_LEAD)
         with patch_homeassistant_clock(clock):
             replay = _Replay(parsed, clock, config_dir)
             return clock.loop.run_until_complete(replay.run())
@@ -286,7 +313,95 @@ def _parse_scenario(raw: dict[str, Any]) -> _Scenario:
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ScenarioError("invalid_scenario", "seed must be an integer")
 
-    return _Scenario(core, start, end, automation, initial_states, events, services, overrun, seed, preview_features, warnings)
+    registry = _parse_registry(raw.get("registry"), warnings)
+
+    return _Scenario(core, start, end, automation, initial_states, events, services, overrun, seed, preview_features, registry, warnings)
+
+
+def _parse_registry(value: Any, warnings: list[dict[str, Any]]) -> dict[str, Any]:
+    """The `registry` snapshot: lists of storage-format entries per registry, config entry stubs, versions, and what the live side dropped."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ScenarioError("invalid_scenario", "registry must be an object")
+    parsed: dict[str, Any] = {}
+    total = 0
+    for kind in (*_REGISTRY_STORES, "config_entries"):
+        items = value.get(kind) or []
+        if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+            raise ScenarioError("invalid_scenario", f"registry.{kind} must be a list of objects")
+        total += len(items)
+        parsed[kind] = items
+    if total > MAX_REGISTRY_ITEMS:
+        raise ScenarioError("invalid_scenario", f"registry carries {total} entries; the limit is {MAX_REGISTRY_ITEMS}")
+    for stub in parsed["config_entries"]:
+        if not all(isinstance(stub.get(key), str) for key in ("entry_id", "domain")):
+            raise ScenarioError("invalid_scenario", "registry.config_entries items need string entry_id and domain")
+    versions = value.get("versions") or {}
+    if not isinstance(versions, dict):
+        raise ScenarioError("invalid_scenario", "registry.versions must be an object")
+    parsed["versions"] = {}
+    for kind, (_, _, _, current) in _REGISTRY_STORES.items():
+        version = versions.get(kind, list(current))
+        if not (isinstance(version, list) and len(version) == 2 and all(isinstance(part, int) and not isinstance(part, bool) for part in version)):
+            raise ScenarioError("invalid_scenario", f"registry.versions.{kind} must be [major, minor]")
+        parsed["versions"][kind] = version
+    truncated = value.get("truncated") or {}
+    if not isinstance(truncated, dict):
+        raise ScenarioError("invalid_scenario", "registry.truncated must be an object")
+    dropped = [f"{count} {kind}" for kind, count in truncated.items() if isinstance(count, int) and count > 0]
+    if dropped:
+        warnings.append(
+            _warning("registry_truncated", f"The registry snapshot was capped: {', '.join(dropped)} left out, so area/label/device lookups may see less than live")
+        )
+    return parsed
+
+
+def _write_registry_storage(config_dir: str, registry: dict[str, Any], stamp: datetime) -> None:
+    """Seed the temp config dir's `.storage` with the snapshot, so the registries load it through their own load path (and migrations) at boot.
+
+    Config entries are written as disabled stubs: they keep devices from being cleaned up as orphans and answer `config_entry_attr()` lookups, and being disabled they are never set up, so no integration code runs for them.
+    """
+    if not registry:
+        return
+    storage = os.path.join(config_dir, ".storage")
+    os.makedirs(storage, exist_ok=True)
+
+    def write(key: str, version: list[int] | tuple[int, int], data: dict[str, Any]) -> None:
+        with open(os.path.join(storage, key), "w", encoding="utf-8") as file:
+            json.dump({"version": version[0], "minor_version": version[1], "key": key, "data": data}, file)
+
+    for kind, (key, items_key, deleted_key, _) in _REGISTRY_STORES.items():
+        if not registry[kind]:
+            continue
+        data: dict[str, Any] = {items_key: registry[kind]}
+        if deleted_key:
+            data[deleted_key] = []
+        write(key, registry["versions"][kind], data)
+    if registry["config_entries"]:
+        now = stamp.isoformat()
+        entries = [
+            {
+                "created_at": now,
+                "data": {},
+                "disabled_by": config_entries.ConfigEntryDisabler.USER.value,
+                "discovery_keys": {},
+                "domain": stub["domain"],
+                "entry_id": stub["entry_id"],
+                "minor_version": 1,
+                "modified_at": now,
+                "options": {},
+                "pref_disable_new_entities": False,
+                "pref_disable_polling": False,
+                "source": config_entries.SOURCE_USER,
+                "subentries": [],
+                "title": str(stub.get("title") or stub["domain"]),
+                "unique_id": None,
+                "version": 1,
+            }
+            for stub in registry["config_entries"]
+        ]
+        write(config_entries.STORAGE_KEY, (config_entries.STORAGE_VERSION, config_entries.STORAGE_VERSION_MINOR), {"entries": entries})
 
 
 def _parse_preview_features(value: Any) -> list[tuple[str, str]]:
@@ -298,6 +413,64 @@ def _parse_preview_features(value: Any) -> list[tuple[str, str]]:
     ):
         raise ScenarioError("invalid_scenario", "core.preview_features must be a list of [domain, preview_feature] pairs")
     return [(domain, feature) for domain, feature in value]
+
+
+# --- platforms the sandbox cannot load --------------------------------------------------------------
+
+
+async def _check_platforms(hass: HomeAssistant, config: dict[str, Any]) -> None:
+    """Refuse, by name and config path, triggers/conditions/device automations the sandbox cannot run.
+
+    - Device triggers, conditions and actions of integration-specific platforms (zha, mqtt, hue, ...): they read that integration's runtime state, which the sandbox does not have. Those of entity-domain integrations (binary_sensor, light, sensor, ...) work from the registry snapshot and are allowed.
+    - Trigger and condition platforms of integrations that are not built into Home Assistant: custom integrations are never loaded in the sandbox, since that would run third-party code in it.
+    """
+    problems: list[str] = []
+    for path, node in _walk(config, ""):
+        if isinstance(node.get("domain"), str) and isinstance(node.get("type"), str) and "device_id" in node:
+            kind = "trigger" if "device" in (node.get("trigger"), node.get("platform")) else "condition" if node.get("condition") == "device" else "action"
+            domain = node["domain"]
+            integration = await _integration(hass, domain)
+            if integration is None:
+                problems.append(f"{path}: device {kind} from '{domain}', an integration that is not built into Home Assistant (custom integrations are not loaded in the sandbox)")
+            elif integration.integration_type != _GENERIC_DEVICE_AUTOMATION_TYPE:
+                problems.append(
+                    f"{path}: device {kind} from '{domain}' is specific to that integration and needs it running; only device {kind}s of entity domains (binary_sensor, light, sensor, switch, ...) replay"
+                )
+            continue
+        for key, aliases, what in (("trigger", _TRIGGER_ALIASES, "trigger"), ("platform", _TRIGGER_ALIASES, "trigger"), ("condition", _CONDITION_ALIASES, "condition")):
+            name = node.get(key)
+            if not isinstance(name, str) or (key == "trigger" and "condition" in node):
+                continue
+            domain = name.split(".", 1)[0]
+            domain = aliases.get(domain, domain)
+            if domain and await _integration(hass, domain) is None:
+                problems.append(f"{path}: {what} '{name}' comes from '{domain}', an integration that is not built into Home Assistant (custom integrations are not loaded in the sandbox)")
+            break
+    if problems:
+        raise ScenarioError("unsupported_automation", "The sandbox cannot replay this automation: " + "; ".join(problems))
+
+
+_TRIGGER_ALIASES: dict[str, str | None] = dict(getattr(trigger_helper, "_PLATFORM_ALIASES", {}))
+_CONDITION_ALIASES: dict[str | None, str | None] = dict(getattr(condition_helper, "_PLATFORM_ALIASES", {}))
+
+
+async def _integration(hass: HomeAssistant, domain: str) -> Any:
+    try:
+        return await async_get_integration(hass, domain)
+    except IntegrationNotFound:
+        return None
+
+
+def _walk(node: Any, path: str) -> Any:
+    """Every dict in the config with its slash path (`triggers/0`, `actions/1/if/0`), skipping service-call payloads."""
+    if isinstance(node, dict):
+        yield path, node
+        for key, value in node.items():
+            if key not in _PAYLOAD_KEYS:
+                yield from _walk(value, f"{path}/{key}" if path else str(key))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _walk(value, f"{path}/{index}")
 
 
 def _warning(code: str, message: str, at: datetime | None = None) -> dict[str, Any]:
@@ -357,8 +530,11 @@ class _Replay:
         collector = _LogCollector(self)
         ha_logger = logging.getLogger("homeassistant")
         try:
-            self.hass = await self._boot()
             try:
+                try:
+                    await self._boot()
+                except ScenarioError as err:
+                    return error_result(err.code, str(err), self.warnings)
                 await self._sleep_until(self.scenario.start)
                 self._seed_states()
                 ha_logger.addHandler(collector)
@@ -380,15 +556,20 @@ class _Replay:
         finally:
             automation_trace.async_store_trace = original_store
 
-    async def _boot(self) -> HomeAssistant:
-        hass = HomeAssistant(self.config_dir)
+    async def _boot(self) -> None:
+        self.hass = hass = HomeAssistant(self.config_dir)
         # Replaced before anything registers a service, so every registration lands in the recording registry.
         hass.services = RecordingServiceRegistry(hass, self._record_call)
         loader.async_setup(hass)
         hass.config.skip_pip = True
         hass.config.skip_pip_packages = []
         hass.config_entries = config_entries.ConfigEntries(hass, {})
-        await bootstrap.async_load_base_functionality(hass)
+        try:
+            await bootstrap.async_load_base_functionality(hass)
+        except Exception as err:
+            if not self.scenario.registry:
+                raise
+            raise ScenarioError("invalid_scenario", f"The registry snapshot could not be loaded: {type(err).__name__}: {err}") from err
         try:
             await async_process_ha_core_config(hass, dict(self.scenario.core))
         except Exception as err:
@@ -398,7 +579,6 @@ class _Replay:
         await self._enable_preview_features(hass)
         await hass.async_start()
         await hass.async_block_till_done()
-        return hass
 
     async def _enable_preview_features(self, hass: HomeAssistant) -> None:
         """Set up `labs` (live HA always has it) and turn on the scenario's preview features, before the automation is validated."""
@@ -439,6 +619,7 @@ class _Replay:
             config.pop("initial_state")
             self.warnings.append(_warning("initial_state_ignored", "initial_state: false was ignored so the automation can run"))
 
+        await _check_platforms(self.hass, config)
         try:
             await async_validate_config_item(self.hass, config["id"], config)
         except vol.Invalid as err:

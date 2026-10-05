@@ -106,3 +106,63 @@ def test_malformed_preview_features_are_refused():
     assert code == 0
     assert result["error"]["code"] == "invalid_scenario"
     assert "preview_features" in result["error"]["message"]
+
+
+# --- #12 platforms the sandbox cannot load --------------------------------------------------------
+
+
+def test_custom_integration_trigger_is_refused_by_name():
+    built = scenario(
+        {
+            "triggers": [{"trigger": "state", "entity_id": "binary_sensor.door"}, {"trigger": "my_custom.button_pressed", "button": 1}],
+            "actions": [{"action": "light.turn_on"}],
+        }
+    )
+    code, result, _ = run_child(built)
+    assert code == 0
+    assert result["error"]["code"] == "unsupported_automation"
+    assert "my_custom" in result["error"]["message"]
+    assert "triggers/1" in result["error"]["message"]
+
+
+def test_custom_integration_condition_in_an_action_is_refused_by_name():
+    built = scenario(
+        {
+            "triggers": [{"trigger": "state", "entity_id": "binary_sensor.door"}],
+            "actions": [{"if": [{"condition": "my_custom.is_home"}], "then": [{"action": "light.turn_on"}]}],
+        }
+    )
+    code, result, _ = run_child(built)
+    assert code == 0
+    assert result["error"]["code"] == "unsupported_automation"
+    assert "my_custom" in result["error"]["message"]
+    assert "actions/0/if/0" in result["error"]["message"]
+
+
+def test_malformed_registry_is_refused():
+    built = occupancy([NEW_TRIGGERS])
+    built["registry"] = {"entities": "nope"}
+    code, result, _ = run_child(built)
+    assert code == 0
+    assert result["error"]["code"] == "invalid_scenario"
+    assert "registry" in result["error"]["message"]
+
+
+def test_registry_entries_missing_fields_are_refused_not_a_crash():
+    built = occupancy([NEW_TRIGGERS])
+    built["registry"] = {"entities": [{"entity_id": "binary_sensor.hall_motion"}]}
+    code, result, stderr = run_child(built)
+    assert code == 0, stderr[-4000:]
+    assert result["error"]["code"] == "invalid_scenario"
+    assert "registry" in result["error"]["message"]
+
+
+def test_truncated_snapshot_is_a_warning():
+    built = occupancy([NEW_TRIGGERS])
+    built["registry"] = {"truncated": {"entities": 7}}
+    code, result, _ = run_child(built)
+    assert code == 0
+    assert result["error"] is None, result["error"]
+    truncated = [warning for warning in result["warnings"] if warning["code"] == "registry_truncated"]
+    assert len(truncated) == 1
+    assert "7 entities" in truncated[0]["message"]
