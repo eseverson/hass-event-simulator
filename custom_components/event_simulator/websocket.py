@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 import logging
 from typing import Any
@@ -26,6 +27,17 @@ from .store import DATA_STORE, SCENARIO_FIELDS, ScenarioStore
 _LOGGER = logging.getLogger(__name__)
 
 Handler = Callable[[HomeAssistant, websocket_api.ActiveConnection, dict[str, Any]], Awaitable[None]]
+
+
+def _error_payload(err: Exception) -> dict[str, Any]:
+    """The `error` object of a failed `simulate/subscribe` event, coded as `_wrap` codes a failed command."""
+    if isinstance(err, SimulatorError):
+        error = {"code": err.code, "message": str(err)}
+        if isinstance(err, SandboxError):
+            error["stderr_tail"] = err.stderr_tail
+        return error
+    _LOGGER.error("event_simulator websocket command failed", exc_info=err)
+    return {"code": websocket_api.ERR_UNKNOWN_ERROR, "message": f"{type(err).__name__}: {err}"}
 
 
 def _wrap(func: Handler) -> Handler:
@@ -64,6 +76,7 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_scenarios_save)
     websocket_api.async_register_command(hass, ws_scenarios_delete)
     websocket_api.async_register_command(hass, ws_simulate)
+    websocket_api.async_register_command(hass, ws_simulate_subscribe)
 
 
 @websocket_api.require_admin
@@ -168,34 +181,101 @@ def _aware_utc_iso(value: Any) -> str:
     return dt_util.as_utc(cv.datetime(value)).isoformat()
 
 
+# Only what the live side needs is checked here; the child validates the rest and answers with a structured error.
+SIMULATE_SCENARIO = vol.Schema(
+    {
+        vol.Required("start"): _aware_utc_iso,
+        vol.Required("end"): _aware_utc_iso,
+        vol.Required("automation"): vol.Any(dict, str),
+        vol.Optional("core"): dict,
+        vol.Optional("services"): dict,
+        vol.Optional("initial_states", default=dict): dict,
+        # A plain list, or packed (packed.py) to fit the websocket's 4 MiB message limit.
+        vol.Optional("events", default=list): vol.Any(list, unpack_events),
+    },
+    extra=vol.ALLOW_EXTRA,
+)
+
+
 @websocket_api.require_admin
 @websocket_api.websocket_command(
-    {
-        vol.Required("type"): f"{DOMAIN}/simulate",
-        # Only what the live side needs is checked here; the child validates the rest and answers with a structured error.
-        vol.Required("scenario"): vol.Schema(
-            {
-                vol.Required("start"): _aware_utc_iso,
-                vol.Required("end"): _aware_utc_iso,
-                vol.Required("automation"): vol.Any(dict, str),
-                vol.Optional("core"): dict,
-                vol.Optional("services"): dict,
-                vol.Optional("initial_states", default=dict): dict,
-                # A plain list, or packed (packed.py) to fit the websocket's 4 MiB message limit.
-                vol.Optional("events", default=list): vol.Any(list, unpack_events),
-            },
-            extra=vol.ALLOW_EXTRA,
-        ),
-    }
+    {vol.Required("type"): f"{DOMAIN}/simulate", vol.Required("scenario"): SIMULATE_SCENARIO}
 )
 @websocket_api.async_response
 @_wrap
 async def ws_simulate(hass, connection, msg: dict[str, Any]) -> None:
-    """Replay a scenario in the sandbox and send its result.
+    """Replay a scenario in the sandbox and send its result (see `async_simulate`).
 
-    `scenario.automation` may be a config dict or YAML text. `core` (time zone, location, units, Labs preview features), `registry` (the registry entries the automation can see) and `services` default to this instance's own, so the panel need not send them. A refusal from the child (invalid scenario or automation) is sent as an error with the child's code.
+    The replay is registered as a subscription of its message id, so the connection closing (or an `unsubscribe_events` for that id) cancels it and kills the child instead of leaving it to run out its timeout.
     """
-    scenario = dict(msg["scenario"])
+    cancel = asyncio.current_task().cancel
+    connection.subscriptions[msg["id"]] = cancel
+    try:
+        result = await async_simulate(hass, msg["scenario"])
+    finally:
+        if connection.subscriptions.get(msg["id"]) is cancel:
+            del connection.subscriptions[msg["id"]]
+    connection.send_result(msg["id"], result)
+
+
+class _Replay:
+    """A `simulate/subscribe` replay in flight; calling it (unsubscribe, connection close) cancels it."""
+
+    def __init__(self, task: asyncio.Task[None]) -> None:
+        self.task = task
+
+    def __call__(self) -> None:
+        self.task.cancel()
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): f"{DOMAIN}/simulate/subscribe", vol.Required("scenario"): SIMULATE_SCENARIO}
+)
+@callback
+def ws_simulate_subscribe(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Replay a scenario as a cancellable subscription: what the panel's auto-run uses.
+
+    Acknowledged at once; the outcome follows as one event, `{"result": ...}` or `{"error": {code, message[, stderr_tail]}}`. The subscription stays registered (inert) until the client unsubscribes, so the client's usual unsubscribe succeeds. Unsubscribing or closing the connection kills the child. Latest wins: a newer replay on the same connection supersedes (and kills) the one in flight, which gets a `superseded` error event, so a burst of edits holds at most one of the `runner.MAX_CONCURRENT` slots per connection.
+    """
+    msg_id = msg["id"]
+    connection.send_result(msg_id)
+    for sub_id, sub in list(connection.subscriptions.items()):
+        # A finished one has answered already and waits for the client's unsubscribe.
+        if isinstance(sub, _Replay) and not sub.task.done():
+            del connection.subscriptions[sub_id]
+            sub()
+            connection.send_message(
+                websocket_api.event_message(
+                    sub_id,
+                    {"error": {"code": "superseded", "message": "A newer replay replaced this one"}},
+                )
+            )
+
+    async def replay() -> None:
+        try:
+            event: dict[str, Any] = {"result": await async_simulate(hass, msg["scenario"])}
+        except Exception as err:  # noqa: BLE001
+            event = {"error": _error_payload(err)}
+        if connection.subscriptions.get(msg_id) is handle:  # not unsubscribed or superseded meanwhile
+            connection.send_message(websocket_api.event_message(msg_id, event))
+
+    handle = _Replay(
+        hass.async_create_background_task(
+            replay(), f"{DOMAIN}.simulate:{msg_id}", eager_start=False
+        )
+    )
+    connection.subscriptions[msg_id] = handle
+
+
+async def async_simulate(hass: HomeAssistant, scenario: dict[str, Any]) -> dict[str, Any]:
+    """Replay a scenario (validated by SIMULATE_SCENARIO) in the sandbox and return its result.
+
+    `scenario.automation` may be a config dict or YAML text. `core` (time zone, location, units, Labs preview features), `registry` (the registry entries the automation can see) and `services` default to this instance's own, so the panel need not send them. A refusal from the child (invalid scenario or automation) raises SimulatorError with the child's code.
+    """
+    scenario = dict(scenario)
     check_window(dt_util.parse_datetime(scenario["start"]), dt_util.parse_datetime(scenario["end"]))
     if (count := len(scenario["events"])) > MAX_EVENTS:
         raise SimulatorError(
@@ -235,7 +315,7 @@ async def ws_simulate(hass, connection, msg: dict[str, Any]) -> None:
         raise SimulatorError(
             str(error.get("code") or "sandbox_failed"), str(error.get("message") or "")
         )
-    connection.send_result(msg["id"], result)
+    return result
 
 
 def parse_automation_yaml(text: str) -> dict[str, Any]:
