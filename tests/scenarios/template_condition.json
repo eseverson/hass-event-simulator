@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "core": {"time_zone": "UTC", "latitude": 52.37, "longitude": 4.89, "elevation": 0, "unit_system": "metric"},
+  "start": "2026-10-04T00:00:00+00:00",
+  "end": "2026-10-04T06:00:00+00:00",
+  "automation": {
+    "id": "dark_mode",
+    "alias": "Mode change when dark",
+    "triggers": [{"trigger": "state", "entity_id": "input_select.mode"}],
+    "conditions": [{"condition": "template", "value_template": "{{ states('sensor.lux') | float(0) < 50 }}"}],
+    "actions": [{"action": "light.turn_on", "target": {"entity_id": "light.living"}, "data": {"brightness_pct": "{{ 10 if trigger.to_state.state == 'night' else 80 }}"}}]
+  },
+  "initial_states": {
+    "input_select.mode": {"state": "day", "attributes": {}},
+    "sensor.lux": {"state": "100", "attributes": {"unit_of_measurement": "lx"}}
+  },
+  "events": [
+    {"at": "2026-10-04T01:00:00+00:00", "entity_id": "input_select.mode", "state": "evening", "attributes": {}},
+    {"at": "2026-10-04T01:30:00+00:00", "entity_id": "sensor.lux", "state": "20", "attributes": {"unit_of_measurement": "lx"}},
+    {"at": "2026-10-04T02:00:00+00:00", "entity_id": "input_select.mode", "state": "night", "attributes": {}}
+  ]
+}

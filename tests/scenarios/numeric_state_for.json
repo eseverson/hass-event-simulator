@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "core": {"time_zone": "UTC", "latitude": 52.37, "longitude": 4.89, "elevation": 0, "unit_system": "metric"},
+  "start": "2026-10-04T00:00:00+00:00",
+  "end": "2026-10-04T06:00:00+00:00",
+  "automation": {
+    "id": "too_warm",
+    "alias": "Too warm for five minutes",
+    "triggers": [{"trigger": "numeric_state", "entity_id": "sensor.temp", "above": 25, "for": "00:05:00"}],
+    "actions": [{"action": "notify.notify", "data": {"message": "Temp is {{ states('sensor.temp') }}"}}]
+  },
+  "initial_states": {"sensor.temp": {"state": "20", "attributes": {"unit_of_measurement": "°C"}}},
+  "events": [
+    {"at": "2026-10-04T01:00:00+00:00", "entity_id": "sensor.temp", "state": "26", "attributes": {"unit_of_measurement": "°C"}},
+    {"at": "2026-10-04T01:03:00+00:00", "entity_id": "sensor.temp", "state": "24", "attributes": {"unit_of_measurement": "°C"}},
+    {"at": "2026-10-04T02:00:00+00:00", "entity_id": "sensor.temp", "state": "27", "attributes": {"unit_of_measurement": "°C"}},
+    {"at": "2026-10-04T02:02:00+00:00", "entity_id": "sensor.temp", "state": "28", "attributes": {"unit_of_measurement": "°C"}}
+  ]
+}

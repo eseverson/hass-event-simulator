@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "core": {"time_zone": "UTC", "latitude": 52.37, "longitude": 4.89, "elevation": 0, "unit_system": "metric"},
+  "start": "2026-10-04T00:00:00+00:00",
+  "end": "2026-10-04T06:00:00+00:00",
+  "automation": {
+    "id": "broken",
+    "alias": "Broken trigger",
+    "triggers": [{"trigger": "numeric_state", "entity_id": "sensor.temp"}],
+    "actions": [{"action": "light.turn_on", "target": {"entity_id": "light.hall"}}]
+  },
+  "initial_states": {},
+  "events": []
+}

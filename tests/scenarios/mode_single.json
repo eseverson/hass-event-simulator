@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "core": {"time_zone": "UTC", "latitude": 52.37, "longitude": 4.89, "elevation": 0, "unit_system": "metric"},
+  "start": "2026-10-04T00:00:00+00:00",
+  "end": "2026-10-04T06:00:00+00:00",
+  "automation": {
+    "id": "single_light",
+    "alias": "Single-mode delayed light",
+    "mode": "single",
+    "max_exceeded": "silent",
+    "triggers": [{"trigger": "state", "entity_id": "binary_sensor.door", "to": "on"}],
+    "actions": [{"delay": "00:05:00"}, {"action": "light.turn_on", "target": {"entity_id": "light.hall"}}]
+  },
+  "initial_states": {"binary_sensor.door": {"state": "off", "attributes": {}}},
+  "events": [
+    {"at": "2026-10-04T01:00:00+00:00", "entity_id": "binary_sensor.door", "state": "on", "attributes": {}},
+    {"at": "2026-10-04T01:01:00+00:00", "entity_id": "binary_sensor.door", "state": "off", "attributes": {}},
+    {"at": "2026-10-04T01:02:00+00:00", "entity_id": "binary_sensor.door", "state": "on", "attributes": {}},
+    {"at": "2026-10-04T01:10:00+00:00", "entity_id": "binary_sensor.door", "state": "off", "attributes": {}},
+    {"at": "2026-10-04T02:00:00+00:00", "entity_id": "binary_sensor.door", "state": "on", "attributes": {}}
+  ]
+}

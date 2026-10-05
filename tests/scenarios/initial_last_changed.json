@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "core": {"time_zone": "UTC", "latitude": 52.37, "longitude": 4.89, "elevation": 0, "unit_system": "metric"},
+  "start": "2026-10-04T00:00:00+00:00",
+  "end": "2026-10-04T02:00:00+00:00",
+  "automation": {
+    "id": "closed_long_enough",
+    "alias": "Motion while the door has been closed ten minutes",
+    "triggers": [{"trigger": "state", "entity_id": "binary_sensor.motion", "to": "on"}],
+    "conditions": [{"condition": "state", "entity_id": "binary_sensor.door", "state": "off", "for": "00:10:00"}],
+    "actions": [{"action": "notify.notify", "data": {"message": "{{ states.binary_sensor.door.last_changed.isoformat() }}|{{ states.binary_sensor.door.last_updated.isoformat() }}"}}]
+  },
+  "initial_states": {
+    "binary_sensor.door": {"state": "off", "attributes": {"battery": 80}, "last_changed": "2026-10-03T08:00:00+00:00", "last_updated": "2026-10-03T20:00:00+00:00"},
+    "binary_sensor.motion": {"state": "off", "attributes": {}}
+  },
+  "events": [
+    {"at": "2026-10-04T00:05:00+00:00", "entity_id": "binary_sensor.motion", "state": "on", "attributes": {}}
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "core": {"time_zone": "UTC", "latitude": 52.37, "longitude": 4.89, "elevation": 0, "unit_system": "metric"},
+  "start": "2026-10-04T00:00:00+00:00",
+  "end": "2026-10-04T06:00:00+00:00",
+  "automation": {
+    "id": "door_cycle",
+    "alias": "Light while the door is open",
+    "mode": "parallel",
+    "triggers": [{"trigger": "state", "entity_id": "binary_sensor.door", "to": "on"}],
+    "actions": [
+      {"delay": "00:02:00"},
+      {"action": "light.turn_on", "target": {"entity_id": "light.hall"}},
+      {"wait_for_trigger": [{"trigger": "state", "entity_id": "binary_sensor.door", "to": "off"}], "timeout": "00:10:00", "continue_on_timeout": true},
+      {"action": "light.turn_off", "target": {"entity_id": "light.hall"}, "data": {"transition": "{{ 1 if wait.trigger else 5 }}"}}
+    ]
+  },
+  "initial_states": {"binary_sensor.door": {"state": "off", "attributes": {}}},
+  "events": [
+    {"at": "2026-10-04T01:00:00+00:00", "entity_id": "binary_sensor.door", "state": "on", "attributes": {}},
+    {"at": "2026-10-04T01:05:00+00:00", "entity_id": "binary_sensor.door", "state": "off", "attributes": {}},
+    {"at": "2026-10-04T03:00:00+00:00", "entity_id": "binary_sensor.door", "state": "on", "attributes": {}}
+  ]
+}
