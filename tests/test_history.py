@@ -45,6 +45,16 @@ AUTOMATIONS = [
 ]
 
 
+@pytest.fixture(autouse=True)
+async def detach_automations(hass: HomeAssistant):
+    """Turn every automation off after the test, so a time trigger leaves no timer behind (the harness fails a test on one from 2026.9)."""
+    yield
+    if hass.services.has_service("automation", "turn_off"):
+        await hass.services.async_call(
+            "automation", "turn_off", {"entity_id": "all"}, blocking=True
+        )
+
+
 @pytest.fixture
 async def automations(hass: HomeAssistant):
     hass.states.async_set("input_boolean.guest_mode", "off")
@@ -262,16 +272,14 @@ async def test_core_config(hass: HomeAssistant):
 
 async def test_core_config_carries_enabled_preview_features(hass: HomeAssistant):
     assert await async_setup_component(hass, "labs", {})
-    await labs.async_update_preview_feature(
-        hass, "automation", "new_triggers_conditions", True
-    )
+    await labs.async_update_preview_feature(hass, "frontend", "winter_mode", True)
     await labs.async_update_preview_feature(hass, "kitchen_sink", "special_repair", True)
     await labs.async_update_preview_feature(
         hass, "kitchen_sink", "special_repair", False
     )
 
     assert history.async_core_config(hass)["preview_features"] == [
-        ["automation", "new_triggers_conditions"]
+        ["frontend", "winter_mode"]
     ]
 
 

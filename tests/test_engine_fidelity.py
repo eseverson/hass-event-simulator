@@ -6,10 +6,12 @@ Same harness as test_engine.py: every scenario runs through a real child process
 from __future__ import annotations
 
 import concurrent.futures
-import copy
 from collections.abc import Callable
+import json
+from pathlib import Path
 from typing import Any
 
+import homeassistant.components.automation
 import pytest
 
 from .test_engine import calls, run_child, summary, utc
@@ -17,6 +19,13 @@ from .test_engine import calls, run_child, summary, utc
 START = "2026-10-04T00:00:00+00:00"
 END = "2026-10-04T06:00:00+00:00"
 NEW_TRIGGERS = ["automation", "new_triggers_conditions"]
+# A preview feature every supported release declares (frontend's), for tests that need any real one.
+ANY_FEATURE = ["frontend", "winter_mode"]
+# Purpose-specific triggers sat behind NEW_TRIGGERS until they graduated (gone by 2026.9); the gated-trigger tests need a release that still has the flag.
+HAS_NEW_TRIGGERS_FLAG = "new_triggers_conditions" in json.loads(
+    (Path(homeassistant.components.automation.__file__).parent / "manifest.json").read_text()
+).get("preview_features", {})
+needs_new_triggers_flag = pytest.mark.skipif(not HAS_NEW_TRIGGERS_FLAG, reason="this Home Assistant has no automation.new_triggers_conditions preview feature")
 
 
 def scenario(automation: dict[str, Any], **extra: Any) -> dict[str, Any]:
@@ -52,11 +61,26 @@ def occupancy(preview_features: list[list[str]] | None) -> dict[str, Any]:
     return built
 
 
+def door(preview_features: list[list[str]] | None = None) -> dict[str, Any]:
+    """A plain state trigger, which every release runs with or without preview features."""
+    built = scenario(
+        {
+            "triggers": [{"trigger": "state", "entity_id": "binary_sensor.door", "to": "on"}],
+            "actions": [{"action": "light.turn_on", "target": {"entity_id": "light.hall"}}],
+        },
+        initial_states={"binary_sensor.door": {"state": "off"}},
+        events=[{"at": "2026-10-04T01:00:00+00:00", "entity_id": "binary_sensor.door", "state": "on"}],
+    )
+    if preview_features is not None:
+        built["core"]["preview_features"] = preview_features
+    return built
+
+
 SCENARIOS: dict[str, Callable[[], dict[str, Any]]] = {
-    "labs_enabled": lambda: occupancy([NEW_TRIGGERS]),
-    "labs_disabled": lambda: occupancy(None),
-    "labs_unknown_feature": lambda: occupancy([NEW_TRIGGERS, ["nope", "not_a_feature"]]),
+    "labs_unknown_feature": lambda: door([ANY_FEATURE, ["nope", "not_a_feature"]]),
 }
+if HAS_NEW_TRIGGERS_FLAG:
+    SCENARIOS |= {"labs_enabled": lambda: occupancy([NEW_TRIGGERS]), "labs_disabled": lambda: occupancy(None)}
 
 
 @pytest.fixture(scope="module")
@@ -76,6 +100,7 @@ def codes(result: dict[str, Any]) -> list[str]:
 # --- #11 Labs preview features -------------------------------------------------------------------
 
 
+@needs_new_triggers_flag
 def test_preview_feature_in_the_scenario_enables_experimental_triggers(results):
     result = results["labs_enabled"]
     assert result["error"] is None, result["error"]
@@ -84,6 +109,7 @@ def test_preview_feature_in_the_scenario_enables_experimental_triggers(results):
     assert result["runs"][0]["trigger"]["entity_id"] == "binary_sensor.hall_motion"
 
 
+@needs_new_triggers_flag
 def test_experimental_trigger_without_the_feature_is_invalid(results):
     result = results["labs_disabled"]
     assert result["error"]["code"] == "invalid_automation"
@@ -158,7 +184,7 @@ def test_registry_entries_missing_fields_are_refused_not_a_crash():
 
 
 def test_truncated_snapshot_is_a_warning():
-    built = occupancy([NEW_TRIGGERS])
+    built = door()
     built["registry"] = {"truncated": {"entities": 7}}
     code, result, _ = run_child(built)
     assert code == 0

@@ -16,21 +16,43 @@ permissions:
 
 jobs:
   pytest:
-    name: pytest
+    name: pytest (HA ${{ matrix.ha }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest release hacs.json accepts.
+          - ha: minimum
+            python: "3.13"
+            homeassistant: "2026.2.3"
+          # The newest stable release, which is what most installs run. Each release can
+          # raise the Python floor, and pip quietly falls back to an older core that still
+          # fits, so this one follows core's own Python and pins the version it resolves.
+          - ha: latest
+            python: "3.14"
+            homeassistant: latest
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: tests/requirements.txt
 
       - name: Install Home Assistant and the test harness
         run: |
           python -m pip install --upgrade pip
-          pip install -r tests/requirements.txt
+          VERSION="${{ matrix.homeassistant }}"
+          if [ "$VERSION" = latest ]; then
+            # PyPI's `info.version` is the newest stable release, never a beta.
+            VERSION=$(python -c "import json,urllib.request;print(json.load(urllib.request.urlopen('https://pypi.org/pypi/homeassistant/json'))['info']['version'])")
+          fi
+          echo "Home Assistant $VERSION"
+          # The harness release that pins exactly this core.
+          pip install "homeassistant==$VERSION" pytest-homeassistant-custom-component
+          python -c "import homeassistant.const as c, sys; sys.exit(c.__version__ != '$VERSION')"
           # The frontend package is not a dependency of homeassistant, but the panel
           # tests need the exact build the installed core asks for.
           FRONTEND=$(python -c "import json,os,homeassistant.components.frontend as f;print(json.load(open(os.path.join(os.path.dirname(f.__file__),'manifest.json')))['requirements'][0])")
