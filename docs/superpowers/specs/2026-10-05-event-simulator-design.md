@@ -49,12 +49,30 @@ Integration domain `event_simulator`, layout mirroring `hass-integration-pins` (
   "start": "2026-10-04T00:00:00+00:00",
   "end":   "2026-10-05T00:00:00+00:00",
   "automation": { "...": "automation config dict" },
-  "initial_states": {"binary_sensor.door": {"state": "off", "attributes": {}}},
-  "events": [{"at": "2026-10-04T07:12:03+00:00", "entity_id": "binary_sensor.door", "state": "on", "attributes": {}}]
+  "initial_states": {"binary_sensor.door": {"state": "off", "attributes": {}, "last_changed": "2026-10-03T21:40:00+00:00", "last_updated": "2026-10-03T21:40:00+00:00"}},
+  "events": [{"at": "2026-10-04T07:12:03+00:00", "entity_id": "binary_sensor.door", "state": "on", "attributes": {}}],
+  "services": {"light": ["turn_on", "turn_off"]},
+  "overrun_seconds": 3600,
+  "seed": 0
 }
 ```
 
-Result: `{"runs": [{"started", "finished", "trigger": {...}, "outcome": "fired|condition_failed|error|...", "stopped_by", "trace": {...}}], "service_calls": [{"at", "domain", "service", "data", "target", "run"}], "warnings": [...]}`.
+The window is half-open, `[start, end)`. `last_changed` / `last_updated` on an initial state are optional (absent: the state is stamped `start`, as the recorder clamps it); they let a `for:` early in the window see how long the state really held (#10). Events outside the window are skipped with a warning; extra event keys (`last_changed`, ...) are ignored, since HA derives them from the write. Optional: `services` (the live instance's services, so calls to anything else are flagged), `overrun_seconds` (how long runs in flight at `end` may continue, default 1 h, max 24 h), `seed` (Python `random` seed; HA uses it for the 50–500 ms offset of time-change triggers and for run ids, so a fixed seed makes replays repeatable).
+
+Result:
+
+```json
+{
+  "version": 1, "start": "...", "end": "...", "error": null,
+  "runs": [{"id": "run id", "started": "...", "finished": "... | null", "trigger": {"idx", "id", "alias", "platform", "description", "entity_id", "from_state", "to_state"},
+            "outcome": "fired|condition_failed|dropped|aborted|cancelled|error|unfinished", "stopped_by": "condition/0 | mode_single | max_runs | recursion | action/N | null",
+            "script_execution": "HA's value", "error": "message | null", "trace": {"...": "as_extended_dict()"}}],
+  "service_calls": [{"at", "domain", "service", "data", "target", "run", "context": {"id", "parent_id", "user_id"}}],
+  "warnings": [{"code": "event_outside_window|unknown_service|run_unfinished|initial_state_after_start|initial_state_ignored|late_attach|log|log_truncated", "message", "at"}]
+}
+```
+
+A refused scenario or automation yields the same shape with `error: {"code": "invalid_scenario" | "invalid_automation", "message"}` and empty lists. The child is started with `sandbox.child_command()` (`[sys.executable, <sandbox dir>]`): exit 0 whenever a result was written (including those errors), 2 when stdin is not a JSON object, 1 on a crash (an `internal_error` result plus the traceback on stderr). Engine details (boot lead, seeding, end-of-window handling) are in `sandbox/engine.py`'s module docstring.
 
 ## Error handling
 
