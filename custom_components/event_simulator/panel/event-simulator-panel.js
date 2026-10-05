@@ -431,6 +431,55 @@ export function buildScenario({ automation, start, end, tracks }) {
   };
 }
 
+/* Home Assistant's websocket closes the connection on a message over 4 MiB (aiohttp's
+ * default), so every request the panel sends is measured against this first, with room
+ * left for the envelope. */
+export const WS_MESSAGE_LIMIT = 4 * 1024 * 1024 - 16 * 1024;
+
+/* Scenario events as `{entity_ids, attributes, rows}`, each row `[at, entity index,
+ * state, attributes index]` (websocket.py unpacks it). Entity ids and attribute dicts
+ * repeat in nearly every recorded event, so this is several times smaller; only what the
+ * replay reads is kept. */
+export function packEvents(events) {
+  const entityIds = [];
+  const entityIndex = new Map();
+  const attributes = [];
+  const attrIndex = new Map();
+  const rows = events.map((ev) => {
+    let e = entityIndex.get(ev.entity_id);
+    if (e === undefined) {
+      e = entityIds.push(ev.entity_id) - 1;
+      entityIndex.set(ev.entity_id, e);
+    }
+    const attrs = isObject(ev.attributes) ? ev.attributes : {};
+    const key = stableStringify(attrs);
+    let a = attrIndex.get(key);
+    if (a === undefined) {
+      a = attributes.push(attrs) - 1;
+      attrIndex.set(key, a);
+    }
+    return [ev.at, e, String(ev.state), a];
+  });
+  return { entity_ids: entityIds, attributes, rows };
+}
+
+/* The event_simulator/simulate request for a scenario from buildScenario. */
+export function simulateMessage(scenario) {
+  return { type: "event_simulator/simulate", scenario: { ...scenario, events: packEvents(scenario.events || []) } };
+}
+
+/* null when a request fits in one websocket message, else a {code, message} error to show
+ * instead of sending it (sending it would drop the whole frontend connection). */
+export function messageSizeError(message) {
+  const bytes = new TextEncoder().encode(JSON.stringify(message)).length;
+  if (bytes <= WS_MESSAGE_LIMIT) return null;
+  const mb = (n) => (n / (1024 * 1024)).toFixed(1);
+  return {
+    code: "too_large",
+    message: `This request is ${mb(bytes)} MB, and Home Assistant accepts at most 4 MB in one websocket message. Try a shorter window or fewer tracks.`,
+  };
+}
+
 /* `YYYY-MM-DDTHH:MM` in local time, the value format of <input type="datetime-local">. */
 export function toLocalInput(ms) {
   const d = new Date(ms);
@@ -1419,11 +1468,17 @@ class EventSimulatorPanel extends Base {
       end: this._window.end,
       tracks: this._tracks,
     });
+    const message = simulateMessage(scenario);
+    const tooLarge = messageSizeError(message);
+    if (tooLarge) {
+      this._runError = describeRunError(tooLarge);
+      return this._render();
+    }
     this._running = true;
     this._runError = null;
     this._render();
     try {
-      const raw = await this._hass.callWS({ type: "event_simulator/simulate", scenario });
+      const raw = await this._hass.callWS(message);
       if (raw && raw.error && !Array.isArray(raw.runs)) {
         this._runError = describeRunError({ ...(isObject(raw.error) ? raw.error : { message: String(raw.error) }), stderr_tail: raw.stderr_tail });
       } else {
@@ -1527,15 +1582,17 @@ class EventSimulatorPanel extends Base {
     }
     const payload = this._payload(check.value);
     const overwrite = !asNew && this._scenario ? this._scenario.scenario_id : null;
+    const message = { type: "event_simulator/scenarios/save", ...payload, ...(overwrite ? { scenario_id: overwrite } : {}) };
+    const tooLarge = messageSizeError(message);
+    if (tooLarge) {
+      this._scError = `This scenario is too large to save. ${tooLarge.message}`;
+      return this._render();
+    }
     this._scBusy = true;
     this._scError = null;
     this._render();
     try {
-      const summary = await this._hass.callWS({
-        type: "event_simulator/scenarios/save",
-        ...payload,
-        ...(overwrite ? { scenario_id: overwrite } : {}),
-      });
+      const summary = await this._hass.callWS(message);
       this._scenario = { scenario_id: summary.scenario_id, name: summary.name };
       this._savedPrint = scenarioFingerprint(payload);
       this._saveForm = null;

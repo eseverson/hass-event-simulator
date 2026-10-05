@@ -407,6 +407,78 @@ async def test_simulate_fills_core_and_services(hass: HomeAssistant, setup, hass
     assert seen["start"] == "2026-10-04T00:00:00+00:00"
 
 
+PACKED_EVENTS = {
+    "entity_ids": ["binary_sensor.door"],
+    "attributes": [{}, {"device_class": "door"}],
+    "rows": [
+        ["2026-10-04T01:00:00+00:00", 0, "on", 1],
+        ["2026-10-04T01:05:00+00:00", 0, "off", 0],
+    ],
+}
+
+
+async def test_simulate_accepts_packed_events(hass: HomeAssistant, setup, hass_ws_client):
+    """The panel packs events (shared entity ids and attributes) to stay under the websocket's 4 MiB message limit."""
+    client = await hass_ws_client(hass)
+    seen = {}
+
+    async def fake_run(hass, scenario, **kwargs):
+        seen.update(scenario)
+        return {"version": 1, "error": None, "runs": [], "service_calls": [], "warnings": []}
+
+    with patch("custom_components.event_simulator.runner.async_run_scenario", fake_run):
+        msg = await _call(
+            client,
+            {"type": "event_simulator/simulate", "scenario": {**SIMULATE, "events": PACKED_EVENTS}},
+        )
+
+    assert msg["success"], msg
+    assert seen["events"] == [
+        {"at": "2026-10-04T01:00:00+00:00", "entity_id": "binary_sensor.door", "state": "on", "attributes": {"device_class": "door"}},
+        {"at": "2026-10-04T01:05:00+00:00", "entity_id": "binary_sensor.door", "state": "off", "attributes": {}},
+    ]
+    assert seen["registry"] == history.async_registry_snapshot(
+        hass, seen["automation"], ["binary_sensor.door", "sun.sun"]
+    )
+
+
+@pytest.mark.parametrize(
+    "packed",
+    [
+        {**PACKED_EVENTS, "rows": [["2026-10-04T01:00:00+00:00", 1, "on", 0]]},
+        {**PACKED_EVENTS, "rows": [["2026-10-04T01:00:00+00:00", 0, "on", 2]]},
+        {**PACKED_EVENTS, "rows": [["2026-10-04T01:00:00+00:00", 0, "on"]]},
+        {**PACKED_EVENTS, "rows": [["2026-10-04T01:00:00+00:00", 0, 5, 0]]},
+        {**PACKED_EVENTS, "attributes": ["x"]},
+        {"entity_ids": ["binary_sensor.door"]},
+    ],
+)
+async def test_simulate_rejects_bad_packed_events(
+    hass: HomeAssistant, setup, hass_ws_client, packed
+):
+    client = await hass_ws_client(hass)
+
+    msg = await _call(
+        client, {"type": "event_simulator/simulate", "scenario": {**SIMULATE, "events": packed}}
+    )
+
+    assert not msg["success"]
+    assert msg["error"]["code"] in ("invalid_scenario", "invalid_format")
+
+
+async def test_simulate_counts_packed_events_against_the_limit(
+    hass: HomeAssistant, setup, hass_ws_client
+):
+    client = await hass_ws_client(hass)
+
+    with patch("custom_components.event_simulator.websocket.MAX_EVENTS", 1):
+        msg = await _call(
+            client, {"type": "event_simulator/simulate", "scenario": {**SIMULATE, "events": PACKED_EVENTS}}
+        )
+
+    assert msg["error"]["code"] == "too_many_events"
+
+
 async def test_simulate_keeps_a_given_core(hass: HomeAssistant, setup, hass_ws_client):
     client = await hass_ws_client(hass)
     seen = {}
