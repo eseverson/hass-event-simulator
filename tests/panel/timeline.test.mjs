@@ -18,6 +18,11 @@ import {
   mergeSegments,
   normalizeResult,
   numericRange,
+  OUTCOMES,
+  OUTCOME_STYLE,
+  outcomeMarker,
+  outcomeSummary,
+  outcomeText,
   panView,
   segmentAt,
   stateColor,
@@ -232,7 +237,58 @@ test("calls can reference a run by id", () => {
 test("outcomes classify", () => {
   assert.equal(classifyOutcome("FIRED"), "fired");
   assert.equal(classifyOutcome(undefined, { error: "x" }), "error");
-  assert.equal(classifyOutcome("cancelled"), "other");
+  // every outcome sandbox/engine.py reports keeps its own name
+  for (const o of ["fired", "condition_failed", "dropped", "aborted", "cancelled", "error", "unfinished"]) assert.equal(classifyOutcome(o), o);
+  assert.equal(classifyOutcome("weird"), "other");
+  assert.equal(classifyOutcome(undefined), "other");
+});
+
+test("each outcome has its own color, marker shape and label", () => {
+  assert.deepEqual(Object.keys(OUTCOME_STYLE).sort(), [...OUTCOMES].sort());
+  const unique = (xs) => new Set(xs).size === xs.length;
+  assert.ok(unique(OUTCOMES.map((o) => OUTCOME_STYLE[o].color)), "colors");
+  assert.ok(unique(OUTCOMES.map((o) => OUTCOME_STYLE[o].label)), "labels");
+  // the shape alone tells them apart, without color vision
+  assert.ok(unique(OUTCOMES.map((o) => outcomeMarker(o, 0, 0, "C"))), "shapes");
+  for (const o of OUTCOMES) assert.match(outcomeMarker(o, 10, 12), new RegExp(OUTCOME_STYLE[o].color.replace(/[()]/g, "\\$&")));
+});
+
+test("an outcome reads as what happened, with why a run was dropped", () => {
+  const run = (outcome, extra = {}) => normalizeResult({ runs: [{ started: iso(T0), outcome, ...extra }] }).runs[0];
+  assert.equal(outcomeText(run("fired")), "Fired");
+  assert.equal(outcomeText(run("cancelled", { stopped_by: "action/0" })), "Cancelled");
+  assert.equal(outcomeText(run("dropped", { stopped_by: "mode_single" })), "Dropped by mode: single");
+  assert.equal(outcomeText(run("dropped", { stopped_by: "max_runs" })), "Dropped at max_runs");
+  assert.equal(outcomeText(run("dropped", { stopped_by: "recursion" })), "Dropped as recursive");
+  assert.equal(outcomeText(run("unfinished")), "Still running after the overrun");
+  assert.equal(outcomeText(run("weird")), "Other (weird)");
+});
+
+test("the legend counts each outcome by name, in a fixed order", () => {
+  const runs = normalizeResult({
+    runs: [
+      { started: iso(T0), outcome: "dropped", stopped_by: "mode_single" },
+      { started: iso(T0), outcome: "condition_failed", stopped_by: "condition/0" },
+      { started: iso(T0), outcome: "fired" },
+      { started: iso(T0), outcome: "dropped", stopped_by: "mode_single" },
+      { started: iso(T0), outcome: "cancelled" },
+      { started: iso(T0), outcome: "dropped", stopped_by: "max_runs" },
+      { started: iso(T0), outcome: "aborted" },
+      { started: iso(T0), outcome: "unfinished" },
+      { started: iso(T0), outcome: "fired" },
+      { started: iso(T0), outcome: "weird" },
+    ],
+  }).runs;
+  assert.deepEqual(outcomeSummary(runs), [
+    { outcome: "fired", text: "fired", count: 2 },
+    { outcome: "condition_failed", text: "stopped by condition", count: 1 },
+    { outcome: "aborted", text: "aborted", count: 1 },
+    { outcome: "cancelled", text: "cancelled", count: 1 },
+    { outcome: "dropped", text: "dropped by mode: single", count: 2 },
+    { outcome: "dropped", text: "dropped at max_runs", count: 1 },
+    { outcome: "unfinished", text: "still running after the overrun", count: 1 },
+    { outcome: "other", text: "other (weird)", count: 1 },
+  ]);
 });
 
 test("conditions come out of an extended trace in order with depth", () => {

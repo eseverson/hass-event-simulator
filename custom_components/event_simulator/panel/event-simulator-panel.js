@@ -229,13 +229,73 @@ export function stateColor(state) {
   return PALETTE[hashString(s) % PALETTE.length];
 }
 
-export const OUTCOMES = ["fired", "condition_failed", "error", "other"];
+/* Every run outcome sandbox/engine.py reports, in legend order; `other` is only for a
+ * value the panel does not know. Each has its own marker shape as well as color, so
+ * they stay apart without color vision. */
+export const OUTCOMES = ["fired", "condition_failed", "aborted", "cancelled", "dropped", "unfinished", "error", "other"];
+
+export const OUTCOME_STYLE = {
+  fired: { label: "Fired", color: "var(--success-color, #43a047)", shape: "dot" },
+  condition_failed: { label: "Stopped by condition", color: "var(--warning-color, #ff9800)", shape: "ring" },
+  aborted: { label: "Aborted", color: "#c2185b", shape: "open-diamond" },
+  cancelled: { label: "Cancelled", color: "#5c6bc0", shape: "cross" },
+  dropped: { label: "Dropped", color: "#8d6e63", shape: "open-triangle" },
+  unfinished: { label: "Still running after the overrun", color: "#0288d1", shape: "play" },
+  error: { label: "Error", color: "var(--error-color, #db4437)", shape: "diamond" },
+  other: { label: "Other", color: "var(--secondary-text-color, #727272)", shape: "open-square" },
+};
 
 export function classifyOutcome(outcome, run = {}) {
   const o = String(outcome ?? "").toLowerCase();
-  if (o === "fired" || o === "condition_failed" || o === "error") return o;
+  if (o in OUTCOME_STYLE && o !== "other") return o;
   if (!o && run.error) return "error";
   return "other";
+}
+
+/* Why the script mode refused a run (engine.py `stopped_by` for `dropped`). */
+const DROPPED_BY = { mode_single: "Dropped by mode: single", max_runs: "Dropped at max_runs", recursion: "Dropped as recursive" };
+
+/* What happened to a normalized run, in words: its outcome, why it was dropped, or the
+ * unknown outcome's own name. */
+export function outcomeText(run) {
+  if (run.outcome === "dropped" && DROPPED_BY[run.stoppedBy]) return DROPPED_BY[run.stoppedBy];
+  if (run.outcome === "other") return `Other (${run.outcomeLabel})`;
+  return OUTCOME_STYLE[run.outcome]?.label ?? OUTCOME_STYLE.other.label;
+}
+
+/* The Runs legend: [{outcome, text, count}] for each distinct outcomeText, in OUTCOMES
+ * order, then first appearance. */
+export function outcomeSummary(runs) {
+  const groups = new Map();
+  for (const run of runs) {
+    const text = outcomeText(run);
+    const g = groups.get(text) || groups.set(text, { outcome: run.outcome, text: text[0].toLowerCase() + text.slice(1), count: 0 }).get(text);
+    g.count++;
+  }
+  return [...groups.values()].sort((a, b) => OUTCOMES.indexOf(a.outcome) - OUTCOMES.indexOf(b.outcome));
+}
+
+/* The SVG marker for an outcome centered on (x, y). */
+export function outcomeMarker(outcome, x, y, color = (OUTCOME_STYLE[outcome] || OUTCOME_STYLE.other).color) {
+  const open = `fill="var(--card-background-color, #fff)" stroke="${color}" stroke-width="2"`;
+  switch ((OUTCOME_STYLE[outcome] || OUTCOME_STYLE.other).shape) {
+    case "dot":
+      return `<circle cx="${x}" cy="${y}" r="5" fill="${color}" class="marker"/>`;
+    case "ring":
+      return `<circle cx="${x}" cy="${y}" r="4.5" ${open} class="marker"/>`;
+    case "diamond":
+      return `<path d="M${x},${y - 6}L${x + 6},${y}L${x},${y + 6}L${x - 6},${y}Z" fill="${color}" class="marker"/>`;
+    case "open-diamond":
+      return `<path d="M${x},${y - 5}L${x + 5},${y}L${x},${y + 5}L${x - 5},${y}Z" ${open} class="marker"/>`;
+    case "cross":
+      return `<path d="M${x - 4},${y - 4}L${x + 4},${y + 4}M${x + 4},${y - 4}L${x - 4},${y + 4}" fill="none" stroke="${color}" stroke-width="2.5" stroke-linecap="round" class="marker"/>`;
+    case "open-triangle":
+      return `<path d="M${x},${y - 5}L${x + 5},${y + 4}L${x - 5},${y + 4}Z" ${open} stroke-linejoin="round" class="marker"/>`;
+    case "play":
+      return `<path d="M${x - 4},${y - 5}L${x + 5},${y}L${x - 4},${y + 5}Z" fill="${color}" class="marker"/>`;
+    default:
+      return `<rect x="${x - 4}" y="${y - 4}" width="8" height="8" fill="none" stroke="${color}" stroke-width="2" class="marker"/>`;
+  }
 }
 
 const isObject = (v) => v != null && typeof v === "object" && !Array.isArray(v);
@@ -910,13 +970,6 @@ const AXIS_H = 24;
 const DISCRETE_H = 24;
 const NUMERIC_H = 56;
 const RESULTS_H = 38;
-const OUTCOME_LABEL = { fired: "Fired", condition_failed: "Stopped by condition", error: "Error", other: "Other" };
-const OUTCOME_COLOR = {
-  fired: "var(--success-color, #43a047)",
-  condition_failed: "var(--warning-color, #ff9800)",
-  error: "var(--error-color, #db4437)",
-  other: "var(--secondary-text-color, #727272)",
-};
 
 function presetWindow(id, now = Date.now()) {
   const end = Math.ceil(now / 60e3) * 60e3;
@@ -2324,9 +2377,10 @@ class EventSimulatorPanel extends Base {
         <svg class="results" width="${scale.width}" height="${RESULTS_H}"></svg></div>`;
     }
     const { runs, calls } = this._result;
-    const counts = OUTCOMES.map((o) => [o, runs.filter((r) => r.outcome === o).length]).filter(([, n]) => n);
     const summary = runs.length
-      ? counts.map(([o, n]) => `<span class="dot" style="background:${OUTCOME_COLOR[o]}"></span>${n} ${OUTCOME_LABEL[o].toLowerCase()}`).join(" · ")
+      ? outcomeSummary(runs)
+          .map((g) => `<span class="legend-item"><svg class="legend-mark" width="14" height="14" aria-hidden="true">${outcomeMarker(g.outcome, 7, 7)}</svg>${g.count} ${esc(g.text)}</span>`)
+          .join(" · ")
       : "no runs";
     const stale = this._resultStale ? ` <span class="stale">inputs changed since this run</span>` : "";
     let marks = "";
@@ -2334,10 +2388,10 @@ class EventSimulatorPanel extends Base {
       if (run.finished < scale.t0 || run.started > scale.t1) continue;
       const x = scale.toX(run.started);
       const x2 = scale.toX(run.finished);
-      const color = OUTCOME_COLOR[run.outcome];
+      const color = OUTCOME_STYLE[run.outcome].color;
       if (x2 - x > 2) marks += `<rect x="${x}" y="9" width="${x2 - x}" height="6" rx="3" fill="${color}" opacity=".35"/>`;
       if (run.index === this._selectedRun) marks += `<circle cx="${x}" cy="12" r="9" class="selected"/>`;
-      marks += this._marker(run.outcome, x, 12, color);
+      marks += outcomeMarker(run.outcome, x, 12, color);
     }
     for (const call of calls) {
       if (call.t < scale.t0 || call.t > scale.t1) continue;
@@ -2351,14 +2405,6 @@ class EventSimulatorPanel extends Base {
           ${this._gridLines(scale, RESULTS_H)}${marks}
         </svg>
       </div>`;
-  }
-
-  /* Shape as well as color, so outcomes stay distinguishable without color vision. */
-  _marker(outcome, x, y, color) {
-    if (outcome === "fired") return `<circle cx="${x}" cy="${y}" r="5" fill="${color}" class="marker"/>`;
-    if (outcome === "condition_failed") return `<circle cx="${x}" cy="${y}" r="4.5" fill="var(--card-background-color, #fff)" stroke="${color}" stroke-width="2" class="marker"/>`;
-    if (outcome === "error") return `<path d="M${x},${y - 6}L${x + 6},${y}L${x},${y + 6}L${x - 6},${y}Z" fill="${color}" class="marker"/>`;
-    return `<rect x="${x - 4}" y="${y - 4}" width="8" height="8" fill="none" stroke="${color}" stroke-width="2" class="marker"/>`;
   }
 
   _detailCard() {
@@ -2403,7 +2449,7 @@ class EventSimulatorPanel extends Base {
             <button class="icon" data-action="prev-run" ${pos <= 0 ? "disabled" : ""} aria-label="Previous run">‹</button>
             <strong>Run ${pos + 1} of ${result.runs.length}</strong>
             <button class="icon" data-action="next-run" ${pos >= result.runs.length - 1 ? "disabled" : ""} aria-label="Next run">›</button>
-            <span class="chip" style="background:${OUTCOME_COLOR[run.outcome]};color:var(--text-primary-color, #fff)">${esc(run.outcomeLabel)}</span>
+            <span class="chip" style="background:${OUTCOME_STYLE[run.outcome].color};color:var(--text-primary-color, #fff)">${esc(outcomeText(run))}</span>
           </div>
           <dl>
             <dt>Started</dt><dd class="mono">${esc(this._fullTime(run.started))}</dd>
@@ -2690,7 +2736,7 @@ class EventSimulatorPanel extends Base {
       if (hit?.run) {
         const r = hit.run;
         html = `<div class="mono small">${esc(this._fullTime(r.started))}</div>
-          <div><strong>${esc(OUTCOME_LABEL[r.outcome])}</strong>${r.outcome === "other" ? ` (${esc(r.outcomeLabel)})` : ""}</div>
+          <div><strong>${esc(outcomeText(r))}</strong></div>
           ${r.trigger ? `<div class="small">${esc(describeTrigger(r.trigger))}</div>` : ""}
           <div class="muted small">click for details</div>`;
       } else if (hit?.call) {
@@ -2956,7 +3002,8 @@ class EventSimulatorPanel extends Base {
       .track-head .eid { color: var(--secondary-text-color); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
       .track-head .meta { color: var(--secondary-text-color); margin-left: auto; text-align: right; }
       .track-head .stale { color: var(--warning-color, #ff9800); }
-      .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+      .legend-item { white-space: nowrap; }
+      .legend-mark { vertical-align: -2px; margin-right: 3px; overflow: visible; }
       svg.track, svg.results { background: var(--secondary-background-color); border-radius: 4px; }
       .tick { stroke: var(--secondary-text-color); }
       .baseline { stroke: var(--divider-color); }
