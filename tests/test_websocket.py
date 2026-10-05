@@ -398,6 +398,10 @@ async def test_simulate_fills_core_and_services(hass: HomeAssistant, setup, hass
 
     assert msg["success"], msg
     assert seen["core"] == history.async_core_config(hass)
+    assert "preview_features" in seen["core"]
+    assert seen["registry"] == history.async_registry_snapshot(
+        hass, seen["automation"], ["binary_sensor.door", "sun.sun"]
+    )
     assert "turn_on" in seen["services"]["automation"]
     assert seen["automation"]["triggers"][0]["to"] == "on"
     assert seen["start"] == "2026-10-04T00:00:00+00:00"
@@ -470,7 +474,7 @@ async def test_simulate_invalid_automation(hass: HomeAssistant, setup, hass_ws_c
         client,
         {
             "type": "event_simulator/simulate",
-            "scenario": {**SIMULATE, "automation": {"triggers": [{"trigger": "nope"}], "actions": []}},
+            "scenario": {**SIMULATE, "automation": {"triggers": [{"trigger": "state"}], "actions": []}},
         },
     )
 

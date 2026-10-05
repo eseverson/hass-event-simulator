@@ -444,7 +444,9 @@ async def _check_platforms(hass: HomeAssistant, config: dict[str, Any]) -> None:
             domain = name.split(".", 1)[0]
             domain = aliases.get(domain, domain)
             if domain and await _integration(hass, domain) is None:
-                problems.append(f"{path}: {what} '{name}' comes from '{domain}', an integration that is not built into Home Assistant (custom integrations are not loaded in the sandbox)")
+                problems.append(
+                    f"{path}: {what} '{name}' comes from '{domain}', which is not an integration built into Home Assistant: a custom integration (never loaded in the sandbox) or a typo"
+                )
             break
     if problems:
         raise ScenarioError("unsupported_automation", "The sandbox cannot replay this automation: " + "; ".join(problems))

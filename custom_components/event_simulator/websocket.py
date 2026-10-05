@@ -191,7 +191,7 @@ def _aware_utc_iso(value: Any) -> str:
 async def ws_simulate(hass, connection, msg: dict[str, Any]) -> None:
     """Replay a scenario in the sandbox and send its result.
 
-    `scenario.automation` may be a config dict or YAML text. `core` (time zone, location, units) and `services` default to this instance's own, so the panel need not send them. A refusal from the child (invalid scenario or automation) is sent as an error with the child's code.
+    `scenario.automation` may be a config dict or YAML text. `core` (time zone, location, units, Labs preview features), `registry` (the registry entries the automation can see) and `services` default to this instance's own, so the panel need not send them. A refusal from the child (invalid scenario or automation) is sent as an error with the child's code.
     """
     scenario = dict(msg["scenario"])
     check_window(dt_util.parse_datetime(scenario["start"]), dt_util.parse_datetime(scenario["end"]))
@@ -211,6 +211,18 @@ async def ws_simulate(hass, connection, msg: dict[str, Any]) -> None:
             parse_automation_yaml, scenario["automation"]
         )
     scenario.setdefault("core", history.async_core_config(hass))
+    if "registry" not in scenario:
+        event_ids = [
+            event.get("entity_id") for event in scenario["events"] if isinstance(event, dict)
+        ]
+        timeline_ids = [
+            entity_id
+            for entity_id in dict.fromkeys([*scenario["initial_states"], *event_ids])
+            if isinstance(entity_id, str)
+        ]
+        scenario["registry"] = history.async_registry_snapshot(
+            hass, scenario["automation"], timeline_ids
+        )
     scenario.setdefault(
         "services",
         {domain: sorted(services) for domain, services in hass.services.async_services().items()},
