@@ -1,0 +1,39 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Both checks look at things outside this repository, so they can start failing
+    # without a commit here.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+# checkout needs this to fetch the repository while it is still private; the HACS
+# docs use an empty set because they assume it is already public.
+permissions:
+  contents: read
+
+jobs:
+  hacs:
+    name: HACS
+    # HACS validates the GitHub repository named by GITHUB_REPOSITORY, so it only means
+    # anything on the GitHub mirror.
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hacs/action@main
+        with:
+          category: integration
+
+  hassfest:
+    name: Hassfest
+    # The action shells out to `docker run`, which the Forgejo runner does not provide.
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: home-assistant/actions/hassfest@master

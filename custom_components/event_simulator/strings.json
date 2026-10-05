@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Event Simulator",
+        "description": "Adds an 'Event Simulator' sidebar panel for replaying recorded history against an automation in a sandbox."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Already configured. Only a single configuration possible."
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "domain": "event_simulator",
+  "name": "Event Simulator",
+  "codeowners": ["@eseverson"],
+  "config_flow": true,
+  "dependencies": ["http", "frontend", "panel_custom", "websocket_api", "recorder", "automation"],
+  "documentation": "https://github.com/eseverson/hass-event-simulator",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/eseverson/hass-event-simulator/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "0.1.0"
+}
