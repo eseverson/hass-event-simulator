@@ -45,7 +45,7 @@ Integration domain `event_simulator`, layout mirroring `hass-integration-pins` (
 ```json
 {
   "version": 1,
-  "core": {"time_zone": "...", "latitude": 0, "longitude": 0, "elevation": 0, "unit_system": "metric"},
+  "core": {"time_zone": "...", "latitude": 0, "longitude": 0, "elevation": 0, "unit_system": "metric", "preview_features": [["automation", "new_triggers_conditions"]]},
   "start": "2026-10-04T00:00:00+00:00",
   "end":   "2026-10-05T00:00:00+00:00",
   "automation": { "...": "automation config dict" },
@@ -57,7 +57,7 @@ Integration domain `event_simulator`, layout mirroring `hass-integration-pins` (
 }
 ```
 
-The window is half-open, `[start, end)`. `last_changed` / `last_updated` on an initial state are optional (absent: the state is stamped `start`, as the recorder clamps it); they let a `for:` early in the window see how long the state really held (#10). Events outside the window are skipped with a warning; extra event keys (`last_changed`, ...) are ignored, since HA derives them from the write. Optional: `services` (the live instance's services, so calls to anything else are flagged), `overrun_seconds` (how long runs in flight at `end` may continue, default 1 h, max 24 h), `seed` (Python `random` seed; HA uses it for the 50–500 ms offset of time-change triggers and for run ids, so a fixed seed makes replays repeatable).
+The window is half-open, `[start, end)`. `last_changed` / `last_updated` on an initial state are optional (absent: the state is stamped `start`, as the recorder clamps it); they let a `for:` early in the window see how long the state really held (#10). Events outside the window are skipped with a warning; extra event keys (`last_changed`, ...) are ignored, since HA derives them from the write. `core.preview_features` (optional) lists the Labs preview features enabled on the live instance as `[domain, preview_feature]` pairs (`history.async_core_config` fills it); the child sets up `labs` and turns them on before validating the automation, so Labs-gated purpose-specific triggers and conditions (#11) validate as they do live, and a feature this HA does not know is a `preview_feature_unknown` warning. Optional: `services` (the live instance's services, so calls to anything else are flagged), `overrun_seconds` (how long runs in flight at `end` may continue, default 1 h, max 24 h), `seed` (Python `random` seed; HA uses it for the 50–500 ms offset of time-change triggers and for run ids, so a fixed seed makes replays repeatable).
 
 Result:
 
@@ -68,7 +68,7 @@ Result:
             "outcome": "fired|condition_failed|dropped|aborted|cancelled|error|unfinished", "stopped_by": "condition/0 | mode_single | max_runs | recursion | action/N | null",
             "script_execution": "HA's value", "error": "message | null", "trace": {"...": "as_extended_dict()"}}],
   "service_calls": [{"at", "domain", "service", "data", "target", "run", "context": {"id", "parent_id", "user_id"}}],
-  "warnings": [{"code": "event_outside_window|unknown_service|run_unfinished|initial_state_after_start|initial_state_ignored|late_attach|log|log_truncated", "message", "at"}]
+  "warnings": [{"code": "event_outside_window|unknown_service|preview_feature_unknown|run_unfinished|initial_state_after_start|initial_state_ignored|late_attach|log|log_truncated", "message", "at"}]
 }
 ```
 

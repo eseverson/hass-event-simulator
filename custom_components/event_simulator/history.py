@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from homeassistant.components.automation import DATA_COMPONENT
+from homeassistant.components.labs.const import LABS_DATA
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.db_schema import States
 from homeassistant.components.recorder.history import (
@@ -57,7 +58,12 @@ def check_window(start: datetime, end: datetime) -> None:
 
 @callback
 def async_core_config(hass: HomeAssistant) -> dict[str, Any]:
-    """The scenario `core` block: what the sandbox copies from this instance."""
+    """The scenario `core` block: what the sandbox copies from this instance.
+
+    `preview_features` lists the enabled Labs preview features as `[domain,
+    preview_feature]` pairs; the sandbox turns them on before validating the
+    automation, so Labs-gated triggers and conditions behave as they do here.
+    """
     config = hass.config
     return {
         "time_zone": config.time_zone,
@@ -65,7 +71,16 @@ def async_core_config(hass: HomeAssistant) -> dict[str, Any]:
         "longitude": config.longitude,
         "elevation": config.elevation,
         "unit_system": config.units._name,  # noqa: SLF001 - the name core config stores
+        "preview_features": _enabled_preview_features(hass),
     }
+
+
+def _enabled_preview_features(hass: HomeAssistant) -> list[list[str]]:
+    if (labs_data := hass.data.get(LABS_DATA)) is None:
+        return []
+    return sorted(
+        [domain, feature] for domain, feature in labs_data.data.preview_feature_status
+    )
 
 
 @callback

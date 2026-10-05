@@ -4,7 +4,7 @@ Runs in the child process (see `__main__.py`). `run_scenario(scenario)` is the w
 
 Timeline of a replay (all virtual time, see `vclock.py`)
 --------------------------------------------------------
-1. `start - BOOT_LEAD`: a `HomeAssistant` boots on the virtual loop with a temporary config dir (deleted afterwards). It loads the base registries and sets up only the `homeassistant` integration, then runs `async_start`; the automation integration and whatever it pulls in (`trace`, `blueprint`, trigger/condition platforms) come later. No recorder, http, frontend or network-facing integrations, and `skip_pip` is on, so nothing is installed or fetched. `BOOT_LEAD` absorbs any timers boot waits on, so the window starts with everything settled.
+1. `start - BOOT_LEAD`: a `HomeAssistant` boots on the virtual loop with a temporary config dir (deleted afterwards). It loads the base registries, sets up only the `homeassistant` and `labs` integrations (turning on the scenario's `core.preview_features`, so Labs-gated triggers and conditions validate as they do live), then runs `async_start`; the automation integration and whatever it pulls in (`trace`, `blueprint`, trigger/condition platforms) come later. No recorder, http, frontend or network-facing integrations, and `skip_pip` is on, so nothing is installed or fetched. `BOOT_LEAD` absorbs any timers boot waits on, so the window starts with everything settled.
 2. `start`: initial states are seeded with their recorded `last_changed` / `last_updated` (`StateMachine.async_set(..., timestamp=...)`; an attribute-only update is reproduced by a second write at `last_updated`); states without them are stamped `start`, the same clamp the recorder applies. Then the automation is validated with HA's own automation schema (invalid -> structured `invalid_automation` error) and set up. It attaches after `async_start`, so a `homeassistant: start` trigger does not fire, and at `start` exactly, so a time trigger at the window start does.
 3. `[start, end)`: timeline events are written with `async_set` at their `at`; events at the same instant are written in list order. Every service call is intercepted at the `ServiceRegistry` (see `RecordingServiceRegistry`): recorded, answered with success (an empty response when one is asked for), and never executed, so recorded calls change no state.
 4. `end`: the automation's triggers are detached (`async_turn_off(stop_actions=False)`), so nothing new starts; the window is half-open and a run triggered at `end` itself is discarded. Runs already in flight (a `delay`, a `wait_for_trigger`, a queue) keep going for up to `overrun_seconds` of virtual time (default `DEFAULT_OVERRUN`, at most `MAX_OVERRUN`); a run still going at that bound is reported with outcome `unfinished` and a warning. Then HA is stopped.
@@ -38,6 +38,7 @@ from typing import Any
 
 import voluptuous as vol
 from homeassistant import bootstrap, config_entries, loader
+from homeassistant.components import labs
 from homeassistant.components.automation import DATA_COMPONENT as AUTOMATION_COMPONENT
 from homeassistant.components.automation import trace as automation_trace
 from homeassistant.components.automation.config import async_validate_config_item
@@ -125,6 +126,7 @@ class _Scenario:
     services: dict[str, set[str]] | None
     overrun: timedelta
     seed: int
+    preview_features: list[tuple[str, str]] = field(default_factory=list)
     warnings: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -216,6 +218,7 @@ def _parse_scenario(raw: dict[str, Any]) -> _Scenario:
     if not isinstance(core_raw, dict):
         raise ScenarioError("invalid_scenario", "core must be an object")
     core = {key: core_raw[key] for key in _CORE_KEYS if core_raw.get(key) is not None}
+    preview_features = _parse_preview_features(core_raw.get("preview_features"))
 
     automation = raw.get("automation")
     if not isinstance(automation, dict):
@@ -283,7 +286,18 @@ def _parse_scenario(raw: dict[str, Any]) -> _Scenario:
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ScenarioError("invalid_scenario", "seed must be an integer")
 
-    return _Scenario(core, start, end, automation, initial_states, events, services, overrun, seed, warnings)
+    return _Scenario(core, start, end, automation, initial_states, events, services, overrun, seed, preview_features, warnings)
+
+
+def _parse_preview_features(value: Any) -> list[tuple[str, str]]:
+    """`core.preview_features`: the Labs preview features enabled on the live instance, as `[domain, preview_feature]` pairs."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(
+        isinstance(item, list) and len(item) == 2 and all(isinstance(part, str) for part in item) for item in value
+    ):
+        raise ScenarioError("invalid_scenario", "core.preview_features must be a list of [domain, preview_feature] pairs")
+    return [(domain, feature) for domain, feature in value]
 
 
 def _warning(code: str, message: str, at: datetime | None = None) -> dict[str, Any]:
@@ -381,9 +395,22 @@ class _Replay:
             raise ScenarioError("invalid_scenario", f"core config rejected: {err}") from err
         if not await async_setup_component(hass, "homeassistant", {}):
             raise RuntimeError("The homeassistant integration failed to set up")
+        await self._enable_preview_features(hass)
         await hass.async_start()
         await hass.async_block_till_done()
         return hass
+
+    async def _enable_preview_features(self, hass: HomeAssistant) -> None:
+        """Set up `labs` (live HA always has it) and turn on the scenario's preview features, before the automation is validated."""
+        if not await async_setup_component(hass, "labs", {}):
+            raise RuntimeError("The labs integration failed to set up")
+        for domain, feature in self.scenario.preview_features:
+            try:
+                await labs.async_update_preview_feature(hass, domain, feature, True)
+            except ValueError:
+                self.warnings.append(
+                    _warning("preview_feature_unknown", f"Preview feature {domain}.{feature} does not exist in this Home Assistant; ignored")
+                )
 
     async def _sleep_until(self, when: datetime) -> None:
         """Wait until the virtual clock reads exactly `when`."""

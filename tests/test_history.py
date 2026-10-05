@@ -10,6 +10,7 @@ from pytest_homeassistant_custom_component.components.recorder.common import (
     async_wait_recording_done,
 )
 
+from homeassistant.components import labs
 from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
@@ -253,7 +254,23 @@ async def test_core_config(hass: HomeAssistant):
         "longitude": -87.6,
         "elevation": 180,
         "unit_system": "us_customary",
+        "preview_features": [],
     }
+
+
+async def test_core_config_carries_enabled_preview_features(hass: HomeAssistant):
+    assert await async_setup_component(hass, "labs", {})
+    await labs.async_update_preview_feature(
+        hass, "automation", "new_triggers_conditions", True
+    )
+    await labs.async_update_preview_feature(hass, "kitchen_sink", "special_repair", True)
+    await labs.async_update_preview_feature(
+        hass, "kitchen_sink", "special_repair", False
+    )
+
+    assert history.async_core_config(hass)["preview_features"] == [
+        ["automation", "new_triggers_conditions"]
+    ]
 
 
 async def test_timeline_refuses_too_many_events(
