@@ -23,6 +23,7 @@ from homeassistant.components.recorder.db_schema import States
 from homeassistant.components.recorder.history import (
     get_significant_states_with_session,
 )
+from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant, State, callback, valid_entity_id
 from homeassistant.helpers import (
     area_registry as ar,
@@ -164,6 +165,7 @@ async def async_get_timeline(
         partial(_read_recorder, hass, list(entity_ids), start, end)
     )
 
+    unrecorded = {entity_id: _unrecorded_attributes(hass, entity_id) for entity_id in states}
     initial_states: dict[str, dict[str, Any]] = {}
     changes: list[State] = []
     for entity_id, entity_states in states.items():
@@ -175,7 +177,7 @@ async def async_get_timeline(
                 last_changed, last_updated = stamp
                 initial_states[entity_id] = {
                     "state": state.state,
-                    "attributes": dict(state.attributes),
+                    "attributes": _with_unrecorded(state, unrecorded[entity_id]),
                     "last_changed": last_changed.isoformat(),
                     "last_updated": last_updated.isoformat(),
                 }
@@ -191,13 +193,31 @@ async def async_get_timeline(
             "at": state.last_updated.isoformat(),
             "entity_id": state.entity_id,
             "state": state.state,
-            "attributes": dict(state.attributes),
+            "attributes": _with_unrecorded(state, unrecorded[state.entity_id]),
             "last_changed": state.last_changed.isoformat(),
             "last_updated": state.last_updated.isoformat(),
         }
         for state in changes
     ]
     return {"initial_states": initial_states, "events": events}
+
+
+def _unrecorded_attributes(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
+    """The live state's attributes that its entity keeps out of the recorder (`_unrecorded_attributes`).
+
+    These are static capabilities (an input_datetime's `has_date` / `has_time`, a light's `supported_color_modes`, ...), yet triggers and templates read them: a time trigger on an input_datetime fails to attach without `has_date`. The live values stand in for the recorded rows that lack them.
+    """
+    if (live := hass.states.get(entity_id)) is None or live.state_info is None:
+        return {}
+    keys = live.state_info["unrecorded_attributes"]
+    return {key: value for key, value in live.attributes.items() if key in keys}
+
+
+def _with_unrecorded(state: State, unrecorded: dict[str, Any]) -> dict[str, Any]:
+    """A recorded state's attributes, with the unrecorded ones put back unless the row is `unavailable` (which carries no capabilities)."""
+    if not unrecorded or state.state == STATE_UNAVAILABLE:
+        return dict(state.attributes)
+    return {**unrecorded, **state.attributes}
 
 
 @callback

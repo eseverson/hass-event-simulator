@@ -66,7 +66,7 @@ The replay attaches the automation at the window start, writes each timeline cha
 
 **Some trigger and condition platforms cannot run.** Custom integrations are never loaded in the sandbox, so a trigger or condition from one is refused, as are device triggers, conditions and actions specific to an integration such as ZHA, MQTT or Hue (they need that integration's runtime state, not just its code). The error names each one by its place in the config. Device automations of entity domains (`binary_sensor`, `light`, `sensor`, ...) work. Whether custom platforms should ever be loaded is an open question, [#14](https://github.com/eseverson/hass-event-simulator/issues/14).
 
-**History is what the recorder kept.** Entities excluded from the recorder have no history to load, and nothing older than the recorder's `purge_keep_days` is available.
+**History is what the recorder kept.** Entities excluded from the recorder have no history to load, and nothing older than the recorder's `purge_keep_days` is available. Attributes an integration keeps out of the recorder (an input_datetime's `has_date`, a light's `supported_color_modes`, ...) are filled in from the entity's current state, so a replay sees today's value for them.
 
 **Clock caveats.** Home Assistant reads the time through a few functions the sandbox patches. Code that calls `datetime.now()` directly — some third-party libraries do — sees real time, as do context ids, log timestamps and anything measured with `time.monotonic` in a worker thread. Work handed to Home Assistant's executor takes zero virtual time. None of this affects Home Assistant's own trigger, condition and script paths.
 

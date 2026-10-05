@@ -339,3 +339,41 @@ async def test_referenced_entities_include_entity_valued_options(hass: HomeAssis
         "zone.work",
     ]
 
+
+async def test_timeline_restores_unrecorded_attributes_from_the_live_state(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+):
+    """The recorder drops an entity's `_unrecorded_attributes`; a replay still needs them.
+
+    A time trigger on an input_datetime reads `has_date` / `has_time`, which input_datetime keeps out of the recorder, so without them the trigger fails to attach in the sandbox. They are static capabilities, so the live state's values stand in.
+    """
+    assert await async_setup_component(
+        hass, "input_datetime", {"input_datetime": {"alarm": {"has_time": True}}}
+    )
+    await hass.async_block_till_done()
+    start = dt_util.utcnow().replace(microsecond=0) + timedelta(minutes=1)
+    freezer.move_to(start + timedelta(minutes=1))
+    await hass.services.async_call(
+        "input_datetime",
+        "set_datetime",
+        {"entity_id": "input_datetime.alarm", "time": "07:30:00"},
+        blocking=True,
+    )
+    hass.states.async_set("sensor.plain", "1")
+    end = start + timedelta(minutes=30)
+    freezer.move_to(end + timedelta(minutes=1))
+    await async_wait_recording_done(hass)
+
+    timeline = await history.async_get_timeline(
+        hass, ["input_datetime.alarm", "sensor.plain"], start, end
+    )
+
+    initial = timeline["initial_states"]["input_datetime.alarm"]["attributes"]
+    assert initial["has_date"] is False
+    assert initial["has_time"] is True
+    [changed] = [e for e in timeline["events"] if e["entity_id"] == "input_datetime.alarm"]
+    assert changed["state"] == "07:30:00"
+    assert changed["attributes"]["has_time"] is True
+    assert changed["attributes"]["has_date"] is False
+    [plain] = [e for e in timeline["events"] if e["entity_id"] == "sensor.plain"]
+    assert plain["attributes"] == {}
