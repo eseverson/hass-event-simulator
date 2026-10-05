@@ -3,7 +3,9 @@
 A saved scenario is what the panel needs to put a simulation back on screen: the
 automation config (and the entity it came from, if any), the window, the entities
 being tracked, and the editable `initial_states` / `events` timeline in the same
-shape `history.async_get_timeline` produces.
+shape `history.async_get_timeline` produces. The events are kept, and sent back by
+`get`, packed (see packed.py): the websocket refuses a message over 4 MiB, and a week of
+a chatty sensor is several times that as a plain list.
 """
 
 from __future__ import annotations
@@ -22,18 +24,25 @@ from homeassistant.util.ulid import ulid_now
 
 from .const import DOMAIN
 from .history import MAX_ENTITIES, MAX_EVENTS, SimulatorError, check_window
+from .packed import event_count, pack_events, unpack_events
 
 STORAGE_KEY = f"{DOMAIN}.scenarios"
-STORAGE_VERSION = 1
+# 2: events packed (version 1 kept them as a plain list).
+STORAGE_VERSION = 2
 DATA_STORE: HassKey[ScenarioStore] = HassKey(f"{DOMAIN}_scenarios")
 
 MAX_SCENARIOS = 100
 MAX_NAME_LENGTH = 100
+# Events across every saved scenario. Each save rewrites the whole store file, so this
+# bounds that file (about 25 MB packed) rather than letting 100 week-long scenarios of a
+# chatty sensor make it hundreds of megabytes.
+MAX_STORED_EVENTS = 500_000
 
 __all__ = [
     "DATA_STORE",
     "MAX_EVENTS",
     "MAX_SCENARIOS",
+    "MAX_STORED_EVENTS",
     "SCENARIO_FIELDS",
     "STORAGE_KEY",
     "ScenarioStore",
@@ -64,17 +73,36 @@ SCENARIO_FIELDS: dict[vol.Marker, Any] = {
     vol.Required("end"): _aware_iso,
     vol.Optional("entity_ids", default=list): [cv.entity_id],
     vol.Optional("initial_states", default=dict): {cv.entity_id: _STATE},
-    vol.Optional("events", default=list): [_EVENT],
+    # A plain list, or packed as the panel sends it.
+    vol.Optional("events", default=list): vol.All(vol.Any(list, unpack_events), [_EVENT]),
 }
 
 _BODY_KEYS = tuple(marker.schema for marker in SCENARIO_FIELDS)
 
 
+class _ScenarioFile(Store[dict[str, Any]]):
+    """The store file, migrated forward on load."""
+
+    async def _async_migrate_func(
+        self, old_major_version: int, old_minor_version: int, old_data: dict[str, Any]
+    ) -> dict[str, Any]:
+        scenarios = dict(old_data.get("scenarios") or {})
+        if old_major_version < 2:
+            for scenario_id, scenario in scenarios.items():
+                events = scenario.get("events")
+                if isinstance(events, list):
+                    scenarios[scenario_id] = {**scenario, "events": pack_events(events)}
+        return {**old_data, "scenarios": scenarios}
+
+
 class ScenarioStore:
-    """Load, save and delete named scenarios, keyed by a generated id."""
+    """Load, save and delete named scenarios, keyed by a generated id.
+
+    `get` returns a scenario with its events packed, as they are stored and as the panel reads them.
+    """
 
     def __init__(self, hass: HomeAssistant) -> None:
-        self._store: Store[dict[str, Any]] = Store(hass, STORAGE_VERSION, STORAGE_KEY)
+        self._store = _ScenarioFile(hass, STORAGE_VERSION, STORAGE_KEY)
         self._scenarios: dict[str, dict[str, Any]] = {}
 
     async def async_load(self) -> None:
@@ -112,10 +140,22 @@ class ScenarioStore:
             created = now
         else:
             created = self.get(scenario_id)["created"]
+        stored = sum(
+            event_count(other["events"])
+            for other_id, other in self._scenarios.items()
+            if other_id != scenario_id
+        )
+        if stored + (count := event_count(body.get("events"))) > MAX_STORED_EVENTS:
+            raise SimulatorError(
+                "store_full",
+                f"Saved scenarios hold at most {MAX_STORED_EVENTS} state changes in all; "
+                f"the others hold {stored} and this one has {count}, so delete some first",
+            )
 
         scenario = {
             "scenario_id": scenario_id,
             **{key: body.get(key) for key in _BODY_KEYS},
+            "events": pack_events(body.get("events") or []),
             "created": created,
             "updated": now,
         }
@@ -131,7 +171,7 @@ class ScenarioStore:
 
 def _check_limits(body: dict[str, Any]) -> None:
     check_window(_parse(body["start"]), _parse(body["end"]))
-    if (count := len(body.get("events") or ())) > MAX_EVENTS:
+    if (count := event_count(body.get("events"))) > MAX_EVENTS:
         raise SimulatorError(
             "too_large", f"A scenario holds at most {MAX_EVENTS} events; this one has {count}"
         )
@@ -157,7 +197,7 @@ def _summary(scenario: dict[str, Any]) -> dict[str, Any]:
         "start": scenario["start"],
         "end": scenario["end"],
         "entity_ids": scenario["entity_ids"],
-        "event_count": len(scenario["events"] or ()),
+        "event_count": event_count(scenario["events"]),
         "created": scenario["created"],
         "updated": scenario["updated"],
     }

@@ -19,6 +19,7 @@ from homeassistant.util.yaml import parse_yaml
 from . import history, runner
 from .const import DOMAIN
 from .history import MAX_ENTITIES, MAX_EVENTS, SimulatorError, check_window
+from .packed import unpack_events
 from .runner import SandboxError
 from .store import DATA_STORE, SCENARIO_FIELDS, ScenarioStore
 
@@ -162,32 +163,6 @@ _SAFE_TAGS = frozenset(tag for tag in yaml.SafeLoader.yaml_constructors if tag) 
 _SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 
 
-_PACKED_EVENTS = vol.Schema(
-    {
-        vol.Required("entity_ids"): [str],
-        vol.Required("attributes"): [dict],
-        vol.Required("rows"): [vol.ExactSequence([str, int, str, int])],
-    }
-)
-
-
-def _unpack_events(value: Any) -> list[dict[str, Any]]:
-    """Scenario events from their packed form: `{entity_ids, attributes, rows}`, each row `[at, entity index, state, attributes index]`.
-
-    HA's websocket refuses a message over 4 MiB, and a week of a sensor that reports every half minute is around 20,000 events whose entity id and attributes repeat in every one, so the panel sends them packed. Only what the replay reads (`at`, `entity_id`, `state`, `attributes`) is carried. The attribute dicts are shared between rows, which is safe because nothing downstream mutates them.
-    """
-    packed = _PACKED_EVENTS(value)
-    entity_ids, attributes = packed["entity_ids"], packed["attributes"]
-    events = []
-    for at, entity, state, attrs in packed["rows"]:
-        if not (0 <= entity < len(entity_ids) and 0 <= attrs < len(attributes)):
-            raise vol.Invalid("a packed event row points past entity_ids or attributes")
-        events.append(
-            {"at": at, "entity_id": entity_ids[entity], "state": state, "attributes": attributes[attrs]}
-        )
-    return events
-
-
 def _aware_utc_iso(value: Any) -> str:
     """A datetime as an ISO UTC string; one without an offset is taken as local time, as `history` does."""
     return dt_util.as_utc(cv.datetime(value)).isoformat()
@@ -206,7 +181,8 @@ def _aware_utc_iso(value: Any) -> str:
                 vol.Optional("core"): dict,
                 vol.Optional("services"): dict,
                 vol.Optional("initial_states", default=dict): dict,
-                vol.Optional("events", default=list): vol.Any(list, _unpack_events),
+                # A plain list, or packed (packed.py) to fit the websocket's 4 MiB message limit.
+                vol.Optional("events", default=list): vol.Any(list, unpack_events),
             },
             extra=vol.ALLOW_EXTRA,
         ),

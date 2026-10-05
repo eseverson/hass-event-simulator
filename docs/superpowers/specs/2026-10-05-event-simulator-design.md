@@ -38,7 +38,7 @@ Integration domain `event_simulator`, layout mirroring `hass-integration-pins` (
 
 6. **Panel (`panel/event-simulator-panel.js`).** Single vanilla web component, no build step. Flow: choose automation → window (default: last 24 h) → tracks load from history for referenced entities (add/remove tracks by entity id) → Run. Timeline: one row per entity (state segments for discrete, a line for numeric), a shared time axis with zoom/pan, editable events (drag to shift, click to edit value/attributes, add, delete), a results row with run markers (fired / stopped by condition / errored) and service-call ticks. Selecting a run shows its trigger, condition results and the recorded calls; the raw trace is expandable. The automation config can be edited in a YAML textarea for what-ifs, without saving to the live instance.
 
-7. **Scenario store (`store.py`).** Save/load named scenarios (automation config + timeline + window) via `helpers.storage.Store`.
+7. **Scenario store (`store.py`).** Save/load named scenarios (automation config + timeline + window) via `helpers.storage.Store`. `scenarios/save` takes `events` as a list or packed, and the store keeps and `scenarios/get` returns them packed (`packed.py`); unlike simulate's, the packing is lossless: a row may go on with flags for `last_updated`/`last_changed` equal to `at` and `edited`, then an object of any other fields. Storage version 2 (version 1 kept plain lists and is migrated on load). At most 500,000 events across all scenarios, since every save rewrites the file.
 
 ## Scenario format (live ↔ child)
 

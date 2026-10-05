@@ -77,13 +77,13 @@ The replay attaches the automation at the window start, writes each timeline cha
 | Window | 7 days |
 | Tracked entities | 50 |
 | Timeline changes | 50,000 |
-| One request to Home Assistant (Run sends the timeline packed; Save sends it as is) | 4 MB |
+| One request to Home Assistant (Run and Save send the timeline packed, so a week of a sensor reporting every 15 s fits) | 4 MB |
 | Registry slice sent to the sandbox | 500 entities, 250 devices (the rest is dropped with a warning) |
 | Edited automation YAML | 256 KiB, 100,000 nodes |
 | Overrun after the window for runs in progress | 1 hour |
 | Wall-clock time for one replay | 300 seconds |
 | Replays at once | 2 (more wait their turn) |
-| Saved scenarios | 100, names up to 100 characters |
+| Saved scenarios | 100, names up to 100 characters, 500,000 timeline changes in all |
 
 ## Development
 

@@ -16,9 +16,11 @@ from pytest_homeassistant_custom_component.components.recorder.common import (
 from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
+from homeassistant.helpers.json import json_bytes
 
 from custom_components.event_simulator import history
 from custom_components.event_simulator.const import DOMAIN
+from custom_components.event_simulator.packed import pack_events, unpack_events
 
 AUTOMATION = {
     "id": "door_light",
@@ -202,7 +204,10 @@ async def test_scenario_round_trip(hass: HomeAssistant, setup, hass_ws_client):
         client, {"type": "event_simulator/scenarios/get", "scenario_id": scenario_id}
     )
     assert got["success"]
-    assert {k: got["result"][k] for k in SCENARIO} == SCENARIO
+    assert {k: got["result"][k] for k in SCENARIO if k != "events"} == {
+        k: v for k, v in SCENARIO.items() if k != "events"
+    }
+    assert unpack_events(got["result"]["events"]) == SCENARIO["events"]
 
     deleted = await _call(
         client, {"type": "event_simulator/scenarios/delete", "scenario_id": scenario_id}
@@ -258,7 +263,88 @@ async def test_scenarios_survive_a_reload(hass: HomeAssistant, setup, hass_ws_cl
         {"type": "event_simulator/scenarios/get", "scenario_id": saved["result"]["scenario_id"]},
     )
     assert got["success"]
-    assert got["result"]["events"] == SCENARIO["events"]
+    assert unpack_events(got["result"]["events"]) == SCENARIO["events"]
+
+
+def _chatty_week(count: int) -> list[dict]:
+    """A power sensor recorded every 20 s, as history.async_get_timeline returns it, with a few edits."""
+    start = dt_util.parse_datetime("2026-10-04T00:00:00+00:00")
+    events = []
+    for i in range(count):
+        at = (start + timedelta(seconds=20 * i, microseconds=123456)).isoformat()
+        event = {
+            "at": at,
+            "entity_id": "sensor.power",
+            "state": f"{300 + i % 997 / 10:.1f}",
+            "attributes": {"unit_of_measurement": "W", "device_class": "power", "friendly_name": "House power", "state_class": "measurement"},
+            "last_changed": at,
+            "last_updated": at,
+        }
+        if i % 1000 == 1:  # an attribute-only change keeps the earlier last_changed
+            event["last_changed"] = events[-1]["at"]
+        if i % 5000 == 2:  # an edit has no recorded times
+            event = {**{k: v for k, v in event.items() if not k.startswith("last_")}, "edited": True}
+        events.append(event)
+    return events
+
+
+async def test_a_week_of_a_chatty_sensor_saves_packed_and_comes_back_whole(
+    hass: HomeAssistant, setup, hass_ws_client
+):
+    """#15: a save is sent packed (it would be ~9 MB unpacked) and get returns it packed, losslessly."""
+    client = await hass_ws_client(hass)
+    events = _chatty_week(30_000)
+    body = {**SCENARIO, "end": "2026-10-11T00:00:00+00:00", "entity_ids": ["sensor.power"], "initial_states": {}}
+    packed = pack_events(events)
+
+    saved = await _call(client, {"type": "event_simulator/scenarios/save", **body, "events": packed})
+    assert saved["success"], saved
+    assert saved["result"]["event_count"] == 30_000
+
+    got = await _call(
+        client, {"type": "event_simulator/scenarios/get", "scenario_id": saved["result"]["scenario_id"]}
+    )
+    assert got["success"]
+    assert got["result"]["events"] == packed
+    assert unpack_events(got["result"]["events"]) == events
+    # Both directions fit under the 4 MiB message limit HA's websocket enforces on what it receives.
+    assert len(json_bytes({"type": "event_simulator/scenarios/save", **body, "events": packed})) < 4 * 1024 * 1024
+    assert len(json_bytes(got)) < 4 * 1024 * 1024
+
+
+async def test_scenario_save_validates_packed_events(hass: HomeAssistant, setup, hass_ws_client):
+    """Unpacked events go through the same checks as a plain list: here, `at` without an offset."""
+    client = await hass_ws_client(hass)
+    packed = {"entity_ids": ["binary_sensor.door"], "attributes": [{}], "rows": [["2026-10-04T07:12:03", 0, "on", 0]]}
+
+    msg = await _call(client, {"type": "event_simulator/scenarios/save", **SCENARIO, "events": packed})
+
+    assert not msg["success"]
+    assert msg["error"]["code"] == "invalid_format"
+
+
+async def test_scenario_save_rejects_a_malformed_packing(hass: HomeAssistant, setup, hass_ws_client):
+    client = await hass_ws_client(hass)
+    packed = {"entity_ids": ["binary_sensor.door"], "attributes": [{}], "rows": [["2026-10-04T07:12:03+00:00", 4, "on", 0]]}
+
+    msg = await _call(client, {"type": "event_simulator/scenarios/save", **SCENARIO, "events": packed})
+
+    assert not msg["success"]
+    assert msg["error"]["code"] == "invalid_format"
+
+
+async def test_scenario_save_counts_packed_events_against_the_limit(
+    hass: HomeAssistant, setup, hass_ws_client
+):
+    client = await hass_ws_client(hass)
+
+    with patch("custom_components.event_simulator.store.MAX_EVENTS", 1):
+        msg = await _call(
+            client,
+            {"type": "event_simulator/scenarios/save", **SCENARIO, "events": pack_events(SCENARIO["events"] * 2)},
+        )
+
+    assert msg["error"]["code"] == "too_large"
 
 
 @pytest.mark.parametrize(

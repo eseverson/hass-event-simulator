@@ -151,6 +151,7 @@ test("scenario errors read as sentences per code", () => {
   assert.match(scenarioErrorMessage({ code: "invalid_window" }), /7 days/);
   assert.match(scenarioErrorMessage({ code: "too_large", message: "this one has 60000" }), /too large.*60000/);
   assert.match(scenarioErrorMessage({ code: "too_many" }), /100 saved scenarios/);
+  assert.match(scenarioErrorMessage({ code: "store_full", message: "the others hold 480000" }), /Delete.*saved scenarios.*480000/s);
   assert.match(scenarioErrorMessage({ code: "invalid_format", message: "expected str for dictionary value @ data['name']" }), /did not accept.*data\['name'\]/);
   assert.match(scenarioErrorMessage({ code: "unknown_command" }), /Update/);
   assert.equal(scenarioErrorMessage({ code: "home_assistant_error", message: "boom" }, "delete"), "Could not delete the scenario: boom");

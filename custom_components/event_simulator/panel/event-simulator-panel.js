@@ -437,10 +437,18 @@ export function buildScenario({ automation, start, end, tracks }) {
 export const WS_MESSAGE_LIMIT = 4 * 1024 * 1024 - 16 * 1024;
 
 /* Scenario events as `{entity_ids, attributes, rows}`, each row `[at, entity index,
- * state, attributes index]` (websocket.py unpacks it). Entity ids and attribute dicts
- * repeat in nearly every recorded event, so this is several times smaller; only what the
- * replay reads is kept. */
-export function packEvents(events) {
+ * state, attributes index]` (packed.py unpacks it). Entity ids and attribute dicts
+ * repeat in nearly every recorded event, so this is several times smaller.
+ *
+ * Simulate only needs what the replay reads, so by default nothing else is kept. A save
+ * must come back exactly as it went (adoptRecorded matches loaded items to history by
+ * their full key), so `lossless` adds `flags` and, when something is left over, an object
+ * of the remaining fields: `[at, e, state, a, flags, {…}]`. */
+export const PACK_LAST_UPDATED = 1; // last_updated equals at
+export const PACK_LAST_CHANGED = 2; // last_changed equals at
+export const PACK_EDITED = 4; // edited: true
+
+export function packEvents(events, { lossless = false } = {}) {
   const entityIds = [];
   const entityIndex = new Map();
   const attributes = [];
@@ -458,14 +466,59 @@ export function packEvents(events) {
       a = attributes.push(attrs) - 1;
       attrIndex.set(key, a);
     }
-    return [ev.at, e, String(ev.state), a];
+    const row = [ev.at, e, String(ev.state), a];
+    if (!lossless) return row;
+    const { at, entity_id, state, attributes: _a, ...rest } = ev;
+    let flags = 0;
+    const extra = {};
+    for (const [k, v] of Object.entries(rest)) {
+      if (k === "last_updated" && v === at) flags |= PACK_LAST_UPDATED;
+      else if (k === "last_changed" && v === at) flags |= PACK_LAST_CHANGED;
+      else if (k === "edited" && v === true) flags |= PACK_EDITED;
+      else extra[k] = v;
+    }
+    if (Object.keys(extra).length) row.push(flags, extra);
+    else if (flags) row.push(flags);
+    return row;
   });
   return { entity_ids: entityIds, attributes, rows };
+}
+
+/* The events of packEvents back as a list (a list is taken as it is: scenarios saved
+ * before they were packed). Rows that do not fit the packed shape are skipped. */
+export function unpackEvents(packed) {
+  if (Array.isArray(packed)) return packed;
+  if (!isObject(packed) || !Array.isArray(packed.rows)) return [];
+  const ids = Array.isArray(packed.entity_ids) ? packed.entity_ids : [];
+  const attrs = Array.isArray(packed.attributes) ? packed.attributes : [];
+  const events = [];
+  for (const row of packed.rows) {
+    if (!Array.isArray(row) || row.length < 4) continue;
+    const [at, e, state, a, flags = 0, extra] = row;
+    if (!(e in ids) || !(a in attrs) || !Number.isInteger(e) || !Number.isInteger(a)) continue;
+    const ev = { at, entity_id: ids[e], state, attributes: attrs[a] };
+    if (flags & PACK_LAST_CHANGED) ev.last_changed = at;
+    if (flags & PACK_LAST_UPDATED) ev.last_updated = at;
+    if (flags & PACK_EDITED) ev.edited = true;
+    events.push(isObject(extra) ? { ...ev, ...extra } : ev);
+  }
+  return events;
 }
 
 /* The event_simulator/simulate request for a scenario from buildScenario. */
 export function simulateMessage(scenario) {
   return { type: "event_simulator/simulate", scenario: { ...scenario, events: packEvents(scenario.events || []) } };
+}
+
+/* The event_simulator/scenarios/save request for a scenarioPayload, overwriting
+ * `scenarioId` when given. Events go packed losslessly, so a save is as large as Run's. */
+export function saveMessage(payload, scenarioId) {
+  return {
+    type: "event_simulator/scenarios/save",
+    ...payload,
+    events: packEvents(payload.events || [], { lossless: true }),
+    ...(scenarioId ? { scenario_id: scenarioId } : {}),
+  };
 }
 
 /* null when a request fits in one websocket message, else a {code, message} error to show
@@ -765,7 +818,7 @@ export function scenarioPayload({ name, entityId, automation, start, end, tracks
 export function tracksFromScenario(scenario) {
   const ids = [...(Array.isArray(scenario?.entity_ids) ? scenario.entity_ids : [])];
   const initials = isObject(scenario?.initial_states) ? scenario.initial_states : {};
-  const events = (Array.isArray(scenario?.events) ? scenario.events : []).filter((ev) => isObject(ev) && ev.entity_id);
+  const events = unpackEvents(scenario?.events).filter((ev) => isObject(ev) && ev.entity_id);
   for (const id of [...Object.keys(initials), ...events.map((ev) => ev.entity_id)]) if (!ids.includes(id)) ids.push(id);
   return ids.map((entity_id) => ({
     entity_id,
@@ -825,6 +878,8 @@ export function scenarioErrorMessage(err, action = "save") {
       return `This scenario is too large to save: at most 50,000 state changes and 50 tracks${detail}.`;
     case "too_many":
       return "There are already 100 saved scenarios. Delete one before saving another.";
+    case "store_full":
+      return `Saved scenarios are limited to 500,000 state changes in all. Delete some saved scenarios before saving this one${detail}.`;
     case "invalid_format":
       return `Home Assistant did not accept the scenario's data${detail}.`;
     case "unknown_command":
@@ -1582,7 +1637,7 @@ class EventSimulatorPanel extends Base {
     }
     const payload = this._payload(check.value);
     const overwrite = !asNew && this._scenario ? this._scenario.scenario_id : null;
-    const message = { type: "event_simulator/scenarios/save", ...payload, ...(overwrite ? { scenario_id: overwrite } : {}) };
+    const message = saveMessage(payload, overwrite);
     const tooLarge = messageSizeError(message);
     if (tooLarge) {
       this._scError = `This scenario is too large to save. ${tooLarge.message}`;
