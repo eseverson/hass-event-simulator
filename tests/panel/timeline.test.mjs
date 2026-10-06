@@ -61,6 +61,15 @@ test("numeric detection ignores unavailable/unknown but needs one number", () =>
   assert.equal(isNumericStates([]), false);
 });
 
+test("a sensor with a unit stays numeric through a stray non-numeric reading", () => {
+  // A humidity sensor reporting "error" once (what a not_triggered run is about) keeps its line; the reading is a gap.
+  assert.equal(isNumericStates(["45", "error", "50"], { unit: "%" }), true);
+  assert.equal(isNumericStates(["45", "error", "50"]), false);
+  // Mostly text: a unit does not make it numeric.
+  assert.equal(isNumericStates(["on", "off", "1"], { unit: "%" }), false);
+  assert.equal(isNumericStates(["error"], { unit: "%" }), false);
+});
+
 test("segments start at the initial state and end at the window end", () => {
   const segs = buildSegments(
     { state: "off", attributes: {} },
@@ -147,6 +156,8 @@ test("numeric range and step path break on missing values", () => {
 test("ticks pick a step that fits and align to whole local units", () => {
   assert.equal(chooseStep(24 * H, 1200), 3 * H);
   assert.equal(chooseStep(60e3, 1200), 5e3);
+  // A week on a phone (about 350 px) gets a label every 3 days, not a single one.
+  assert.equal(chooseStep(7 * 24 * H, 350), 3 * 24 * H);
   const { step, ticks } = timeTicks(T0 + 10 * 60e3, T0 + 6 * H, 600, () => 0);
   assert.equal(step, H);
   assert.equal(ticks[0], T0 + H);

@@ -11,6 +11,7 @@ import {
   displaySettings,
   fromLocalInput,
   hasClockTerms,
+  localizeTimes,
   makeClock,
   offsetIn,
   presetWindow,
@@ -192,4 +193,13 @@ test("clock-dependent suggestions are detected and their YAML times annotated", 
       "  after: sunset",
     ].join("\n")
   );
+});
+
+test("times inside a warning's message read in the display zone", () => {
+  const fmt = (ms) => toLocalInput(ms, BER);
+  const msg = "automation.x started 1000 runs at 2026-10-05T17:40:42+00:00 without virtual time moving on";
+  assert.equal(localizeTimes(msg, fmt), "automation.x started 1000 runs at 2026-10-05T19:40 without virtual time moving on");
+  assert.equal(localizeTimes("until 2026-10-05T17:40:42.250Z, then 2026-10-05T13:00:00-04:00.", fmt), "until 2026-10-05T19:40, then 2026-10-05T19:00.");
+  // No offset, a bare date, or nothing like a time: left as is.
+  for (const text of ["at 2026-10-05T17:40:42 local", "on 2026-10-05", "no time here"]) assert.equal(localizeTimes(text, fmt), text);
 });

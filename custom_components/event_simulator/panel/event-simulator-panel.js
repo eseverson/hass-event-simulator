@@ -39,15 +39,28 @@ export function toNumber(state) {
 }
 
 /* A track is numeric when every state that is not unavailable/unknown parses as a number,
- * and there is at least one such state. */
-export function isNumericStates(states) {
-  let seen = false;
+ * and there is at least one such state. With a unit of measurement it only needs more
+ * numbers than other states: a stray reading ("error") is drawn as a gap in the line. */
+export function isNumericStates(states, { unit = "" } = {}) {
+  let numbers = 0;
+  let others = 0;
   for (const state of states) {
     if (isMissing(state)) continue;
-    if (Number.isNaN(toNumber(state))) return false;
-    seen = true;
+    if (Number.isNaN(toNumber(state))) {
+      if (!unit) return false;
+      others++;
+    } else numbers++;
   }
-  return seen;
+  return numbers > others;
+}
+
+/* `text` with each ISO date-time that carries an offset (or Z) rewritten by `fmt(ms)`: the
+ * backend's messages name instants in UTC, the page shows them in its display zone. */
+export function localizeTimes(text, fmt) {
+  return String(text ?? "").replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})/g, (iso) => {
+    const t = Date.parse(iso);
+    return Number.isFinite(t) ? fmt(t) : iso;
+  });
 }
 
 /* Epoch milliseconds from an ISO string (or a number passed through); NaN if unparseable. */
@@ -322,7 +335,7 @@ export function stepPath(segments, toX, toY) {
 /* Tick steps the axis may use, smallest first. */
 export const TICK_STEPS = [
   1e3, 5e3, 15e3, 30e3, 60e3, 5 * 60e3, 15 * 60e3, 30 * 60e3,
-  3600e3, 3 * 3600e3, 6 * 3600e3, 12 * 3600e3, 864e5, 2 * 864e5, 7 * 864e5,
+  3600e3, 3 * 3600e3, 6 * 3600e3, 12 * 3600e3, 864e5, 2 * 864e5, 3 * 864e5, 7 * 864e5,
 ];
 
 /* The smallest step that keeps ticks at least `minPx` apart. */
@@ -2765,7 +2778,8 @@ class EventSimulatorPanel extends Base {
   _derive(timeline) {
     const { start, end } = this._window;
     const segments = buildSegments(timeline.initial, timeline.events, start, end);
-    const numeric = isNumericStates(segments.map((s) => s.state));
+    const unit = segments.findLast((s) => s.attributes?.unit_of_measurement)?.attributes.unit_of_measurement || "";
+    const numeric = isNumericStates(segments.map((s) => s.state), { unit });
     return {
       segments,
       numeric,
@@ -3516,6 +3530,10 @@ class EventSimulatorPanel extends Base {
         return;
       }
       view.scrollDOM.addEventListener("scroll", () => this._placeConfigMarks(), { passive: true });
+      // CodeMirror guesses the height of lines outside the viewport and measures them once
+      // they scroll in; its gutter is as tall as those heights, so it resizes when they change.
+      const gutters = view.dom.querySelector(".cm-gutters");
+      if (gutters) this._cfgObserver?.observe(gutters);
       this._updateConfigDiff();
     };
     hook();
@@ -4365,7 +4383,8 @@ class EventSimulatorPanel extends Base {
       this._cfgDraft ? "the edited automation config" : "",
     ].filter(Boolean);
     const bus = this._busLaneEvents().length;
-    const calendarEvents = this._calendarIds().reduce((n, id) => n + (this._calendars[id]?.length || 0), 0);
+    const { start, end } = this._window;
+    const calendarEvents = this._calendarIds().reduce((n, id) => n + calendarLane(this._calendars[id], this._clock.serverTimeZone, start, end).length, 0);
     const fired = [
       bus ? `${bus} recorded event${bus === 1 ? "" : "s"}` : "",
       calendarEvents ? `${calendarEvents} calendar event${calendarEvents === 1 ? "" : "s"}` : "",
@@ -4527,7 +4546,7 @@ class EventSimulatorPanel extends Base {
       .map((g) => {
         const items = g.items
           .slice(0, LIMIT)
-          .map((w) => `<li>${w.at != null ? `<span class="mono small w-at">${esc(this._fullTime(w.at))}</span> ` : ""}<span class="w-msg">${esc(w.message)}</span></li>`)
+          .map((w) => `<li>${w.at != null ? `<span class="mono small w-at">${esc(this._fullTime(w.at))}</span> ` : ""}<span class="w-msg">${esc(localizeTimes(w.message, (t) => this._fullTime(t)))}</span></li>`)
           .join("");
         const more = g.items.length > LIMIT ? `<li class="muted">…and ${g.items.length - LIMIT} more</li>` : "";
         const key = `warn:${g.code}`;
@@ -5705,7 +5724,7 @@ class EventSimulatorPanel extends Base {
           <div class="muted small">drag to move this change · click to edit</div>`;
       } else {
         html = `<div class="mono small">${esc(this._fullTime(t))}</div>
-          <div><strong>${seg ? esc(seg.state) : "no data"}</strong>${seg && track.numeric && !isMissing(seg.state) && unit ? ` ${esc(unit)}` : ""}</div>
+          <div><strong>${seg ? esc(seg.state) : "no data"}</strong>${seg && track.numeric && !Number.isNaN(toNumber(seg.state)) && unit ? ` ${esc(unit)}` : ""}</div>
           ${seg ? `<div class="muted small">since ${esc(this._fullTime(seg.from))}</div>` : ""}
           ${track?.segments ? `<div class="muted small">drag to shift the whole track</div>` : ""}`;
       }
