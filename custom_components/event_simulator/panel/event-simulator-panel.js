@@ -1314,7 +1314,7 @@ export const MAX_SCENARIO_NAME = 100; // store.MAX_NAME_LENGTH
 
 /* The body of event_simulator/scenarios/save for the panel's current state. Times go
  * out as UTC ISO strings with a `Z`, the offset the store insists on. */
-export function scenarioPayload({ name, entityId, automation, start, end, tracks }) {
+export function scenarioPayload({ name, entityId, automation, start, end, tracks, labels = [], suggestOptions = null }) {
   const initial_states = {};
   const events = [];
   const track_shifts = {};
@@ -1340,6 +1340,10 @@ export function scenarioPayload({ name, entityId, automation, start, end, tracks
     initial_states,
     events,
     ...(Object.keys(track_shifts).length ? { track_shifts } : {}),
+    // Suggest mode: labeled periods (also kept in Replay, where they are an overlay), and
+    // the options, which are only sent from Suggest mode and reopen a scenario in it.
+    ...(labels.length ? { labels: labelsPayload(labels) } : {}),
+    ...(suggestOptions ? { suggest_options: suggestOptions } : {}),
   };
 }
 
@@ -1413,6 +1417,8 @@ export function scenarioErrorMessage(err, action = "save") {
       return "That scenario no longer exists; it may have been deleted in another window. The list is refreshed.";
     case "invalid_window":
       return "The window is not valid: it must end after it starts and be at most 7 days long.";
+    case "window_too_long":
+      return "Saved scenarios are limited to windows of at most 7 days for now. Shorten the window to save it.";
     case "too_large":
       return `This scenario is too large to save: at most 50,000 state changes and 50 tracks${detail}.`;
     case "too_many":
@@ -1430,11 +1436,237 @@ export function scenarioErrorMessage(err, action = "save") {
   }
 }
 
+// ---- suggest labels (pure) --------------------------------------------------
+//
+// Suggest mode learns an automation from labeled periods of history. A label is
+// {id, start, end, kind, anchor} with times in ms: kind "fire" (should fire, anchored at
+// its start, its end, both, or "while" = conditions hold throughout) or "no_fire" (must not
+// fire anywhere in it). Periods are half-open [start, end). Lists are kept sorted by start
+// and never mutated; every edit returns a new list, so an undo snapshot is the old list.
+//
+// Overlaps: periods of the same kind that overlap merge into one (the period being placed
+// keeps its id and anchor); a should-fire period may not overlap a must-not-fire one.
+
+export const LABEL_KINDS = ["fire", "no_fire"];
+export const LABEL_ANCHORS = ["start", "end", "both", "while"];
+export const ANCHOR_TEXT = { start: "at start", end: "at end", both: "at start and end", while: "while" };
+export const MAX_LABELS = 500; // store.MAX_LABELS
+export const DEFAULT_TOLERANCE = { before: 2 * 60e3, after: 10 * 60e3 };
+export const MAX_TOLERANCE_MIN = 24 * 60; // store.MAX_TOLERANCE
+export const MIN_LABEL_SPAN = 1e3;
+const LABEL_DEFAULT_KEY = "event_simulator.label_default";
+
+let labelSeq = 0;
+export const nextLabelId = () => `l${++labelSeq}`;
+
+const byStart = (a, b) => a.start - b.start || a.end - b.end;
+const overlaps = (a, b) => a.start < b.end && b.start < a.end;
+
+/* A label in words: "Should fire at start", "Must not fire". */
+export function labelText(label) {
+  return label.kind === "no_fire" ? "Must not fire" : `Should fire ${ANCHOR_TEXT[label.anchor] ?? ANCHOR_TEXT.start}`;
+}
+
+/* A label from loose input (saved, or typed), or null when it is not one. Times may be ISO
+ * strings or ms. A should-fire label without a known anchor is anchored at its start. */
+export function normalizeLabel(raw, id = undefined) {
+  if (!isObject(raw)) return null;
+  const start = parseTime(raw.start);
+  const end = parseTime(raw.end);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || !(end > start) || !LABEL_KINDS.includes(raw.kind)) return null;
+  const anchor = LABEL_ANCHORS.includes(raw.anchor) ? raw.anchor : "start";
+  return { id: id ?? raw.id ?? nextLabelId(), start, end, kind: raw.kind, anchor };
+}
+
+/* Put `label` into `labels`, replacing the one with its id (a new one gets an id):
+ * {ok: true, labels, label, merged: [ids absorbed]} or {ok: false, error}. Same-kind
+ * periods it overlaps (directly or through another) merge into it; a should-fire and a
+ * must-not-fire period may not overlap. */
+export function placeLabel(labels, label) {
+  if (!(label.end - label.start >= MIN_LABEL_SPAN)) return { ok: false, error: "A period must end at least a second after it starts." };
+  if (!LABEL_KINDS.includes(label.kind)) return { ok: false, error: "Unknown kind of period." };
+  const placed = { ...label, id: label.id ?? nextLabelId(), anchor: LABEL_ANCHORS.includes(label.anchor) ? label.anchor : "start" };
+  const others = labels.filter((l) => l.id !== placed.id);
+  let merged = placed;
+  const absorbed = new Set();
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const l of others) {
+      if (absorbed.has(l) || l.kind !== merged.kind || !overlaps(l, merged)) continue;
+      merged = { ...merged, start: Math.min(merged.start, l.start), end: Math.max(merged.end, l.end) };
+      absorbed.add(l);
+      grew = true;
+    }
+  }
+  if (others.some((l) => l.kind !== merged.kind && overlaps(l, merged))) {
+    const other = merged.kind === "fire" ? "must-not-fire" : "should-fire";
+    return {
+      ok: false,
+      error: `That period overlaps a ${other} period${absorbed.size ? " (once merged with the overlapping ones of its own kind)" : ""}. Should-fire and must-not-fire periods cannot overlap; shorten or move one first.`,
+    };
+  }
+  const next = [...others.filter((l) => !absorbed.has(l)), merged].sort(byStart);
+  if (next.length > MAX_LABELS) return { ok: false, error: `At most ${MAX_LABELS} labeled periods.` };
+  return { ok: true, labels: next, label: merged, merged: [...absorbed].map((l) => l.id) };
+}
+
+export function removeLabel(labels, id) {
+  return labels.filter((l) => l.id !== id);
+}
+
+/* The label moved by dt ms, its length kept, never leaving the window [start, end). */
+export function moveLabel(label, dt, { start, end }) {
+  const span = label.end - label.start;
+  const from = Math.min(Math.max(label.start + Math.round(dt), start), Math.max(start, end - span));
+  return { ...label, start: from, end: from + Math.min(span, end - start) };
+}
+
+/* The label with one edge ("start" | "end") dragged to t, kept at least `minSpan` long and
+ * inside the window. */
+export function resizeLabel(label, edge, t, { start, end }, minSpan = MIN_LABEL_SPAN) {
+  const at = Math.round(t);
+  if (edge === "start") return { ...label, start: Math.max(start, Math.min(at, label.end - minSpan)) };
+  return { ...label, end: Math.min(end, Math.max(at, label.start + minSpan)) };
+}
+
+/* The period a brush from t0 to t1 covers: ordered, each end snapped to `step` of local
+ * time, clamped to the window; null when it is too short to be a period (a click). */
+export function brushPeriod(t0, t1, { start, end, step = 0, offsetMinutes = localOffsetMinutes }) {
+  const snap = (t) => (step ? snapTime(t, step, offsetMinutes) : Math.round(t));
+  const lo = Math.max(start, snap(Math.min(t0, t1)));
+  const hi = Math.min(end, snap(Math.max(t0, t1)));
+  return hi - lo >= Math.max(step, MIN_LABEL_SPAN) ? { start: lo, end: hi } : null;
+}
+
+/* What the pointer at `x` px is on: {id, part: "start" | "end" | "body"} or null. Edges
+ * within `reach` px win over the body, the nearest edge first; with a finger (`touch`) only
+ * the selected label has edge handles, so a drag on any other one moves it. */
+export function labelHit(labels, x, scale, { reach = 6, selected = null, touch = false } = {}) {
+  let edge = null;
+  let best = reach;
+  let body = null;
+  for (const l of labels) {
+    if (l.end < scale.t0 || l.start > scale.t1) continue;
+    const x1 = scale.toX(l.start);
+    const x2 = scale.toX(l.end);
+    if (!touch || l.id === selected) {
+      for (const [part, ex] of [["start", x1], ["end", x2]]) {
+        const d = Math.abs(ex - x);
+        // Ties go to the selected label, then to the edge the pointer is inside of.
+        if (d < best || (d === best && edge && (l.id === selected || (x >= x1 && x <= x2)))) {
+          best = d;
+          edge = { id: l.id, part };
+        }
+      }
+    }
+    if (x >= x1 && x <= x2 && (!body || l.id === selected)) body = { id: l.id, part: "body" };
+  }
+  return edge ?? body;
+}
+
+export function labelsInWindow(labels, start, end) {
+  return labels.filter((l) => l.start < end && l.end > start);
+}
+
+/* Labels as event_simulator/suggest/subscribe and the store take them: sorted, ISO times,
+ * an anchor only on should-fire periods. */
+export function labelsPayload(labels) {
+  return [...labels].sort(byStart).map((l) => ({
+    start: new Date(l.start).toISOString(),
+    end: new Date(l.end).toISOString(),
+    kind: l.kind,
+    ...(l.kind === "fire" ? { anchor: LABEL_ANCHORS.includes(l.anchor) ? l.anchor : "start" } : {}),
+  }));
+}
+
+/* The labels of a saved scenario, sorted; malformed ones are skipped. */
+export function labelsFromScenario(raw) {
+  return (Array.isArray(raw) ? raw : []).map((l) => normalizeLabel(l, nextLabelId())).filter(Boolean).sort(byStart);
+}
+
+/* Suggest options from the tolerance (ms) as the store and suggest/subscribe take them (s). */
+export function suggestOptions(tolerance = DEFAULT_TOLERANCE) {
+  return { tolerance_before: tolerance.before / 1000, tolerance_after: tolerance.after / 1000 };
+}
+
+export function toleranceFromOptions(options) {
+  const pick = (v, d) => (Number.isFinite(Number(v)) && Number(v) >= 0 && v !== null && v !== "" ? Number(v) * 1000 : d);
+  return { before: pick(options?.tolerance_before, DEFAULT_TOLERANCE.before), after: pick(options?.tolerance_after, DEFAULT_TOLERANCE.after) };
+}
+
+/* A tolerance typed in minutes: {ok, value (ms)} or {ok: false, error}. */
+export function checkToleranceMinutes(text) {
+  const src = String(text ?? "").trim();
+  const n = toNumber(src);
+  if (!src || Number.isNaN(n) || n < 0 || n > MAX_TOLERANCE_MIN) return { ok: false, error: `The tolerance is a number of minutes from 0 to ${MAX_TOLERANCE_MIN}.` };
+  return { ok: true, value: Math.round(n * 60e3) };
+}
+
+/* The remembered kind and anchor for a new period (default: should fire, at start). */
+export function readLabelDefault(storage = globalThis.localStorage) {
+  try {
+    const v = JSON.parse(storage?.getItem(LABEL_DEFAULT_KEY) ?? "null");
+    if (isObject(v) && LABEL_KINDS.includes(v.kind)) return { kind: v.kind, anchor: LABEL_ANCHORS.includes(v.anchor) ? v.anchor : "start" };
+  } catch {
+    // unreadable or blocked: the default
+  }
+  return { kind: "fire", anchor: "start" };
+}
+
+export function writeLabelDefault(value, storage = globalThis.localStorage) {
+  try {
+    storage?.setItem(LABEL_DEFAULT_KEY, JSON.stringify({ kind: value.kind, anchor: value.anchor }));
+  } catch {
+    // not remembered
+  }
+}
+
+/* The event_simulator/suggest/subscribe request (see the suggestions spec): the entities to
+ * learn from, the window, the labels inside it, and the options. */
+export function suggestMessage({ entityIds, start, end, labels, tolerance }) {
+  return {
+    type: "event_simulator/suggest/subscribe",
+    entity_ids: [...entityIds],
+    start: new Date(start).toISOString(),
+    end: new Date(end).toISOString(),
+    labels: labelsPayload(labelsInWindow(labels, start, end)),
+    options: suggestOptions(tolerance),
+  };
+}
+
+/* Whether the backend has suggest/subscribe, from how it answered a request with no fields:
+ * an unknown command is not there; any other refusal (invalid_format) means it is. */
+export function suggestAvailable(err) {
+  return err?.code !== "unknown_command";
+}
+
+/* A suggest/subscribe event (or a rejected subscribe, as {error}) for the panel:
+ * {kind: "done", suggestions, hints}, {kind: "progress", text}, {kind: "unavailable"} or
+ * {kind: "error", error: describeRunError(...)}. */
+export function suggestOutcome(event) {
+  const e = isObject(event) ? event : {};
+  const err = e.error ?? (isObject(e.result) && e.result.error && !Array.isArray(e.result.suggestions) ? e.result.error : null);
+  if (err) {
+    if (err?.code === "unknown_command") return { kind: "unavailable" };
+    return { kind: "error", error: describeRunError(err) };
+  }
+  const body = isObject(e.result) ? e.result : e;
+  if (Array.isArray(body.suggestions)) return { kind: "done", suggestions: body.suggestions, hints: Array.isArray(body.hints) ? body.hints : [] };
+  const stage = body.stage ?? body.progress ?? body.status ?? body.type;
+  const counts = [body.done ?? body.count, body.total].filter((n) => Number.isFinite(n));
+  const text = stage ? `${String(stage).charAt(0).toUpperCase()}${String(stage).slice(1)}${counts.length === 2 ? ` ${counts[0]}/${counts[1]}` : ""}…` : "Working…";
+  return { kind: "progress", text };
+}
+
 // ---- panel ----------------------------------------------------------------
 
 const HOUR = 3600e3;
 const DAY = 24 * HOUR;
 const MAX_WINDOW = 7 * DAY; // history.MAX_WINDOW
+// Suggest mode learns from repetition, so its window may be longer (the suggestions spec).
+// The history command still caps a load at MAX_WINDOW until the backend raises it for
+// suggest; a longer window then fails to load with `window_too_long`, said in words.
+const MAX_SUGGEST_WINDOW = 30 * DAY;
 const MAX_ENTITIES = 50; // history.MAX_ENTITIES
 const PRESETS = [
   { id: "1h", label: "1 h", span: HOUR },
@@ -1442,10 +1674,14 @@ const PRESETS = [
   { id: "24h", label: "24 h", span: DAY },
   { id: "3d", label: "3 d", span: 3 * DAY },
   { id: "7d", label: "7 d", span: 7 * DAY },
+  { id: "14d", label: "14 d", span: 14 * DAY, suggest: true },
+  { id: "30d", label: "30 d", span: 30 * DAY, suggest: true },
   { id: "today", label: "Today" },
   { id: "yesterday", label: "Yesterday" },
 ];
 const AXIS_H = 24;
+const LABELS_H = 30;
+const LONG_PRESS_MS = 450; // a touch held this long on the labels row starts a brush
 const SCROLL_MIN_THUMB = 28; // px
 const DISCRETE_H = 24;
 const NUMERIC_H = 56;
@@ -1563,6 +1799,21 @@ class EventSimulatorPanel extends Base {
       start: (seq, opts) => this._startReplay(seq, opts),
       cancel: (seq) => this._cancelReplay(seq),
     });
+    // Suggest mode: the same timeline, tracks and window, plus labeled periods. Label edits
+    // share the undo history (entries with `labels`: the list as it was before).
+    this._mode = "replay"; // "replay" | "suggest"
+    this._labels = []; // sorted, immutable: see placeLabel
+    this._labelSel = null; // id of the label in the editor
+    this._labelDraft = null; // {start, end}: a brushed period waiting for its kind
+    this._labelDrag = null; // brush, move or resize in progress
+    this._labelEdDraft = null; // unapplied label editor times: {id, start, end}
+    this._labelError = null;
+    this._labelDefault = readLabelDefault();
+    this._tolerance = { ...DEFAULT_TOLERANCE };
+    this._tolError = null;
+    this._suggestAvail = null; // null until probed, then true / false
+    this._suggestRun = null; // {done, unsub}
+    this._suggestState = null; // {running, text, error, result}
   }
 
   get _running() {
@@ -1623,6 +1874,7 @@ class EventSimulatorPanel extends Base {
       this._renderConfig();
     });
     this._listScenarios();
+    this._probeSuggest();
     try {
       this._automations = await this._hass.callWS({ type: "event_simulator/automations" });
       this._loading = null;
@@ -1635,6 +1887,17 @@ class EventSimulatorPanel extends Base {
   }
 
   async _selectAutomation(entityId) {
+    // In Suggest mode an automation only seeds tracks: it adds its entities to the ones there.
+    if (this._mode === "suggest" && this._tracks.length) {
+      if (entityId) return this._seedFromAutomation(entityId);
+      this._entityId = "";
+      this._automation = null;
+      this._cfgDraft = null;
+      this._cfgError = null;
+      this._clearResult();
+      this._renderConfig();
+      return this._render();
+    }
     this._entityId = entityId;
     this._automation = null;
     this._tracks = [];
@@ -1669,6 +1932,50 @@ class EventSimulatorPanel extends Base {
     }
   }
 
+  /* Suggest mode: load an automation and add a track for each entity it references that
+   * has none yet, keeping the tracks, their edits and the labels already there. */
+  async _seedFromAutomation(entityId) {
+    this._entityId = entityId;
+    this._clearResult();
+    this._cfgDraft = null;
+    this._cfgError = null;
+    this._error = null;
+    this._notice = null;
+    const token = this._requestToken;
+    this._loading = "Loading automation…";
+    this._render();
+    try {
+      const automation = await this._hass.callWS({ type: "event_simulator/automation", entity_id: entityId });
+      if (token !== this._requestToken) return;
+      this._automation = automation;
+      this._renderConfig();
+      const have = new Set(this._tracks.map((t) => t.entity_id));
+      const fresh = (automation.referenced_entities || []).filter((id) => !have.has(id));
+      const room = Math.max(0, MAX_ENTITIES - this._tracks.length);
+      if (fresh.length > room) this._notice = `Only ${room} of the ${fresh.length} entities ${entityId} references were added: at most ${MAX_ENTITIES} tracks.`;
+      const add = fresh.slice(0, room);
+      for (const id of add) this._tracks.push({ entity_id: id, initial: null, events: [] });
+      if (!add.length && !this._notice) this._notice = `Every entity ${entityId} references already has a track.`;
+      this._markStale();
+      await this._loadHistory(add.length ? add : []);
+    } catch (e) {
+      if (token !== this._requestToken) return;
+      this._loading = null;
+      this._error = `Could not load ${entityId}: ${e.message || e}`;
+      this._render();
+    }
+  }
+
+  /* A failed history load in words. A window longer than the history command takes says
+   * so plainly, since Suggest mode offers windows the backend may not load yet. */
+  _historyError(e) {
+    if (e?.code === "window_too_long") {
+      const span = formatDuration(this._window.end - this._window.start);
+      return `This window is ${span}, and this version of the integration loads at most ${MAX_WINDOW / DAY} days of history at a time, so it cannot load yet. Pick ${MAX_WINDOW / DAY} days or less for now.`;
+    }
+    return `Could not load history: ${e.message || e}`;
+  }
+
   /* Fetch history for `entityIds` (default: every track) in the current window and
    * replace those tracks' data. A response is dropped if the automation or the window
    * changed while it was in flight (both bump _requestToken and reload everything). */
@@ -1696,7 +2003,14 @@ class EventSimulatorPanel extends Base {
       }
     } catch (e) {
       if (token !== this._requestToken) return;
-      this._error = `Could not load history: ${e.message || e}`;
+      this._error = this._historyError(e);
+      // Whatever these tracks showed belongs to another window (or none): show them empty.
+      for (const track of this._tracks) {
+        if (!ids.includes(track.entity_id)) continue;
+        Object.assign(track, { initial: null, events: [], recorded: { initial: null, events: [] } });
+        delete track.shift;
+        this._prepareTrack(track);
+      }
     }
     this._loading = null;
     this._render();
@@ -1747,8 +2061,11 @@ class EventSimulatorPanel extends Base {
       this._error = "The window must end after it starts.";
       return this._render();
     }
-    if (end - start > MAX_WINDOW) {
-      this._error = "The window can be at most 7 days long.";
+    if (end - start > this._maxWindow()) {
+      this._error =
+        this._mode === "suggest"
+          ? `The window can be at most ${MAX_SUGGEST_WINDOW / DAY} days long in Suggest mode.`
+          : `The window can be at most ${MAX_WINDOW / DAY} days long (${MAX_SUGGEST_WINDOW / DAY} in Suggest mode).`;
       return this._render();
     }
     this._preset = preset;
@@ -1760,8 +2077,37 @@ class EventSimulatorPanel extends Base {
     }
     this._clearEdits();
     this._requestToken++;
-    if (this._automation) this._loadHistory();
+    if (this._hasTimeline()) this._loadHistory();
     else this._render();
+  }
+
+  _maxWindow() {
+    return this._mode === "suggest" ? MAX_SUGGEST_WINDOW : MAX_WINDOW;
+  }
+
+  /* Whether there is a timeline to show: an automation's, or Suggest mode's own tracks. */
+  _hasTimeline() {
+    return !!this._automation || this._mode === "suggest";
+  }
+
+  /* Switch between Replay and Suggest. Both share the window, tracks, edits and labels; a
+   * window longer than Replay allows is cut to its last 7 days on the way back. */
+  _setMode(mode) {
+    if (mode === this._mode || !["replay", "suggest"].includes(mode)) return;
+    this._mode = mode;
+    this._labelDraft = null;
+    this._labelDrag = null;
+    this._labelError = null;
+    this._notice = null;
+    if (mode === "replay") {
+      this._labelSel = null;
+      const { start, end } = this._window;
+      if (end - start > MAX_WINDOW) {
+        this._setWindow(end - MAX_WINDOW, end, "7d");
+        this._notice = [`Replay windows are at most ${MAX_WINDOW / DAY} days, so the window is now the last ${MAX_WINDOW / DAY} days of the Suggest one.`, this._notice].filter(Boolean).join(" ");
+      }
+    }
+    this._render();
   }
 
   _addTrack(entityId) {
@@ -1803,6 +2149,10 @@ class EventSimulatorPanel extends Base {
     this._edError = null;
     this._evDrag = null;
     this._drag = null;
+    this._labelSel = null;
+    this._labelDraft = null;
+    this._labelDrag = null;
+    this._labelEdDraft = null;
   }
 
   _track(entityId) {
@@ -1817,6 +2167,7 @@ class EventSimulatorPanel extends Base {
     }
     this._sel = sel;
     this._selT = sel ? t : null;
+    if (sel) this._labelSel = null;
   }
 
   /* Replace tracks' timelines as one undoable edit. `changes` is [{entity_id, timeline}];
@@ -1851,6 +2202,16 @@ class EventSimulatorPanel extends Base {
   _undoEdit() {
     const entry = this._undo.pop();
     if (!entry) return;
+    if (entry.labels) {
+      this._labels = entry.labels;
+      if (!this._labels.some((l) => l.id === this._labelSel)) this._labelSel = null;
+      this._labelDraft = null;
+      this._labelEdDraft = null;
+      this._labelError = null;
+      this._labelsChanged();
+      this._notice = `Undid: ${entry.label}.`;
+      return this._render();
+    }
     for (const { entity_id, timeline } of entry.snapshots) {
       const track = this._track(entity_id);
       if (track) this._setTimeline(track, timeline);
@@ -1950,6 +2311,194 @@ class EventSimulatorPanel extends Base {
       const half = (t1 - t0) / 2;
       this._view = clampView(t - half, t + half, ...this._bounds());
     }
+    this._render();
+  }
+
+  // ---- labels (Suggest mode) ----------------------------------------------------
+
+  _label(id) {
+    return this._labels.find((l) => l.id === id) || null;
+  }
+
+  /* Place a new or edited label as one undoable edit (see placeLabel for the overlap rules).
+   * A refusal leaves the labels as they were and says why. */
+  _placeLabel(undoLabel, label) {
+    const r = placeLabel(this._labels, label);
+    if (!r.ok) {
+      this._labelError = r.error;
+      return this._render();
+    }
+    this._undo.push({ label: undoLabel, snapshots: [], labels: this._labels });
+    this._labels = r.labels;
+    this._labelSel = r.label.id;
+    this._sel = null;
+    this._labelEdDraft = null;
+    this._labelError = null;
+    const merged = r.merged.length;
+    this._notice = merged ? `Merged with ${merged} overlapping ${label.kind === "fire" ? "should-fire" : "must-not-fire"} period${merged === 1 ? "" : "s"}.` : null;
+    this._labelsChanged();
+    this._render();
+  }
+
+  _deleteLabel(id) {
+    if (!this._label(id)) return;
+    this._undo.push({ label: "delete period", snapshots: [], labels: this._labels });
+    this._labels = removeLabel(this._labels, id);
+    if (this._labelSel === id) this._labelSel = null;
+    this._labelEdDraft = null;
+    this._labelError = null;
+    this._labelsChanged();
+    this._render();
+  }
+
+  _selectLabel(id) {
+    this._select(null);
+    this._labelSel = id;
+    this._labelEdDraft = null;
+    this._labelError = null;
+  }
+
+  /* The kind picked for a brushed period: create it and remember the choice for next time. */
+  _createLabel(kind, anchor) {
+    const draft = this._labelDraft;
+    if (!draft) return;
+    this._labelDraft = null;
+    this._labelDefault = { kind, anchor: kind === "fire" ? anchor : this._labelDefault.anchor };
+    writeLabelDefault(this._labelDefault);
+    this._placeLabel("add period", { start: draft.start, end: draft.end, kind, anchor: this._labelDefault.anchor });
+    this.shadowRoot.getElementById("tl-wrap")?.focus({ preventScroll: true });
+  }
+
+  /* Kind and anchor apply as soon as they are picked in the label editor. */
+  _updateLabel(id, changes) {
+    const label = this._label(id);
+    if (!label) return;
+    const next = { ...label, ...changes };
+    if (changes.kind === "fire" && !LABEL_ANCHORS.includes(label.anchor)) next.anchor = this._labelDefault.anchor;
+    this._placeLabel(changes.kind ? "change period kind" : "change anchor", next);
+  }
+
+  /* The label editor's exact start and end. */
+  _applyLabelEditor() {
+    const label = this._label(this._labelSel);
+    if (!label) return;
+    const root = this.shadowRoot;
+    const startText = root.getElementById("lb-start")?.value;
+    const endText = root.getElementById("lb-end")?.value;
+    const start = startText === toLocalInputSeconds(label.start) ? label.start : fromLocalInput(startText);
+    const end = endText === toLocalInputSeconds(label.end) ? label.end : fromLocalInput(endText);
+    const fail = (message) => {
+      this._labelError = message;
+      this._render();
+    };
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return fail("Enter a start and an end.");
+    if (end <= start) return fail("The period must end after it starts.");
+    if (start < this._window.start || end > this._window.end) {
+      return fail(`The period must be inside the window (${this._fullTime(this._window.start)} to ${this._fullTime(this._window.end)}).`);
+    }
+    if (start === label.start && end === label.end) {
+      this._labelEdDraft = null;
+      return this._render();
+    }
+    this._placeLabel("edit period", { ...label, start, end });
+  }
+
+  /* Labels changed: the save state and anything suggested from the old ones are out of date. */
+  _labelsChanged() {
+    if (this._suggestState?.result) this._suggestState = { ...this._suggestState, stale: true };
+    this._updateDirty();
+  }
+
+  // ---- suggest ------------------------------------------------------------------
+
+  /* Ask the backend whether it has suggest/subscribe: a request with no fields is refused
+   * as unknown when it does not, and as malformed when it does. */
+  async _probeSuggest() {
+    try {
+      await this._hass.callWS({ type: "event_simulator/suggest/subscribe" });
+      this._suggestAvail = true;
+    } catch (e) {
+      this._suggestAvail = suggestAvailable(e);
+    }
+    if (this._mode === "suggest") this._render();
+  }
+
+  _canSuggest() {
+    return (
+      this._suggestAvail !== false &&
+      !this._loading &&
+      this._tracks.length > 0 &&
+      labelsInWindow(this._labels, this._window.start, this._window.end).some((l) => l.kind === "fire")
+    );
+  }
+
+  /* Press Suggest: subscribe to suggest/subscribe (newest wins: a running one is dropped).
+   * The results UI is the next panel unit; this shows progress, errors and a count. */
+  _runSuggest() {
+    if (!this._canSuggest()) return;
+    this._cancelSuggest();
+    const message = suggestMessage({
+      entityIds: this._tracks.map((t) => t.entity_id),
+      start: this._window.start,
+      end: this._window.end,
+      labels: this._labels,
+      tolerance: this._tolerance,
+    });
+    const tooLarge = messageSizeError(message);
+    if (tooLarge) {
+      this._suggestState = { running: false, error: describeRunError(tooLarge) };
+      return this._render();
+    }
+    const run = { done: false, unsub: null };
+    this._suggestRun = run;
+    this._suggestState = { running: true, text: "Starting…" };
+    this._hass.connection
+      .subscribeMessage((event) => this._onSuggestEvent(run, event), message, { resubscribe: false })
+      .then((unsub) => {
+        run.unsub = unsub;
+        if (run.done) this._unsubscribe(run);
+      })
+      .catch((err) => this._onSuggestEvent(run, { error: err }));
+    this._render();
+  }
+
+  _cancelSuggest() {
+    const run = this._suggestRun;
+    if (!run) return;
+    run.done = true;
+    this._suggestRun = null;
+    this._unsubscribe(run);
+  }
+
+  _onSuggestEvent(run, event) {
+    if (run.done || run !== this._suggestRun) return;
+    const outcome = suggestOutcome(event);
+    if (outcome.kind === "progress") {
+      this._suggestState = { ...this._suggestState, running: true, text: outcome.text };
+      return this._renderSoon();
+    }
+    this._cancelSuggest();
+    if (outcome.kind === "unavailable") {
+      this._suggestAvail = false;
+      this._suggestState = null;
+    } else if (outcome.kind === "error") {
+      this._suggestState = { running: false, error: outcome.error };
+    } else {
+      this._suggestState = { running: false, result: { suggestions: outcome.suggestions, hints: outcome.hints } };
+    }
+    this._renderSoon();
+  }
+
+  _setTolerance(which, text) {
+    const check = checkToleranceMinutes(text);
+    if (!check.ok) {
+      this._tolError = check.error;
+      return this._render();
+    }
+    this._tolError = null;
+    if (this._tolerance[which] === check.value) return this._render();
+    this._tolerance = { ...this._tolerance, [which]: check.value };
+    this._labelsChanged();
     this._render();
   }
 
@@ -2232,7 +2781,7 @@ class EventSimulatorPanel extends Base {
 
   /* Whether a replay can start now: an automation, no load pending, a config that parses. */
   _syncReady() {
-    this._scheduler.setReady(!!this._automation && !this._loading && !this._cfgError);
+    this._scheduler.setReady(this._mode === "replay" && !!this._automation && !this._loading && !this._cfgError);
   }
 
   _run() {
@@ -2249,7 +2798,7 @@ class EventSimulatorPanel extends Base {
   /* ReplayScheduler's `start`: send replay `seq`, or skip it when nothing changed since the
    * shown result (unless forced by Run now) or the request is too large to send. */
   _startReplay(seq, { forced }) {
-    const print = this._fingerprint();
+    const print = this._replayPrint();
     if (!forced && this._result && !this._runError && print === this._resultPrint) {
       this._resultStale = false;
       this._renderSoon();
@@ -2309,7 +2858,7 @@ class EventSimulatorPanel extends Base {
       this._result = normalizeResult(outcome.result);
       this._runError = null;
       this._resultPrint = replay.print;
-      this._resultStale = this._scheduler.dirty || this._fingerprint() !== replay.print;
+      this._resultStale = this._scheduler.dirty || this._replayPrint() !== replay.print;
       // Keep the run being inspected across replays when it is still there.
       const runs = this._result.runs;
       this._selectedRun = runs.some((r) => r.index === selected) ? selected : (runs[0]?.index ?? null);
@@ -2320,7 +2869,7 @@ class EventSimulatorPanel extends Base {
   /* Render now, or once the drag in progress ends: a redraw replaces the timeline the
    * pointer is captured by. */
   _renderSoon() {
-    if (this._evDrag || this._drag || this._thumbDrag) {
+    if (this._evDrag || this._drag || this._thumbDrag || this._labelDrag) {
       this._renderDeferred = true;
       return;
     }
@@ -2328,7 +2877,7 @@ class EventSimulatorPanel extends Base {
   }
 
   _flushRender() {
-    if (!this._renderDeferred || this._evDrag || this._drag || this._thumbDrag) return;
+    if (!this._renderDeferred || this._evDrag || this._drag || this._thumbDrag || this._labelDrag) return;
     this._renderDeferred = false;
     this._render();
   }
@@ -2344,29 +2893,43 @@ class EventSimulatorPanel extends Base {
       start: this._window.start,
       end: this._window.end,
       tracks: this._tracks,
+      labels: this._labels,
+      suggestOptions: this._mode === "suggest" ? suggestOptions(this._tolerance) : null,
     });
   }
 
-  /* scenarioFingerprint of the current state. Timelines are immutable and replaced on
-   * every edit, so the costly part is cached on their identity. */
+  /* scenarioFingerprint of the current state, labels and Suggest options included.
+   * Timelines and label lists are immutable and replaced on every edit, so the costly
+   * part is cached on their identity. */
   _fingerprint() {
-    const parts = [this._entityId, this._window.start, this._window.end, ...this._tracks.flatMap((t) => [t.entity_id, t.initial, t.events, t.shift])];
+    return this._prints().full;
+  }
+
+  /* The same without labels and Suggest options: what a replay depends on. */
+  _replayPrint() {
+    return this._prints().replay;
+  }
+
+  _prints() {
+    const parts = [this._entityId, this._window.start, this._window.end, this._labels, this._mode, this._tolerance, ...this._tracks.flatMap((t) => [t.entity_id, t.initial, t.events, t.shift])];
     const c = this._printCache;
     if (!c || c.parts.length !== parts.length || c.parts.some((x, i) => x !== parts[i]) || c.config !== this._runConfig()) {
-      this._printCache = { parts, config: this._runConfig(), print: scenarioFingerprint(this._payload()) };
+      const payload = this._payload();
+      const { labels, suggest_options, ...replay } = payload;
+      this._printCache = { parts, config: this._runConfig(), full: scenarioFingerprint(payload), replay: scenarioFingerprint(replay) };
     }
-    return this._printCache.print;
+    return this._printCache;
   }
 
   /* "saved", "dirty", "new" (never saved) or null (nothing to save yet). */
   _saveState() {
-    if (!this._automation) return null;
+    if (!this._hasTimeline()) return null;
     if (!this._scenario) return "new";
     return this._fingerprint() === this._savedPrint ? "saved" : "dirty";
   }
 
   _canSave() {
-    return !!this._automation && !this._loading && !this._cfgError && !this._scBusy;
+    return this._hasTimeline() && !this._loading && !this._cfgError && !this._scBusy;
   }
 
   /* The save-state chip, redrawn on its own while the config editor is typed in. */
@@ -2396,7 +2959,7 @@ class EventSimulatorPanel extends Base {
   }
 
   _defaultName() {
-    const alias = this._automation?.config?.alias || this._entityId || "Scenario";
+    const alias = this._automation?.config?.alias || this._entityId || (this._mode === "suggest" ? "Suggest" : "Scenario");
     const d = new Date(this._window.start);
     return `${alias} — ${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })}`.slice(0, MAX_SCENARIO_NAME);
   }
@@ -2479,6 +3042,14 @@ class EventSimulatorPanel extends Base {
     this._tracks = [];
     this._clearResult();
     this._clearEdits();
+    this._cancelSuggest();
+    this._suggestState = null;
+    // Saved from Suggest mode (it has options) or not; labels load either way.
+    this._mode = isObject(record.suggest_options) ? "suggest" : "replay";
+    this._labels = labelsFromScenario(record.labels);
+    this._tolerance = toleranceFromOptions(record.suggest_options);
+    this._tolError = null;
+    this._labelError = null;
     this._cfgDraft = null;
     this._cfgError = null;
     this._error = null;
@@ -2502,9 +3073,10 @@ class EventSimulatorPanel extends Base {
     }
     if (token !== this._requestToken) return;
     const saved = isObject(record.automation) ? record.automation : {};
-    this._automation = live || { config: saved, referenced_entities: [] };
+    // A Suggest scenario saved without an automation has none to replay.
+    this._automation = live || (entityId || Object.keys(saved).length ? { config: saved, referenced_entities: [] } : null);
     // The saved config is what Run sent; against the live automation it is an edit or not.
-    this._cfgDraft = stableStringify(saved) === stableStringify(this._automation.config) ? null : saved;
+    this._cfgDraft = !this._automation || stableStringify(saved) === stableStringify(this._automation.config) ? null : saved;
     this._renderConfig();
     const loaded = tracksFromScenario(record);
     let recorded = new Map();
@@ -2595,6 +3167,8 @@ class EventSimulatorPanel extends Base {
       .then(() => {
         if (held === this._heldRender) page.style.minHeight = "";
       });
+    // Suggest mode has no automation to edit; the config card keeps its editor, hidden.
+    this.shadowRoot.getElementById("config").hidden = this._mode === "suggest";
     const add = root.querySelector("#add-track");
     if (add) add.value = addValue;
     const menu = root.querySelector("ha-menu-button");
@@ -2605,6 +3179,13 @@ class EventSimulatorPanel extends Base {
     this._bindTimeline();
     this._renderTimeline();
     if (timelineFocused) this.shadowRoot.getElementById("tl-wrap")?.focus({ preventScroll: true });
+    // A just-brushed period: its kind popover takes the keyboard, the remembered kind first.
+    if (this._focusPop) {
+      const pop = this.shadowRoot.getElementById("label-pop");
+      // A new ha-card renders its slot asynchronously; until then its content cannot take focus.
+      Promise.resolve(pop?.closest("ha-card")?.updateComplete).then(() => pop?.querySelector("[data-default]")?.focus({ preventScroll: true }));
+    }
+    this._focusPop = false;
     const name = this.shadowRoot.getElementById("sc-name");
     if (name && (caret || this._focusName)) {
       const scroll = this._focusName;
@@ -2672,14 +3253,25 @@ class EventSimulatorPanel extends Base {
             <input id="auto-filter" type="search" placeholder="Search automations…" value="${esc(this._autoFilter)}" autocomplete="off">
             <select id="automation" size="1">${this._automationOptions()}</select>`;
     const w = this._window;
-    const presets = PRESETS.map(
+    const suggest = this._mode === "suggest";
+    const presets = PRESETS.filter((p) => suggest || !p.suggest).map(
       (p) => `<button class="${this._preset === p.id ? "on" : ""}" data-action="preset" data-preset="${p.id}">${p.label}</button>`
     ).join("");
+    const modes = [
+      ["replay", "Replay", "Replay recorded history against an automation"],
+      ["suggest", "Suggest", "Label periods of history and get a trigger and conditions suggested"],
+    ]
+      .map(([id, text, title]) => `<button class="${this._mode === id ? "on" : ""}" data-action="mode" data-mode="${id}" title="${esc(title)}" aria-pressed="${this._mode === id}">${text}</button>`)
+      .join("");
     return `
       <ha-card>
         <div class="card-content setup">
+          <div class="field">
+            <span class="label">Mode</span>
+            <div class="segmented mode" role="group" aria-label="Mode">${modes}</div>
+          </div>
           <div class="field grow">
-            <span class="label">Automation</span>
+            <span class="label">${suggest ? "Seed tracks from an automation (optional)" : "Automation"}</span>
             <span class="picker">${picker}</span>
           </div>
           <div class="field">
@@ -2691,7 +3283,7 @@ class EventSimulatorPanel extends Base {
             </div>
             <div class="segmented">${presets}</div>
           </div>
-          <div class="run-row">
+          ${suggest ? this._suggestRowHtml() : `<div class="run-row">
             <label class="auto-run" title="Replay automatically after each change">
               <input type="checkbox" id="auto-run" ${this._autoRun ? "checked" : ""}> Auto-run
             </label>
@@ -2700,10 +3292,45 @@ class EventSimulatorPanel extends Base {
             </button>
             ${this._running ? `<span class="spinner" aria-label="Replaying"></span>` : ""}
             <span class="muted small">${esc(this._runHint())}</span>
-          </div>
+          </div>`}
           ${this._scenarioHtml()}
         </div>
       </ha-card>`;
+  }
+
+  /* Suggest mode's row in place of Run: the match tolerance, the Suggest button and what it
+   * is doing. The suggestions list itself is the next panel unit. */
+  _suggestRowHtml() {
+    const tol = this._tolerance;
+    const minutes = (ms) => String(Math.round((ms / 60e3) * 100) / 100);
+    const st = this._suggestState;
+    const inWindow = labelsInWindow(this._labels, this._window.start, this._window.end);
+    const fires = inWindow.filter((l) => l.kind === "fire").length;
+    let status;
+    if (this._suggestAvail === false) status = `<span class="muted small" id="suggest-status">Suggestions are not available yet.</span>`;
+    else if (st?.running) status = `<span class="spinner" aria-label="Suggesting"></span><span class="muted small" id="suggest-status">${esc(st.text || "Working…")}</span>`;
+    else if (st?.error) status = `<span class="err small" id="suggest-status" role="alert">${esc(st.error.title)}: ${esc(st.error.message)}</span>`;
+    else if (st?.result) {
+      const n = st.result.suggestions.length;
+      status = `<span class="muted small" id="suggest-status">${n} suggestion${n === 1 ? "" : "s"} found${st.stale ? " (labels changed since)" : ""}.</span>`;
+    } else if (!this._tracks.length) status = `<span class="muted small" id="suggest-status">Add the entities to learn from as tracks.</span>`;
+    else if (!fires) status = `<span class="muted small" id="suggest-status">Label at least one period where the automation should fire.</span>`;
+    else status = `<span class="muted small" id="suggest-status">${fires} should-fire and ${inWindow.length - fires} must-not-fire period${inWindow.length - fires === 1 ? "" : "s"} labeled.</span>`;
+    const title = this._suggestAvail === false ? "Suggestions are not available yet" : "Suggest a trigger and conditions from the labeled periods";
+    return `
+      <div class="run-row suggest-row">
+        <div class="tolerance" role="group" aria-label="Match tolerance">
+          <span class="label">Tolerance</span>
+          <span class="small">a fire counts for an anchor from</span>
+          <input id="tol-before" type="number" min="0" max="${MAX_TOLERANCE_MIN}" step="0.5" value="${minutes(tol.before)}" aria-label="Minutes before an anchor">
+          <span class="small">min before to</span>
+          <input id="tol-after" type="number" min="0" max="${MAX_TOLERANCE_MIN}" step="0.5" value="${minutes(tol.after)}" aria-label="Minutes after an anchor">
+          <span class="small">min after it</span>
+        </div>
+        <button class="primary" data-action="suggest" ${this._canSuggest() && !st?.running ? "" : "disabled"} title="${esc(title)}">Suggest</button>
+        ${status}
+        ${this._tolError ? `<span class="err small" role="alert">${esc(this._tolError)}</span>` : ""}
+      </div>`;
   }
 
   /* The saved-scenario controls: current name and save state, Save / Save as, the name
@@ -2831,9 +3458,10 @@ class EventSimulatorPanel extends Base {
       this._error ? `<div class="alert error">${esc(this._error)}</div>` : "",
       this._notice ? `<div class="alert info">${esc(this._notice)}</div>` : "",
       this._loading ? `<div class="alert info"><span class="spinner"></span>${esc(this._loading)}</div>` : "",
-      this._runErrorHtml(),
+      this._mode === "replay" ? this._runErrorHtml() : "",
+      this._labelError && !this._labelSel ? `<div class="alert error" role="alert">${esc(this._labelError)}</div>` : "",
     ].join("");
-    if (!this._entityId && !this._automation) {
+    if (!this._entityId && !this._hasTimeline()) {
       return `<ha-card><div class="card-content">${banner}<div class="empty">Choose an automation above. Its triggers, conditions and templates decide which entities get a track.</div></div></ha-card>`;
     }
     const entityOptions = this._entityDatalist();
@@ -2858,20 +3486,66 @@ class EventSimulatorPanel extends Base {
               <button data-action="add-track">Add</button>
             </div>
           </div>
-          <div class="muted small hint">${this._narrow
-            ? "Pan with the scroll bar under the axis. Drag a track to shift its whole history; to move one change, tap it, then drag its handle. Tap a state to edit it or add a change there; double-tap adds one directly."
-            : "Pan with the scroll bar under the axis (or the horizontal wheel); Ctrl/⌘ + wheel or wheel over the axis zooms. Drag a track to shift its whole history in time; drag a change mark to move just that change (Shift + drag shifts the track even from a mark). Click a state to edit it or add a change there; double-click adds one directly."}</div>
-          <div id="tl-wrap" tabindex="0">
+          <div class="muted small hint">${this._hintText()}</div>
+          <div id="tl-wrap" tabindex="0" class="${this._mode === "suggest" ? "suggest-mode" : ""}">
             <div id="tl"></div>
             <div id="cursor" hidden></div>
             <div id="tip" hidden></div>
+            <div id="label-pop" class="label-pop" hidden></div>
           </div>
-          ${this._editorHtml()}
+          ${this._labelSel ? this._labelEditorHtml() : this._editorHtml()}
           ${this._tracks.length === 0 && !this._loading
-            ? `<div class="empty">This automation references no entities (a time pattern, say). Add tracks above, or run it as is.</div>`
+            ? this._mode === "suggest"
+              ? `<div class="empty">Add the entities to learn from with Add track above, or seed them from an automation.</div>`
+              : `<div class="empty">This automation references no entities (a time pattern, say). Add tracks above, or run it as is.</div>`
             : ""}
         </div>
       </ha-card>`;
+  }
+
+  _hintText() {
+    const touch = this._narrow;
+    const base = touch
+      ? "Pan with the scroll bar under the axis. Drag a track to shift its whole history; to move one change, tap it, then drag its handle. Tap a state to edit it or add a change there; double-tap adds one directly."
+      : "Pan with the scroll bar under the axis (or the horizontal wheel); Ctrl/⌘ + wheel or wheel over the axis zooms. Drag a track to shift its whole history in time; drag a change mark to move just that change (Shift + drag shifts the track even from a mark). Click a state to edit it or add a change there; double-click adds one directly.";
+    if (this._mode !== "suggest") return base;
+    return touch
+      ? `Label periods: long-press the Labels row or the time axis, then drag across a period. Tap a period to edit it; drag it to move it, or its edges once selected to resize it. ${base}`
+      : `Label periods: drag across the Labels row or the time axis. Click a period to edit it; drag its edges to resize it or its body to move it; Delete removes the selected one. ${base}`;
+  }
+
+  /* The editor for the selected label: kind and anchor (applied as picked), exact start
+   * and end (applied with Apply or Enter), delete. */
+  _labelEditorHtml() {
+    const label = this._label(this._labelSel);
+    if (!label) return "";
+    const draft = this._labelEdDraft?.id === label.id ? this._labelEdDraft : null;
+    const fire = label.kind === "fire";
+    const anchors = LABEL_ANCHORS.map((a) => `<option value="${a}" ${label.anchor === a ? "selected" : ""}>${esc(ANCHOR_TEXT[a])}</option>`).join("");
+    const where = label.start < this._window.start || label.end > this._window.end ? `<span class="chip none" title="Only the part inside the window is used">reaches outside the window</span>` : "";
+    return `
+      <div class="editor label-editor ${fire ? "fire" : "nofire"}" id="label-editor">
+        <div class="editor-head">
+          <strong>Labeled period</strong>
+          <span class="chip ${fire ? "pass" : "fail"}">${esc(labelText(label))}</span>
+          <span class="muted small">${esc(formatDuration(label.end - label.start))}</span>
+          ${where}
+          <button class="icon close" data-action="label-close" aria-label="Close editor" title="Close (Esc)">×</button>
+        </div>
+        <div class="editor-fields">
+          <label class="fld"><span class="label">Kind</span>
+            <select id="lb-kind"><option value="fire" ${fire ? "selected" : ""}>Should fire</option><option value="no_fire" ${fire ? "" : "selected"}>Must not fire</option></select></label>
+          <label class="fld"><span class="label">Anchor</span>
+            <select id="lb-anchor" ${fire ? "" : "disabled"} title="${fire ? "Where in the period the automation should fire; while: its conditions should hold throughout" : "A must-not-fire period has no anchor"}">${anchors}</select></label>
+          <label class="fld"><span class="label">Start</span><input id="lb-start" type="datetime-local" step="1" value="${esc(draft?.start ?? toLocalInputSeconds(label.start))}"></label>
+          <label class="fld"><span class="label">End</span><input id="lb-end" type="datetime-local" step="1" value="${esc(draft?.end ?? toLocalInputSeconds(label.end))}"></label>
+        </div>
+        ${this._labelError ? `<div class="err small" role="alert">${esc(this._labelError)}</div>` : ""}
+        <div class="editor-actions">
+          <button class="primary small-btn" data-action="label-apply">Apply times</button>
+          <button data-action="label-delete" title="Delete this period (Del)">Delete period</button>
+        </div>
+      </div>`;
   }
 
   _entityDatalist() {
@@ -2998,13 +3672,127 @@ class EventSimulatorPanel extends Base {
     const label = this.shadowRoot.getElementById("span-label");
     if (label) label.textContent = `${formatDuration(t1 - t0)} visible`;
     const parts = [this._axisSvg(scale)];
-    if (this._result || this._running) parts.push(this._resultsRow(scale));
+    if (this._mode === "suggest" || this._labels.length) parts.push(this._labelsRow(scale));
+    if (this._mode === "replay" && (this._result || this._running)) parts.push(this._resultsRow(scale));
     for (const track of this._tracks) parts.push(this._trackRow(track, scale));
     tl.innerHTML = parts.join("");
     // The hover line starts under the axis and its scroll bar.
     const axis = tl.querySelector(".axis-row");
     const cursor = this.shadowRoot.getElementById("cursor");
     if (axis && cursor) cursor.style.top = `${axis.offsetHeight}px`;
+    this._placeLabelPopover(scale);
+  }
+
+  /* The labels to draw: the list, with a label being moved or resized drawn where it would land. */
+  _drawnLabels() {
+    const d = this._labelDrag;
+    if (!d?.preview || d.brush) return this._labels;
+    return this._labels.map((l) => (l.id === d.labelId ? d.preview : l));
+  }
+
+  /* The Labels row: should-fire periods green with a tick at each anchor, must-not-fire
+   * periods red hatched; the selected one outlined with edge handles. In Suggest mode it is
+   * where periods are brushed; in Replay it is an overlay of the labels a scenario has. */
+  _labelsRow(scale) {
+    const labels = this._drawnLabels();
+    const suggest = this._mode === "suggest";
+    const W = scale.width;
+    const clip = (t) => Math.min(W + 2, Math.max(-2, scale.toX(t)));
+    let out = `<defs><pattern id="nofire-hatch" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="7" height="7" class="nofire-bg"/><line x1="0" y1="0" x2="0" y2="7" class="nofire-line"/></pattern></defs>${this._gridLines(scale, LABELS_H)}`;
+    for (const l of labels) {
+      if (l.end < scale.t0 || l.start > scale.t1) continue;
+      const x1 = clip(l.start);
+      const x2 = clip(l.end);
+      const w = Math.max(1, x2 - x1);
+      const sel = l.id === this._labelSel;
+      const fire = l.kind === "fire";
+      out += `<rect x="${x1}" y="3" width="${w}" height="${LABELS_H - 6}" rx="3" class="lb ${fire ? "fire" : "nofire"}${fire && l.anchor === "while" ? " while" : ""}${sel ? " sel" : ""}"/>`;
+      if (fire) {
+        const ticks = [];
+        if (l.anchor === "start" || l.anchor === "both") ticks.push([scale.toX(l.start), 1]);
+        if (l.anchor === "end" || l.anchor === "both") ticks.push([scale.toX(l.end), -1]);
+        for (const [x, dir] of ticks) {
+          if (x < -4 || x > W + 4) continue;
+          out += `<line x1="${x}" x2="${x}" y1="0" y2="${LABELS_H}" class="lb-anchor"/><path d="M${x},0L${x + 7 * dir},0L${x},7Z" class="lb-anchor-flag"/>`;
+        }
+      }
+      const text = fire ? `fire ${ANCHOR_TEXT[l.anchor]}` : "must not fire";
+      const room = Math.floor((w - 10) / 6.2);
+      if (room >= 4) out += `<text x="${Math.max(x1, 0) + 6}" y="${LABELS_H / 2 + 4}" class="lb-text">${esc(text.length <= room ? text : `${text.slice(0, room - 1)}…`)}</text>`;
+      if (sel && suggest) {
+        for (const x of [scale.toX(l.start), scale.toX(l.end)]) {
+          if (x >= -4 && x <= W + 4) out += `<rect x="${x - 3.5}" y="${LABELS_H / 2 - 8}" width="7" height="16" rx="3" class="lb-handle"/>`;
+        }
+      }
+    }
+    const brush = this._labelDrag?.brush ? this._labelDrag.preview : this._labelDraft;
+    if (brush) {
+      const x1 = clip(brush.start);
+      out += `<rect x="${x1}" y="1.5" width="${Math.max(1, clip(brush.end) - x1)}" height="${LABELS_H - 3}" rx="3" class="lb-brush"/>`;
+    }
+    if (suggest && !labels.length && !brush) {
+      out += `<text x="8" y="${LABELS_H / 2 + 4}" class="lb-empty">${this._narrow ? "Long-press here, then drag across a period to label it" : "Drag across a period here (or on the time axis) to label it"}</text>`;
+    }
+    const inView = labelsInWindow(this._labels, this._window.start, this._window.end);
+    const fires = inView.filter((l) => l.kind === "fire").length;
+    const meta = inView.length ? `${fires} should fire · ${inView.length - fires} must not fire` : suggest ? "no periods labeled yet" : "";
+    return `
+      <div class="row labels-row">
+        <div class="track-head"><span class="name">Labels</span>${suggest ? "" : `<span class="chip none" title="Labeled in Suggest mode">from Suggest</span>`}<span class="meta">${meta}</span></div>
+        <svg class="labels${suggest ? " editable" : ""}" data-row="labels" width="${W}" height="${LABELS_H}">${out}</svg>
+      </div>`;
+  }
+
+  /* Labels drawn faintly across a track, so periods line up with what the track did. */
+  _labelOverlay(scale, height) {
+    let out = "";
+    for (const l of this._drawnLabels()) {
+      if (l.end < scale.t0 || l.start > scale.t1) continue;
+      const x1 = Math.max(-1, scale.toX(l.start));
+      const x2 = Math.min(scale.width + 1, scale.toX(l.end));
+      out += `<rect x="${x1}" y="0" width="${Math.max(1, x2 - x1)}" height="${height}" class="lb-overlay ${l.kind === "fire" ? "fire" : "nofire"}"/>`;
+      if (l.kind === "fire") {
+        if (l.anchor === "start" || l.anchor === "both") out += `<line x1="${scale.toX(l.start)}" x2="${scale.toX(l.start)}" y1="0" y2="${height}" class="lb-overlay-anchor"/>`;
+        if (l.anchor === "end" || l.anchor === "both") out += `<line x1="${scale.toX(l.end)}" x2="${scale.toX(l.end)}" y1="0" y2="${height}" class="lb-overlay-anchor"/>`;
+      }
+    }
+    return out;
+  }
+
+  /* The popover asking what a just-brushed period is, placed under the Labels row. */
+  _placeLabelPopover(scale) {
+    const pop = this.shadowRoot.getElementById("label-pop");
+    if (!pop) return;
+    const draft = this._labelDraft;
+    const row = this.shadowRoot.querySelector("#tl .labels-row");
+    if (!draft || !row || this._mode !== "suggest") {
+      pop.hidden = true;
+      pop.innerHTML = "";
+      return;
+    }
+    const def = this._labelDefault;
+    const btn = (kind, anchor, text) => {
+      const isDefault = def.kind === kind && (kind === "no_fire" || def.anchor === anchor);
+      return `<button class="${isDefault ? "primary small-btn" : ""}${kind === "no_fire" ? " nofire-btn" : ""}" data-action="label-create" data-kind="${kind}" data-anchor="${anchor}" ${isDefault ? 'data-default="1"' : ""}>${text}</button>`;
+    };
+    pop.hidden = false;
+    pop.innerHTML = `
+      <div class="small"><strong>${esc(this._fullTime(draft.start))} – ${esc(this._clockTime(draft.end))}</strong> <span class="muted">(${esc(formatDuration(draft.end - draft.start))})</span></div>
+      <div class="pop-group"><span class="label">Should fire</span>
+        ${btn("fire", "start", "at start")}${btn("fire", "end", "at end")}${btn("fire", "both", "at start and end")}${btn("fire", "while", "while")}</div>
+      <div class="pop-group">${btn("no_fire", "start", "Must not fire")}<button data-action="label-cancel" class="link">Cancel</button></div>`;
+    // Placed once laid out: right after a full redraw the card around it has not rendered yet.
+    const place = () => {
+      const wrap = this.shadowRoot.getElementById("tl-wrap");
+      if (!pop.isConnected || !row.isConnected || !wrap) return;
+      const top = row.getBoundingClientRect().bottom - wrap.getBoundingClientRect().top + 4;
+      const left = Math.min(Math.max(0, scale.toX(draft.start)), Math.max(0, wrap.clientWidth - pop.offsetWidth));
+      pop.style.top = `${top}px`;
+      pop.style.left = `${left}px`;
+    };
+    place();
+    requestAnimationFrame(place);
   }
 
   _axisSvg(scale) {
@@ -3088,6 +3876,7 @@ class EventSimulatorPanel extends Base {
         <svg class="track${track.edited ? " is-edited" : ""}${shifting ? " shifting" : ""}" data-row="track" data-entity="${esc(track.entity_id)}" width="${scale.width}" height="${height}">
           ${this._hatch(`h-${hashString(track.entity_id)}`)}
           ${this._gridLines(scale, height)}
+          ${this._labelOverlay(scale, height)}
           ${body}
         </svg>
       </div>`;
@@ -3230,7 +4019,7 @@ class EventSimulatorPanel extends Base {
 
   _detailCard() {
     const result = this._result;
-    if (!result) return "";
+    if (!result || this._mode !== "replay") return "";
     return `<div class="detail${this._running ? " updating" : ""}">${this._detailHtml(result)}</div>`;
   }
 
@@ -3316,16 +4105,22 @@ class EventSimulatorPanel extends Base {
     });
     wrap.addEventListener("pointercancel", () => {
       // A cancelled gesture (the browser took it for a page scroll, say) changes nothing.
-      const redraw = this._evDrag || this._drag?.moved || this._thumbDrag;
+      const redraw = this._evDrag || this._drag?.moved || this._thumbDrag || this._labelDrag;
+      clearTimeout(this._labelDrag?.timer);
       this._drag = null;
       this._evDrag = null;
       this._thumbDrag = null;
+      this._labelDrag = null;
       this._hideHover();
       if (redraw) this._scheduleTimeline();
       this._flushRender();
     });
     wrap.addEventListener("pointerleave", () => {
-      if (!this._evDrag?.moved) this._hideHover();
+      if (!this._evDrag?.moved && !this._labelDrag) this._hideHover();
+    });
+    // A long press on the labels row or the axis starts a brush, not the context menu.
+    wrap.addEventListener("contextmenu", (ev) => {
+      if (this._mode === "suggest" && ev.target.closest?.("svg[data-row=labels], svg[data-row=axis]")) ev.preventDefault();
     });
     this._observeWidth();
   }
@@ -3424,6 +4219,8 @@ class EventSimulatorPanel extends Base {
     const bar = ev.target.closest?.("[data-part=scrollbar]");
     if (bar) return this._onScrollbarDown(ev, bar);
     if (!ev.target.closest?.("svg")) return;
+    const row = ev.target.closest("svg[data-row]")?.dataset.row;
+    if (this._mode === "suggest" && (row === "labels" || row === "axis")) return this._onLabelDown(ev, row);
     const hit = ev.target.closest("svg[data-row=track]") ? this._trackAt(ev) : null;
     // A mark is a handle for that one change; Shift + drag shifts the track from anywhere.
     const index = hit && !ev.shiftKey ? this._markHit(hit, ev) : null;
@@ -3436,6 +4233,117 @@ class EventSimulatorPanel extends Base {
       this._drag = { id: ev.pointerId, x: ev.clientX, moved: false, entity_id: hit ? hit.track.entity_id : null, dt: 0, preview: null, touch: ev.pointerType === "touch" };
     }
     ev.currentTarget.setPointerCapture?.(ev.pointerId);
+  }
+
+  /* Press on the Labels row or the axis in Suggest mode: grab a label's edge (resize) or
+   * body (move), or start brushing a new period. A finger has to rest for LONG_PRESS_MS
+   * before a brush starts, so a swipe meant to scroll the page labels nothing. */
+  _onLabelDown(ev, row) {
+    const svg = ev.target.closest("svg[data-row]");
+    const x = ev.clientX - svg.getBoundingClientRect().left;
+    const scale = this._scale();
+    const touch = ev.pointerType === "touch";
+    const base = { pid: ev.pointerId, x0: ev.clientX, y0: ev.clientY, moved: false, touch, preview: null };
+    const hit = row === "labels" ? labelHit(this._labels, x, scale, { reach: touch ? 14 : 6, selected: this._labelSel, touch }) : null;
+    if (hit) {
+      this._labelDrag = { ...base, labelId: hit.id, part: hit.part, orig: this._label(hit.id) };
+    } else {
+      const drag = { ...base, brush: true, t0: scale.toT(x), armed: !touch };
+      if (touch) {
+        drag.timer = setTimeout(() => {
+          if (this._labelDrag !== drag) return;
+          drag.armed = true;
+          navigator.vibrate?.(12);
+          this._showBrushTip(drag.x0, drag.y0, null);
+        }, LONG_PRESS_MS);
+      }
+      this._labelDrag = drag;
+    }
+    ev.currentTarget.setPointerCapture?.(ev.pointerId);
+  }
+
+  /* A label move, resize or brush following the pointer. */
+  _onLabelMove(ev, d) {
+    const dx = ev.clientX - d.x0;
+    const msPerPx = (this._view[1] - this._view[0]) / this._width;
+    const step = snapStep(msPerPx);
+    if (d.brush) {
+      if (!d.armed) {
+        // A finger that moves before the long press is up is scrolling or swiping: no brush.
+        if (Math.hypot(dx, ev.clientY - d.y0) > 8) {
+          clearTimeout(d.timer);
+          this._labelDrag = null;
+        }
+        return;
+      }
+      if (Math.abs(dx) > 3) d.moved = true;
+      if (!d.moved) return;
+      const rect = this.shadowRoot.getElementById("tl-wrap").getBoundingClientRect();
+      d.preview = brushPeriod(d.t0, this._scale().toT(ev.clientX - rect.left), { ...this._editOpts(), step });
+      this._showBrushTip(ev.clientX, ev.clientY, d.preview);
+      return this._scheduleTimeline();
+    }
+    if (Math.abs(dx) > (d.touch ? 6 : 3)) d.moved = true;
+    if (!d.moved || !d.orig) return;
+    const dt = dx * msPerPx;
+    d.preview =
+      d.part === "body"
+        ? moveLabel(d.orig, snapDelta(dt, step), this._editOpts())
+        : resizeLabel(d.orig, d.part, snapTime(d.orig[d.part] + dt, step), this._editOpts(), Math.max(step, MIN_LABEL_SPAN));
+    this._showBrushTip(ev.clientX, ev.clientY, d.preview, d.part === "body" ? "move" : "resize");
+    this._scheduleTimeline();
+  }
+
+  _onLabelUp(d) {
+    clearTimeout(d.timer);
+    this._labelDrag = null;
+    this._hideHover();
+    if (d.brush) {
+      if (d.moved && d.preview) {
+        // Ask what the period is (the popover); Escape or Cancel drops it.
+        this._labelDraft = d.preview;
+        this._labelSel = null;
+        this._labelError = null;
+        this._focusPop = true;
+        return this._render();
+      }
+      // A click on an empty part of the row (or the axis) drops the selection.
+      if (this._labelSel || this._labelDraft) {
+        this._labelSel = null;
+        this._labelDraft = null;
+        return this._render();
+      }
+      return this._scheduleTimeline();
+    }
+    if (!d.moved) {
+      this._labelDraft = null;
+      this._selectLabel(d.labelId);
+      this._render();
+      return this.shadowRoot.getElementById("tl-wrap")?.focus({ preventScroll: true });
+    }
+    const p = d.preview;
+    if (!p || (p.start === d.orig.start && p.end === d.orig.end)) return this._scheduleTimeline();
+    this._placeLabel(d.part === "body" ? "move period" : "resize period", p);
+  }
+
+  /* The period a brush, move or resize would give, next to the pointer. */
+  _showBrushTip(clientX, clientY, period, what = "new") {
+    const tip = this.shadowRoot.getElementById("tip");
+    const cursor = this.shadowRoot.getElementById("cursor");
+    if (!tip || !cursor) return;
+    const wrap = this.shadowRoot.getElementById("tl-wrap");
+    const rect = wrap.getBoundingClientRect();
+    const x = clientX - rect.left;
+    cursor.hidden = false;
+    cursor.style.left = `${x}px`;
+    tip.hidden = false;
+    tip.innerHTML = period
+      ? `<div class="mono small"><strong>${esc(this._fullTime(period.start))} – ${esc(this._clockTime(period.end))}</strong></div>
+        <div class="muted small">${esc(formatDuration(period.end - period.start))}${what === "new" ? " · release to label it" : what === "move" ? " · moving the period" : " · resizing the period"}</div>`
+      : `<div class="muted small">Drag across the period to label</div>`;
+    const tipWidth = tip.offsetWidth;
+    tip.style.left = `${x + 12 + tipWidth > wrap.clientWidth ? Math.max(0, x - 12 - tipWidth) : x + 12}px`;
+    tip.style.top = `${clientY - rect.top + 14}px`;
   }
 
   /* Press on the scroll bar: drag the thumb, or page toward a press beside it. */
@@ -3461,6 +4369,8 @@ class EventSimulatorPanel extends Base {
       this._setView(viewFromThumb(left, thumb.view, this._bounds(), thumb.bar, thumb.thumb));
       return;
     }
+    const ld = this._labelDrag;
+    if (ld && ld.pid === ev.pointerId) return this._onLabelMove(ev, ld);
     const moving = this._evDrag;
     if (moving && moving.id === ev.pointerId) {
       const dx = ev.clientX - moving.x;
@@ -3502,6 +4412,8 @@ class EventSimulatorPanel extends Base {
       this._thumbDrag = null;
       return this._scheduleTimeline();
     }
+    const ld = this._labelDrag;
+    if (ld && ld.pid === ev.pointerId) return this._onLabelUp(ld);
     const moving = this._evDrag;
     if (moving && moving.id === ev.pointerId) {
       this._evDrag = null;
@@ -3629,9 +4541,11 @@ class EventSimulatorPanel extends Base {
     const svg = this._rowAt(ev.clientX, ev.clientY);
     const tip = this.shadowRoot.getElementById("tip");
     const cursor = this.shadowRoot.getElementById("cursor");
-    if (!svg || !tip || svg.dataset.row === "axis") return this._hideHover();
+    if (!svg || !tip || (svg.dataset.row === "axis" && this._mode !== "suggest")) return this._hideHover();
     const { x, y } = this._localX(ev);
     let overMark = false;
+    let overEdge = false;
+    let overLabel = false;
     const svgX = ev.clientX - svg.getBoundingClientRect().left;
     const scale = makeScale(this._view[0], this._view[1], this._width);
     const t = scale.toT(svgX);
@@ -3654,6 +4568,19 @@ class EventSimulatorPanel extends Base {
           ${seg ? `<div class="muted small">since ${esc(this._fullTime(seg.from))}</div>` : ""}
           ${track?.segments ? `<div class="muted small">drag to shift the whole track</div>` : ""}`;
       }
+    } else if (svg.dataset.row === "labels" || svg.dataset.row === "axis") {
+      const suggest = this._mode === "suggest";
+      const hit = svg.dataset.row === "labels" ? labelHit(this._labels, svgX, scale, { reach: 6, selected: this._labelSel }) : null;
+      const label = hit && this._label(hit.id);
+      if (label) {
+        overEdge = suggest && hit.part !== "body";
+        overLabel = suggest && hit.part === "body";
+        html = `<div class="mono small">${esc(this._fullTime(label.start))} – ${esc(this._clockTime(label.end))}</div>
+          <div><strong>${esc(labelText(label))}</strong> <span class="muted small">${esc(formatDuration(label.end - label.start))}</span></div>
+          ${suggest ? `<div class="muted small">${overEdge ? "drag to resize" : "drag to move · click to edit"}</div>` : ""}`;
+      } else {
+        html = `<div class="mono small">${esc(this._fullTime(t))}</div>${suggest ? `<div class="muted small">drag across a period to label it</div>` : ""}`;
+      }
     } else if (svg.dataset.row === "results") {
       const hit = this._resultsHit(ev);
       if (hit?.run) {
@@ -3669,7 +4596,10 @@ class EventSimulatorPanel extends Base {
         html = `<div class="mono small">${esc(this._fullTime(t))}</div>`;
       }
     }
-    this.shadowRoot.getElementById("tl-wrap")?.classList.toggle("over-mark", overMark);
+    const wrapEl = this.shadowRoot.getElementById("tl-wrap");
+    wrapEl?.classList.toggle("over-mark", overMark);
+    wrapEl?.classList.toggle("over-edge", overEdge);
+    wrapEl?.classList.toggle("over-label", overLabel);
     cursor.hidden = false;
     cursor.style.left = `${x}px`;
     tip.hidden = false;
@@ -3685,7 +4615,7 @@ class EventSimulatorPanel extends Base {
     const cursor = this.shadowRoot.getElementById("cursor");
     if (tip) tip.hidden = true;
     if (cursor) cursor.hidden = true;
-    this.shadowRoot.getElementById("tl-wrap")?.classList.remove("over-mark");
+    this.shadowRoot.getElementById("tl-wrap")?.classList.remove("over-mark", "over-edge", "over-label");
   }
 
   _onClick(ev) {
@@ -3715,7 +4645,19 @@ class EventSimulatorPanel extends Base {
     else if (action === "ed-close") {
       this._select(null);
       this._render();
-    } else if (action === "cfg-revert") this._revertConfig();
+    } else if (action === "mode") this._setMode(el.dataset.mode);
+    else if (action === "label-create") this._createLabel(el.dataset.kind, el.dataset.anchor);
+    else if (action === "label-cancel") {
+      this._labelDraft = null;
+      this._render();
+    } else if (action === "label-close") {
+      this._labelSel = null;
+      this._labelError = null;
+      this._render();
+    } else if (action === "label-delete") this._deleteLabel(this._labelSel);
+    else if (action === "label-apply") this._applyLabelEditor();
+    else if (action === "suggest") this._runSuggest();
+    else if (action === "cfg-revert") this._revertConfig();
     else if (action === "sc-save") this._onSave(false);
     else if (action === "sc-save-as") this._onSave(true);
     else if (action === "sc-save-name") this._saveScenario(!!this._saveForm?.asNew, this.shadowRoot.getElementById("sc-name")?.value);
@@ -3757,6 +4699,9 @@ class EventSimulatorPanel extends Base {
     const id = ev.target.id;
     if (id === "automation") this._selectAutomation(ev.target.value);
     else if (id === "auto-run") this._setAutoRun(ev.target.checked);
+    else if (id === "lb-kind" && this._labelSel) this._updateLabel(this._labelSel, { kind: ev.target.value });
+    else if (id === "lb-anchor" && this._labelSel) this._updateLabel(this._labelSel, { anchor: ev.target.value });
+    else if (id === "tol-before" || id === "tol-after") this._setTolerance(id === "tol-before" ? "before" : "after", ev.target.value);
     else if (id === "win-start" || id === "win-end") {
       const start = fromLocalInput(this.shadowRoot.getElementById("win-start").value);
       const end = fromLocalInput(this.shadowRoot.getElementById("win-end").value);
@@ -3770,6 +4715,11 @@ class EventSimulatorPanel extends Base {
       // Kept so a re-render (a history load, a run finishing) does not wipe unapplied input.
       const value = (name) => this.shadowRoot.getElementById(name)?.value;
       this._edDraft = { key: `${this._sel.entity_id}#${this._sel.index}`, time: value("ed-time"), state: value("ed-state"), attrs: value("ed-attrs") };
+      return;
+    }
+    if ((id === "lb-start" || id === "lb-end") && this._labelSel) {
+      const value = (name) => this.shadowRoot.getElementById(name)?.value;
+      this._labelEdDraft = { id: this._labelSel, start: value("lb-start"), end: value("lb-end") };
       return;
     }
     if (id === "sc-name" && this._saveForm) {
@@ -3792,12 +4742,24 @@ class EventSimulatorPanel extends Base {
     const origin = path[0];
     if (!path.includes(this) && origin !== document.body && origin !== document.documentElement) return;
     const typing = path.some((el) => /^(INPUT|TEXTAREA|SELECT|HA-YAML-EDITOR|HA-CODE-EDITOR)$/.test(el.tagName || "") || el.isContentEditable);
-    const inEditor = ["ed-time", "ed-state", "ed-attrs"].includes(origin.id);
+    const inEditor = ["ed-time", "ed-state", "ed-attrs", "lb-start", "lb-end", "lb-kind", "lb-anchor"].includes(origin.id);
+    if (ev.key === "Escape" && (!typing || inEditor) && (this._labelDraft || this._labelSel || this._labelDrag)) {
+      clearTimeout(this._labelDrag?.timer);
+      this._labelDrag = null;
+      if (this._labelDraft) this._labelDraft = null;
+      else this._labelSel = null;
+      this._labelError = null;
+      return this._render();
+    }
     if (this._sel && ev.key === "Escape" && (!typing || inEditor)) {
       this._select(null);
       return this._render();
     }
     if (typing) return;
+    if ((ev.key === "Delete" || ev.key === "Backspace") && this._labelSel && this._mode === "suggest") {
+      ev.preventDefault();
+      return this._deleteLabel(this._labelSel);
+    }
     if ((ev.key === "Delete" || ev.key === "Backspace") && this._sel?.index >= 0) {
       ev.preventDefault();
       return this._deleteSelected();
@@ -3812,6 +4774,10 @@ class EventSimulatorPanel extends Base {
     if (["ed-time", "ed-state"].includes(ev.target.id) && ev.key === "Enter") {
       ev.preventDefault();
       return this._applyEditor();
+    }
+    if (["lb-start", "lb-end"].includes(ev.target.id) && ev.key === "Enter") {
+      ev.preventDefault();
+      return this._applyLabelEditor();
     }
     if (ev.target.id === "sc-name") {
       if (ev.key === "Enter") {
@@ -4023,6 +4989,42 @@ class EventSimulatorPanel extends Base {
       .sc-row-actions button { padding: 3px 10px; }
       button.danger { background: var(--error-color, #db4437); border-color: var(--error-color, #db4437); color: var(--text-primary-color, #fff); }
       button.danger:hover:not([disabled]) { background: var(--error-color, #db4437); filter: brightness(1.1); }
+      .segmented.mode button { font-size: 0.95em; padding: 5px 16px; }
+      .suggest-row { gap: 10px 12px; }
+      .tolerance { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+      .tolerance input { width: 5em; padding: 4px 6px; }
+      #tl-wrap { -webkit-touch-callout: none; }
+      svg.labels { background: var(--secondary-background-color); border-radius: 4px; }
+      svg.labels.editable { cursor: crosshair; }
+      .suggest-mode svg.axis { cursor: crosshair; }
+      #tl-wrap.over-edge svg.labels { cursor: ew-resize; }
+      #tl-wrap.over-label svg.labels { cursor: grab; }
+      .lb.fire { fill: var(--success-color, #43a047); fill-opacity: .28; stroke: var(--success-color, #43a047); stroke-width: 1; }
+      .lb.fire.while { stroke-dasharray: 5 3; fill-opacity: .18; }
+      .lb.nofire { fill: url(#nofire-hatch); stroke: var(--error-color, #db4437); stroke-width: 1; }
+      .lb.sel { stroke-width: 2.5; stroke: var(--primary-text-color); }
+      .nofire-bg { fill: rgba(219, 68, 55, .12); }
+      .nofire-line { stroke: var(--error-color, #db4437); stroke-width: 2.5; opacity: .55; }
+      .lb-anchor { stroke: var(--success-color, #43a047); stroke-width: 3; }
+      .lb-anchor-flag { fill: var(--success-color, #43a047); }
+      .lb-text { fill: var(--primary-text-color); font-size: 11px; pointer-events: none; }
+      .lb-empty { fill: var(--secondary-text-color); font-size: 11px; font-style: italic; pointer-events: none; }
+      .lb-handle { fill: var(--card-background-color, #fff); stroke: var(--primary-text-color); stroke-width: 1.5; }
+      .lb-brush { fill: var(--primary-color); fill-opacity: .18; stroke: var(--primary-color); stroke-width: 1.5; stroke-dasharray: 4 3; }
+      .lb-overlay { pointer-events: none; }
+      .lb-overlay.fire { fill: var(--success-color, #43a047); fill-opacity: .08; }
+      .lb-overlay.nofire { fill: var(--error-color, #db4437); fill-opacity: .08; }
+      .lb-overlay-anchor { stroke: var(--success-color, #43a047); stroke-width: 1.5; opacity: .45; pointer-events: none; }
+      .label-pop { position: absolute; z-index: 4; display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; max-width: min(440px, 100%); box-sizing: border-box;
+        background: var(--card-background-color, #fff); color: var(--primary-text-color); border: 1px solid var(--divider-color); border-radius: 8px; box-shadow: 0 4px 14px rgba(0,0,0,.3); }
+      .label-pop[hidden] { display: none; }
+      .pop-group { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+      .pop-group button { padding: 4px 10px; }
+      .pop-group button.primary.small-btn { padding: 4px 12px; }
+      .pop-group .nofire-btn { border-color: var(--error-color, #db4437); }
+      .pop-group .nofire-btn.primary { background: var(--error-color, #db4437); border-color: var(--error-color, #db4437); }
+      .label-editor.fire { border-left-color: var(--success-color, #43a047); }
+      .label-editor.nofire { border-left-color: var(--error-color, #db4437); }
       @media (max-width: 600px) {
         .page { padding: 8px; }
         .card-content { padding: 12px; }
