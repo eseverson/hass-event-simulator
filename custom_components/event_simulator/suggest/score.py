@@ -131,8 +131,16 @@ def clock_roundness(seconds: float) -> int:
     return 3
 
 
+def extra_triggers(candidate: Candidate) -> int:
+    """Triggers beyond one per trigger id: the parts of an OR (a start/end pair is one trigger per side)."""
+    return len(candidate.triggers) - len({trigger.id for trigger in candidate.triggers})
+
+
 def simplicity(candidate: Candidate) -> tuple[int, int, int, int]:
-    """Lower is simpler: (conditions, `for:` options, roughness of thresholds and times, triggers)."""
+    """Lower is simpler: (conditions and extra triggers of an OR, `for:` options, roughness of thresholds and times, triggers).
+
+    Each extra trigger of an OR costs as much as a condition: "door opens or motion" is no simpler than "door opens, only when someone is home".
+    """
     fors = 0
     rough = 0
     for part in (*candidate.triggers, *candidate.conditions):
@@ -154,7 +162,7 @@ def simplicity(candidate: Candidate) -> tuple[int, int, int, int]:
                 rough += clock_roundness(part.offset)
             case SunCondition():
                 rough += clock_roundness(part.after_offset) + clock_roundness(part.before_offset)
-    return (len(candidate.conditions), fors, rough, len(candidate.triggers))
+    return (len(candidate.conditions) + extra_triggers(candidate), fors, rough, len(candidate.triggers))
 
 
 def rank_key(stats: Stats, candidate: Candidate) -> tuple[Any, ...]:

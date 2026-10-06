@@ -10,6 +10,7 @@ How it searches (see docs/superpowers/specs/2026-10-05-suggestions-design.md):
    - `numeric_state`: `above` / `below`, the threshold searched over the full window's values. The behavior of a threshold only changes at observed values, so each gap between consecutive distinct values is one candidate, represented by its roundest number; gaps are scored by how many anchors a crossing hits and how often the value crosses elsewhere. `for:` as for state.
    - `time` / `sun`: when the anchors cluster by local clock time, or by sunrise/sunset offset; whichever clusters more anchors with less spread wins. The time is chosen at or just before the cluster and rounded.
    Triggers that hit fewer than `min_recall` of the best trigger's anchors are dropped before any condition search, and only the best `beam` go on.
+   When no single trigger hits every anchor of a side, ORs of up to `max_triggers` triggers (possibly on different entities or of different kinds) join them: greedy set cover from each of the best `union_seeds` triggers, each step adding the trigger, searched again around the anchors still missed, that hits the most of them with the fewest bad fires. A trigger joins only as evidence, not chance: it hits the missed anchors more often than its fires would at random (binomial tail at `union_alpha`), and one fitted to a single moment (a clock time, a threshold, a `for:`) never joins for one anchor. The parts of an OR keep their side's trigger id, so a start/end pair stays a pair; each extra part costs as much simplicity as a condition.
 3. Conditions, greedily: from each trigger (or trigger pair), add the condition that removes the most bad fires (must-not first, then unlabeled within the labeled stretch, then beyond it) while keeping every anchor hit and every `while` period held, up to `max_conditions`, branching on the best `branch` choices at each step. Condition values come from the state at the anchor fires (and throughout `while` periods) against the state at the bad fires; numeric thresholds are the roundest number between the good and the bad values.
 4. Every candidate is scored exactly by the evaluator, deduplicated (candidates that fire at the same instants keep only the simplest), ranked by `score.rank_key` and `tie_break` (fewer options, fires closer to the anchors, fewer unlabeled fires overall) and cut to `top_k`.
 """
@@ -69,6 +70,10 @@ class SuggestOptions:
     max_hints: int = 20  # per kind
     hint_suggestions: int = 3  # whose outside fires become hints
     max_bad_sample: int = 600  # bad fires the condition search looks at (all of them are scored)
+    max_triggers: int = 3  # per side: an OR of up to this many triggers when no single one hits every anchor
+    union_seeds: int = 3  # triggers an OR is grown from
+    union_min_recall: float = 0.1  # a part of an OR hits at least this share of the anchors still missed
+    union_alpha: float = 0.01  # a part of an OR must hit the missed anchors more often than chance would, at this level
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any] | None) -> SuggestOptions:
@@ -329,15 +334,27 @@ def describe_condition(condition: Condition) -> str:
     raise TypeError(f"not a condition: {condition!r}")
 
 
+def _either(triggers: Sequence[Trigger]) -> str:
+    """Triggers joined with "or": "at 07:00 or when X changes", "when X changes or Y changes"."""
+    phrases = []
+    after_clock = True
+    for trigger in triggers:
+        phrase = describe_trigger(trigger)
+        clock = isinstance(trigger, (TimeTrigger, SunTrigger))
+        phrases.append(phrase if clock or not after_clock else f"when {phrase}")
+        after_clock = clock
+    return " or ".join(phrases)
+
+
 def describe(candidate: Candidate) -> str:
     """What the candidate does, as one sentence (without its stats)."""
     triggers = candidate.triggers
-    if len(triggers) == 2 and (triggers[0].id, triggers[1].id) == ("start", "end"):
-        text = f"Starts when {describe_trigger(triggers[0])}; ends when {describe_trigger(triggers[1])}"
+    if {t.id for t in triggers} == {"start", "end"}:
+        starts = " or ".join(describe_trigger(t) for t in triggers if t.id == "start")
+        ends = " or ".join(describe_trigger(t) for t in triggers if t.id == "end")
+        text = f"Starts when {starts}; ends when {ends}"
     else:
-        phrases = [describe_trigger(t) for t in triggers]
-        lead = " or ".join(phrases)
-        text = f"Fires {lead}" if isinstance(triggers[0], (TimeTrigger, SunTrigger)) else f"Fires when {lead}"
+        text = f"Fires {_either(triggers)}"
     for condition in candidate.conditions:
         text += f", {describe_condition(condition)}"
     return text
@@ -632,6 +649,30 @@ def dedupe(evaluator: Evaluator, labels: Labels, candidates: Iterable[Candidate]
     return [min(group, key=lambda c: (simplicity(c), complexity(c), describe(c))) for group in groups.values()]
 
 
+@dataclass(frozen=True, slots=True)
+class _Part:
+    """A trigger as a candidate part of an OR (see `_Search.unions`)."""
+
+    hits: frozenset[int]  # anchors hit
+    nearest: dict[int, int]  # each hit anchor's nearest fire (index into the trigger's fires)
+    chance: float  # share of the window within reach of its fires: the chance it hits an anchor placed at random
+    rank: tuple[Any, ...]  # bad fires, simplicity, then how close its fires are to the anchors
+
+
+def _binomial_tail(n: int, k: int, p: float) -> float:
+    """P(X >= k) for X ~ Binomial(n, p)."""
+    if k <= 0 or p >= 1:
+        return 1.0
+    if p <= 0:
+        return 0.0
+    log_p, log_q = math.log(p), math.log1p(-p)
+    total = sum(
+        math.exp(math.lgamma(n + 1) - math.lgamma(i + 1) - math.lgamma(n - i + 1) + i * log_p + (n - i) * log_q)
+        for i in range(k, n + 1)
+    )
+    return min(1.0, total)
+
+
 class _Search:
     def __init__(self, timeline: Timeline, labels: Labels, evaluator: Evaluator, options: SuggestOptions) -> None:
         self.timeline = timeline
@@ -845,6 +886,101 @@ class _Search:
             if len(kept) >= beam:
                 break
         return kept
+
+    # OR of several triggers
+
+    def side(self, anchors: Sequence[Anchor], trigger_id: str | None, beam: int) -> list[tuple[Trigger, ...]]:
+        """The trigger sets one side (all anchors, or the starts or ends of a pair) is searched from: the best single triggers, then ORs of several (`unions`)."""
+        singles = self.best_triggers(anchors, trigger_id, beam)
+        return [(trigger,) for trigger in singles] + self.unions(anchors, trigger_id, singles)
+
+    def _part(self, trigger: Trigger, anchors: Sequence[Anchor]) -> _Part:
+        """A trigger's anchor hits (indexes into `anchors`, the whole side), its bad fires, and how much of the window its fires would cover by chance."""
+        _, must_not, near, unlabeled, fires = self.screen(trigger, anchors)
+        before, after = self.tolerance.before, self.tolerance.after
+        nearest: dict[int, int] = {}
+        distance = 0.0
+        for n, a in enumerate(anchors):
+            lo, hi = bisect_left(fires, a.at - before), bisect_right(fires, a.at + after)
+            if hi > lo:
+                j = min((lo, hi - 1), key=lambda j: abs(fires[j] - a.at))
+                nearest[n] = j
+                distance += abs(fires[j] - a.at)
+        # An anchor at `a` is hit by a fire in [a - before, a + after]: the anchors a fire could explain lie in [fire - after, fire + before].
+        covered = 0.0
+        reach = self.timeline.start
+        for t in fires:
+            lo, hi = max(t - after, reach), min(t + before, self.timeline.end)
+            if hi > lo:
+                covered += hi - lo
+                reach = hi
+        span = max(self.timeline.end - self.timeline.start, 1.0)
+        single = Candidate((trigger,))
+        fit = round(distance / len(nearest), 1) if nearest else 0.0
+        rank = (must_not, near, simplicity(single), complexity(single), fit, unlabeled, describe(single))
+        return _Part(frozenset(nearest), nearest, covered / span, rank)
+
+    def _evidence(self, trigger: Trigger, part: _Part, new: Iterable[int], missed: int) -> bool:
+        """Whether a trigger hitting the `new` anchors (of `missed` ones) is evidence, not chance. What counts is the moments it fires at (one fire near a burst of labels is one moment): one fitted to a single moment (a clock time, a threshold, a `for:`) never is evidence, and anything else must fire near more of them than its fires would at random (binomial tail at `union_alpha`)."""
+        moments = len({part.nearest[n] for n in new})
+        fitted = isinstance(trigger, (TimeTrigger, SunTrigger, NumericStateTrigger)) or bool(getattr(trigger, "for_", 0))
+        if fitted and moments < 2:
+            return False
+        return _binomial_tail(missed, moments, part.chance) <= self.options.union_alpha
+
+    def unions(self, anchors: Sequence[Anchor], trigger_id: str | None, singles: Sequence[Trigger]) -> list[tuple[Trigger, ...]]:
+        """ORs of up to `max_triggers` triggers, when no single trigger hits every anchor: greedy set cover from each of the best `union_seeds` triggers, each step adding the trigger (searched again around the anchors still missed) that hits the most of them, fewest bad fires first. A trigger joins only when it hits the missed anchors more often than chance would."""
+        options = self.options
+        everything = frozenset(range(len(anchors)))
+        if options.max_triggers < 2 or len(anchors) < 2:
+            return []
+        memo: dict[Trigger, _Part] = {}
+
+        def info(trigger: Trigger) -> _Part:
+            if (found := memo.get(trigger)) is None:
+                found = memo[trigger] = self._part(trigger, anchors)
+            return found
+
+        if any(info(t).hits == everything for t in singles):
+            return []
+
+        def pool(around: Sequence[Anchor]) -> list[Trigger]:
+            min_hits = max(1, math.ceil(len(around) * options.union_min_recall))
+            return sorted(self.triggers(around, trigger_id, min_hits), key=lambda t: info(t).rank)
+
+        first = pool(anchors)
+        seeds = [
+            t
+            for t in sorted(first, key=lambda t: (-len(info(t).hits), info(t).rank))
+            if self._evidence(t, info(t), info(t).hits, len(anchors))
+        ][: options.union_seeds]
+        found: list[tuple[Trigger, ...]] = []
+        seen: set[frozenset[Trigger]] = set()
+        for seed in seeds:
+            parts = [seed]
+            covered = info(seed).hits
+            while len(parts) < options.max_triggers and covered != everything:
+                missed = sorted(everything - covered)
+                around = [anchors[n] for n in missed]
+                best: tuple[Any, ...] | None = None
+                for trigger in dict.fromkeys([*first, *pool(around)]):
+                    if trigger in parts:
+                        continue
+                    part = info(trigger)
+                    new = part.hits - covered
+                    if not new or not self._evidence(trigger, part, new, len(missed)):
+                        continue
+                    key = (-len(new), part.rank)
+                    if best is None or key < best[0]:
+                        best = (key, trigger)
+                if best is None:
+                    break
+                parts.append(best[1])
+                covered |= info(best[1]).hits
+            if len(parts) > 1 and frozenset(parts) not in seen:
+                seen.add(frozenset(parts))
+                found.append(tuple(parts))
+        return found
 
     # Conditions
 
@@ -1213,14 +1349,14 @@ def suggest(
     ends = [a for a in anchors if a.edge == "end"]
     check()
     if paired and starts and ends:
-        start_side = search.best_triggers(starts, "start", options.side_beam)
-        end_side = search.best_triggers(ends, "end", options.side_beam)
+        start_side = search.side(starts, "start", options.side_beam)
+        end_side = search.side(ends, "end", options.side_beam)
         if start_side and end_side:
-            bases = [Candidate((s, e)) for s in start_side for e in end_side]
+            bases = [Candidate((*s, *e)) for s in start_side for e in end_side]
         else:
-            bases = [Candidate((t,)) for t in start_side or end_side]
+            bases = [Candidate(t) for t in start_side or end_side]
     else:
-        bases = [Candidate((t,)) for t in search.best_triggers(anchors, None, options.beam)]
+        bases = [Candidate(t) for t in search.side(anchors, None, options.beam)]
 
     scored: list[_Scored] = []
     for base in bases:

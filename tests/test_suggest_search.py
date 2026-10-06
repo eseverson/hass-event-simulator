@@ -341,6 +341,99 @@ def test_start_and_end_labels_yield_paired_triggers_with_ids():
     assert best.explanation.startswith("Starts when binary_sensor.hall_motion changes to on; ends when")
 
 
+# OR of several triggers (#33)
+
+
+def door_or_motion(rng, days=4):
+    """The hall light comes on when the door opens (twice a day) or when the hall motion sensor sees someone (once a day, at other times)."""
+    initial, changes = distractors(rng, days)
+    initial.update({DOOR: "off", MOTION: "off"})
+    anchors = []
+    for day in range(days):
+        for at in (day * D + rng.uniform(7 * H, 9 * H), day * D + rng.uniform(17 * H, 19 * H)):
+            changes += [(at, DOOR, "on"), (at + M, DOOR, "off")]
+            anchors.append(at + rng.uniform(0, 30))
+        at = day * D + rng.uniform(12 * H, 14 * H)
+        changes += [(at, MOTION, "on"), (at + 3 * M, MOTION, "off")]
+        anchors.append(at + rng.uniform(0, 30))
+    return initial, changes, sorted(anchors)
+
+
+DOOR_ON = StateTrigger(DOOR, to=("on",))
+MOTION_ON = StateTrigger(MOTION, to=("on",))
+
+
+def test_anchors_explained_by_one_trigger_or_another_get_both():
+    initial, changes, anchors = door_or_motion(random.Random(21))
+    result = run(timeline(initial, changes, 4), Labels([fire(at) for at in anchors]))
+
+    best = top(result)
+    assert set(best.candidate.triggers) == {DOOR_ON, MOTION_ON}
+    assert best.candidate.conditions == ()
+    assert best.stats.recall == 1.0 and not best.stats.outside_fires
+    assert [t["entity_id"] for t in best.config["triggers"]] == [DOOR, MOTION]  # the trigger covering most anchors first
+    assert best.explanation.startswith(f"Fires when {DOOR} changes to on or {MOTION} changes to on; hits 12/12")
+    # The single triggers are still there, below the union.
+    assert any(s.candidate.triggers == (DOOR_ON,) for s in result.suggestions[1:])
+
+
+def test_a_trigger_that_meets_a_stray_anchor_by_chance_is_not_added():
+    """A label nothing explains, with a chatty sensor flipping a minute before it: one coincidence is no evidence, so neither that sensor nor a clock time fitted to the lone label joins the union."""
+    rng = random.Random(22)
+    initial, changes, anchors = door_or_motion(rng)
+    stray = 3 * D + 22 * H
+    chatty = "binary_sensor.chatty"
+    flips = sorted([*(rng.uniform(0, 4 * D) for _ in range(4 * 24)), stray - M])
+    initial[chatty] = "off"
+    changes += [(at, chatty, "on" if n % 2 == 0 else "off") for n, at in enumerate(flips)]
+    labels = Labels([fire(at) for at in [*anchors, stray]])
+
+    best = top(run(timeline(initial, changes, 4), labels))
+
+    assert set(best.candidate.triggers) == {DOOR_ON, MOTION_ON}
+    assert (best.stats.anchors_hit, best.stats.anchors_total) == (12, 13)
+
+
+def test_a_clock_time_fitted_to_one_burst_of_labels_is_not_added():
+    """Three labels a minute apart that nothing explains: a clock time hits all three with one fire, which is still one moment."""
+    initial, changes, anchors = door_or_motion(random.Random(24))
+    burst = [3 * D + 22 * H + n * M for n in range(3)]
+    best = top(run(timeline(initial, changes, 4), Labels([fire(at) for at in [*anchors, *burst]])))
+    assert set(best.candidate.triggers) == {DOOR_ON, MOTION_ON}
+
+
+def test_start_and_end_pairs_take_an_or_on_one_side():
+    """The light comes on when the door opens or motion starts, and goes off 5 minutes after motion clears: the start side is a union with id `start`, the end side keeps its own id."""
+    rng = random.Random(23)
+    initial, changes = distractors(rng, 2)
+    initial.update({DOOR: "off", MOTION: "off"})
+    labels = []
+    for n, begin in enumerate((8 * H, 13 * H, 19 * H, D + 8 * H, D + 13 * H, D + 19 * H)):
+        if n % 2 == 0:  # through the door; the hall sees them only a quarter of an hour later
+            changes += [(begin, DOOR, "on"), (begin + M, DOOR, "off"), (begin + 15 * M, MOTION, "on")]
+        else:
+            changes.append((begin, MOTION, "on"))
+        changes.append((begin + 40 * M, MOTION, "off"))
+        labels.append(fire(begin + rng.uniform(0, 30), "both", end=begin + 45 * M + rng.uniform(-30, 30)))
+
+    best = top(run(timeline(initial, changes, 2), Labels(labels)))
+
+    triggers = best.candidate.triggers
+    starts = {t for t in triggers if t.id == "start"}
+    (end,) = [t for t in triggers if t.id == "end"]
+    assert starts == {StateTrigger(DOOR, to=("on",), id="start"), StateTrigger(MOTION, to=("on",), id="start")}
+    assert (end.entity_id, end.to) == (MOTION, ("off",)) and 4 * M <= end.for_ <= 6 * M
+    assert (best.stats.anchors_hit, best.stats.anchors_total) == (12, 12)
+    assert [t["id"] for t in best.config["triggers"]] == ["start", "start", "end"]
+    assert best.explanation.startswith(f"Starts when {DOOR} changes to on or {MOTION} changes to on; ends when {MOTION} changes to off")
+
+
+def test_a_single_trigger_covering_every_anchor_needs_no_union():
+    tl, labels, sun = door_after_sunset(random.Random(1))
+    for suggestion in run(tl, labels, sun=sun).suggestions:
+        assert len(suggestion.candidate.triggers) == 1
+
+
 def test_a_must_not_period_forces_a_condition_that_excludes_it():
     rng = random.Random(5)
     initial, changes = distractors(rng, 1, count=0)
