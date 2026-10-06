@@ -105,6 +105,30 @@ async def test_sends_the_result_as_an_event(hass: HomeAssistant, setup, hass_ws_
     assert event["event"]["result"]["runs"] == []
 
 
+async def test_the_traces_option_reaches_the_child(hass: HomeAssistant, setup, hass_ws_client):
+    """#28: the child is handed `traces`; an unknown value is refused before one starts."""
+    client = await hass_ws_client(hass)
+    echo_traces = fake_child(
+        """
+        import json, sys
+        scenario = json.load(sys.stdin)
+        json.dump({"version": 1, "error": None, "runs": [], "service_calls": [], "warnings": [], "traces": scenario["traces"]}, sys.stdout)
+        """
+    )
+
+    with patch.object(runner, "child_command", return_value=echo_traces):
+        msg_id = await subscribe(client, {**SIMULATE, "traces": "none"})
+        event = await client.receive_json()
+
+    assert event["id"] == msg_id
+    assert event["event"]["result"]["traces"] == "none"
+
+    await client.send_json_auto_id({"type": SUBSCRIBE, "scenario": {**SIMULATE, "traces": "all"}})
+    refused = await client.receive_json()
+    assert not refused["success"]
+    assert refused["error"]["code"] == "invalid_format"
+
+
 async def test_the_client_can_unsubscribe_after_the_outcome(
     hass: HomeAssistant, setup, hass_ws_client
 ):

@@ -181,6 +181,9 @@ def _aware_utc_iso(value: Any) -> str:
     return dt_util.as_utc(cv.datetime(value)).isoformat()
 
 
+# The sandbox's `traces` modes (sandbox/engine.py TRACE_MODES; the engine is child-only, so not imported here).
+TRACE_MODES = ("full", "summary", "none")
+
 # Only what the live side needs is checked here; the child validates the rest and answers with a structured error.
 SIMULATE_SCENARIO = vol.Schema(
     {
@@ -192,6 +195,8 @@ SIMULATE_SCENARIO = vol.Schema(
         vol.Optional("initial_states", default=dict): dict,
         # A plain list, or packed (packed.py) to fit the websocket's 4 MiB message limit.
         vol.Optional("events", default=list): vol.Any(list, unpack_events),
+        # How much each run carries (the engine's TRACE_MODES): the panel needs `full`; a long validation can ask for `summary` or `none` to stay under the output cap.
+        vol.Optional("traces"): vol.In(TRACE_MODES),
     },
     extra=vol.ALLOW_EXTRA,
 )

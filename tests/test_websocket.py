@@ -453,6 +453,21 @@ async def test_simulate(hass: HomeAssistant, setup, hass_ws_client):
     assert [w["code"] for w in result["warnings"]] == ["unknown_service"]
 
 
+async def test_simulate_with_trimmed_traces(hass: HomeAssistant, setup, hass_ws_client):
+    """#28: `traces` reaches the child, which then leaves the step trace out."""
+    client = await hass_ws_client(hass)
+
+    msg = await _call(
+        client, {"type": "event_simulator/simulate", "scenario": {**SIMULATE, "traces": "summary"}}
+    )
+
+    assert msg["success"], msg
+    [run] = msg["result"]["runs"]
+    assert run["outcome"] == "fired"
+    assert "trace" not in run and run["conditions"] == {"condition/0": True}
+    assert len(msg["result"]["service_calls"]) == 1
+
+
 async def test_simulate_yaml_automation(hass: HomeAssistant, setup, hass_ws_client):
     client = await hass_ws_client(hass)
 
@@ -653,6 +668,7 @@ async def test_simulate_invalid_automation(hass: HomeAssistant, setup, hass_ws_c
             "too_many_entities",
         ),
         ({"automation": "alias: " + "x" * 300}, "too_large"),
+        ({"traces": "steps"}, "invalid_format"),
     ],
 )
 async def test_simulate_validates(

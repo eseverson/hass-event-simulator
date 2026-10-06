@@ -22,6 +22,8 @@ Result
       "warnings": [{"code", "message", "at"}]
     }
 
+`traces` sets how much each run carries: `full` (the default) is the shape above. `summary` drops `trace` and adds `conditions`, the result of each top-level condition by trace path (`{"condition/0": false}`; empty when none was evaluated). `none` keeps only `id`, `started`, `finished`, `outcome` and `trigger` as `{"idx", "id"}`, and records no service calls (`service_calls` is empty). Trimmed runs are reduced as each one finishes, so the child never holds more than Home Assistant's own few stored traces per automation; that keeps a month of many automations well under the runner's output cap.
+
 Under `automations`, each run and service call also carries `"automation": index`, per-automation warnings carry it too, and the result adds `"automations": [{"index", "entity_id", "loaded", "error": null | {"code", "message"}, "run_count"}]`. An automation the sandbox refuses (`invalid_automation`, `unsupported_automation`) is reported there with `loaded: false` and the others still replay; the top-level `error` is only for a problem with the scenario itself.
 
 `outcome`: `fired` (the actions ran to the end or a `stop`), `condition_failed` (`stopped_by` = the failing condition's trace path, e.g. `condition/0`), `dropped` (the script mode refused the run; `stopped_by` = `mode_single` / `max_runs` / `recursion`), `aborted` (a condition or `stop: error` inside the actions; `stopped_by` = last action path), `cancelled` (a `restart` re-trigger or shutdown), `error` (an exception; `stopped_by` = last action path, `error` = message), `unfinished` (still running at the overrun bound).
@@ -119,6 +121,9 @@ _REGISTRY_STORES: dict[str, tuple[str, str, str | None, tuple[int, int]]] = {
     "floors": (floor_registry.STORAGE_KEY, "floors", None, (floor_registry.STORAGE_VERSION_MAJOR, floor_registry.STORAGE_VERSION_MINOR)),
     "labels": (label_registry.STORAGE_KEY, "labels", None, (label_registry.STORAGE_VERSION_MAJOR, label_registry.STORAGE_VERSION_MINOR)),
 }
+# What each run carries (scenario `traces`), most first; see the module docstring.
+TRACE_MODES = ("full", "summary", "none")
+DEFAULT_TRACES = "full"
 # Upper bound on registry entries a scenario may carry (the live side caps far lower).
 MAX_REGISTRY_ITEMS = 10_000
 # Device automation platforms the sandbox can run: those of entity-domain integrations (binary_sensor, light, sensor, ...), which work from the entity and device registries alone. Integration-specific ones (zha, mqtt, hue, ...) need that integration running.
@@ -186,6 +191,7 @@ class _Scenario:
     warnings: list[dict[str, Any]] = field(default_factory=list)
     # `automations` rather than `automation`: runs, calls and per-automation warnings carry the index, and the result lists each automation.
     multi: bool = False
+    traces: str = DEFAULT_TRACES
 
 
 def error_result(code: str, message: str, warnings: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -356,12 +362,18 @@ def _parse_scenario(raw: dict[str, Any]) -> _Scenario:
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ScenarioError("invalid_scenario", "seed must be an integer")
 
+    traces = raw.get("traces")
+    if traces is None:
+        traces = DEFAULT_TRACES
+    elif not isinstance(traces, str) or traces not in TRACE_MODES:
+        raise ScenarioError("invalid_scenario", f"traces must be one of {', '.join(TRACE_MODES)}, not {traces!r}")
+
     registry = _parse_registry(raw.get("registry"), warnings)
     automations = _automations(items, multi, registry, warnings)
     for automation in automations:
         automation.own_initial = initial_states.pop(automation.entity_id, None)
 
-    return _Scenario(core, start, end, automations, initial_states, events, services, overrun, seed, preview_features, registry, warnings, multi)
+    return _Scenario(core, start, end, automations, initial_states, events, services, overrun, seed, preview_features, registry, warnings, multi, traces)
 
 
 def _automations(items: list[Any], multi: bool, registry: dict[str, Any], warnings: list[dict[str, Any]]) -> list[_Automation]:
@@ -640,7 +652,8 @@ class _Replay:
         self.clock = clock
         self.config_dir = config_dir
         self.hass: HomeAssistant | None = None
-        self.traces: list[Any] = []
+        # Each run in start order as (trace key, its trace while running or under `full`, else its trimmed record).
+        self.runs: list[tuple[str, Any]] = []
         self.service_calls: list[dict[str, Any]] = []
         self.warnings: list[dict[str, Any]] = list(scenario.warnings)
         self.log_warnings: list[dict[str, Any]] = []
@@ -657,7 +670,9 @@ class _Replay:
         original_store = automation_trace.async_store_trace
 
         def store_trace(hass: Any, trace: Any, stored_traces: int) -> None:
-            self.traces.append(trace)
+            self.runs.append((trace.key, trace))
+            if self.scenario.traces != "full":
+                self._trim_when_finished(trace, len(self.runs) - 1)
             original_store(hass, trace, stored_traces)
 
         automation_trace.async_store_trace = store_trace
@@ -691,6 +706,17 @@ class _Replay:
                 await self._stop()
         finally:
             automation_trace.async_store_trace = original_store
+
+    def _trim_when_finished(self, trace: Any, slot: int) -> None:
+        """Replace the run's trace with its trimmed record as soon as it finishes, so only Home Assistant's own stored traces stay alive."""
+        finished = trace.finished
+
+        def finish() -> None:
+            finished()
+            del trace.finished
+            self.runs[slot] = (trace.key, _run_record(trace, self.scenario.traces))
+
+        trace.finished = finish
 
     async def _boot(self) -> None:
         self.hass = hass = HomeAssistant(self.config_dir)
@@ -875,7 +901,8 @@ class _Replay:
         }
         if self.scenario.multi:
             call["automation"] = None if automation is None else automation.index
-        self.service_calls.append(call)
+        if self.scenario.traces != "none":
+            self.service_calls.append(call)
         known = self.scenario.services
         name = f"{domain}.{service}"
         if (
@@ -911,9 +938,10 @@ class _Replay:
         start, end = self.scenario.start, self.scenario.end
         runs: list[dict[str, Any]] = []
         dropped_ids: set[str] = set()
-        for trace in self.traces:
-            run = _run_record(trace)
-            automation = self._by_key.get(trace.key)
+        for key, item in self.runs:
+            # Still running at the overrun bound, or `full`: reduced only now.
+            run = item if isinstance(item, dict) else _run_record(item, self.scenario.traces)
+            automation = self._by_key.get(key)
             if self.scenario.multi:
                 run["automation"] = None if automation is None else automation.index
             started = run["started"]
@@ -946,13 +974,17 @@ class _Replay:
         return _json_safe(result)
 
 
-def _run_record(trace: Any) -> dict[str, Any]:
-    """One run of the result from an automation trace."""
-    extended = trace.as_extended_dict()
+def _run_record(trace: Any, traces: str = DEFAULT_TRACES) -> dict[str, Any]:
+    """One run of the result from an automation trace, carrying what `traces` asks for."""
     short = trace.as_short_dict()
     execution = short.get("script_execution")
     error = short.get("error")
-    steps: dict[str, list[dict[str, Any]]] = extended.get("trace") or {}
+    extended: dict[str, Any] | None = None
+    if traces == "full":
+        extended = trace.as_extended_dict()
+        steps: dict[str, list[dict[str, Any]]] = extended.get("trace") or {}
+    else:
+        steps = _trigger_and_condition_steps(trace)
     last_step = short.get("last_step")
 
     stopped_by: str | None = None
@@ -981,17 +1013,39 @@ def _run_record(trace: Any) -> dict[str, Any]:
 
     timestamps = short.get("timestamp") or {}
     finished = timestamps.get("finish") if outcome != "unfinished" else None
-    return {
+    trigger = _trigger_summary(steps, short.get("trigger"))
+    if traces == "none":
+        return {"id": trace.run_id, "started": timestamps.get("start"), "finished": finished, "outcome": outcome, "trigger": {"idx": trigger["idx"], "id": trigger["id"]}}
+    record = {
         "id": trace.run_id,
         "started": timestamps.get("start"),
         "finished": finished,
-        "trigger": _trigger_summary(steps, short.get("trigger")),
+        "trigger": trigger,
         "outcome": outcome,
         "stopped_by": stopped_by,
         "script_execution": execution,
         "error": error,
-        "trace": extended,
     }
+    if extended is not None:
+        record["trace"] = extended
+    else:
+        record["conditions"] = {
+            path: (elements[-1].get("result") or {}).get("result") for path, elements in steps.items() if path.startswith("condition/") and path.count("/") == 1 and elements
+        }
+    return record
+
+
+def _trigger_and_condition_steps(trace: Any) -> dict[str, list[dict[str, Any]]]:
+    """The trace's trigger and condition steps only, as `as_extended_dict()` would give them, without serializing the action steps."""
+    elements = getattr(trace, "_trace", None)
+    if isinstance(elements, dict):
+        return {path: [step.as_dict() for step in steps] for path, steps in elements.items() if _is_trigger_or_condition(path)}
+    # Not the ActionTrace layout this was written against: take the long way.
+    return {path: steps for path, steps in (trace.as_extended_dict().get("trace") or {}).items() if _is_trigger_or_condition(path)}
+
+
+def _is_trigger_or_condition(path: str) -> bool:
+    return path == "trigger" or path.startswith(("trigger/", "condition/"))
 
 
 def _failed_condition(steps: dict[str, list[dict[str, Any]]]) -> str | None:
