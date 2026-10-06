@@ -23,8 +23,10 @@ from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 
 from custom_components.event_simulator import runner, websocket
+from custom_components.event_simulator.suggest import exact
 from custom_components.event_simulator.const import DOMAIN
 
+from .test_runner import held_child, wait_started
 from .test_websocket import AUTOMATION, SIMULATE
 from .test_websocket_subscribe import fake_child, gone, sleeper, wait_for_pids, wait_gone
 
@@ -149,6 +151,9 @@ async def test_suggests_from_recorded_history_and_validates_exactly(
     [scenario] = sent
     assert scenario["traces"] == "none"
     assert len(scenario["automations"]) == len(final["suggestions"])
+    # Replayed without the placeholder action: whether a run fires is up to its trigger and conditions (#36).
+    assert all(automation["actions"] == [] for automation in scenario["automations"])
+    assert all(s["config"]["actions"] for s in final["suggestions"])
     assert "automation" not in scenario
     referenced = set()
     for suggestion in final["suggestions"]:
@@ -361,3 +366,73 @@ async def test_a_replay_cut_short_by_the_time_limit_validates_nothing(
     assert final["warning"]["code"] == "validation_failed"
     assert "time limit" in final["warning"]["message"]
     assert final["suggestions"][0]["stats"]["anchors_hit"] == 3
+
+
+async def test_a_validation_waits_its_turn_visibly_and_never_holds_up_a_replay(
+    hass: HomeAssistant, setup, door_history, hass_ws_client, tmp_path: Path
+):
+    """#36: validations share one sandbox slot. One that has to wait says `queued`; a panel replay still starts at once."""
+    start, evenings = door_history
+    client = await hass_ws_client(hass)
+    panel = await hass_ws_client(hass)
+    held = held_child(tmp_path)
+    blocker = hass.async_create_task(
+        runner.async_run_scenario(hass, SIMULATE, timeout=60, command=held, background=True)
+    )
+    await wait_started(tmp_path, 1)
+
+    msg_id = await subscribe(client, request(start, evenings))
+    progress = []
+    while not progress or progress[-1].get("stage") != "queued":
+        event = await client.receive_json()
+        assert event["id"] == msg_id and "stage" in event["event"], event
+        progress.append(event["event"])
+    assert [p["stage"] for p in progress] == ["loading", "mining", "validating", "queued"]
+
+    await panel.send_json_auto_id({"type": "event_simulator/simulate", "scenario": SIMULATE})
+    replay = await panel.receive_json()
+    assert replay["success"] and replay["result"]["error"] is None, replay
+
+    (tmp_path / "release").touch()
+    await blocker
+    _, final = await until_final(client, msg_id)
+    assert final["suggestions"] and all(s["exact"] is True for s in final["suggestions"])
+
+
+async def test_suggestions_too_costly_to_replay_keep_the_miner_estimate(
+    hass: HomeAssistant, setup, door_history, hass_ws_client
+):
+    """#36: only the best suggestions whose runs fit `MAX_VALIDATION_RUNS` are replayed; the rest are not suspect, just unchecked."""
+    start, evenings = door_history
+    client = await hass_ws_client(hass)
+    sent: list[dict[str, Any]] = []
+    run_scenario = runner.async_run_scenario
+
+    async def spy(hass, scenario, **kwargs):
+        sent.append(scenario)
+        return await run_scenario(hass, scenario, **kwargs)
+
+    # Room for the top suggestion's runs (the door opens twice a day) and not much more.
+    with patch.object(runner, "async_run_scenario", spy), patch.object(exact, "MAX_VALIDATION_RUNS", DAYS * 2):
+        msg_id = await subscribe(client, request(start, evenings))
+        progress, final = await until_final(client, msg_id)
+
+    [scenario] = sent
+    suggestions = final["suggestions"]
+    checked = [s for s in suggestions if s["exact"] is True]
+    unchecked = [s for s in suggestions if s["exact"] is False]
+    assert checked and unchecked
+    assert len(scenario["automations"]) == len(checked) == progress[-1]["candidates"]
+    assert final["warning"]["code"] == "validation_capped"
+    assert f"{len(unchecked)} of {len(suggestions)} suggestions fire too often" in final["warning"]["message"]
+    assert all(s["stats"]["fire_times"] and "approx_stats" not in s for s in unchecked)
+
+    # Nothing fits: no child at all, every suggestion keeps the miner's estimate.
+    sent.clear()
+    with patch.object(runner, "async_run_scenario", spy), patch.object(exact, "MAX_VALIDATION_RUNS", 0):
+        msg_id = await subscribe(client, request(start, evenings))
+        progress, final = await until_final(client, msg_id)
+    assert sent == []
+    assert [p["stage"] for p in progress] == ["loading", "mining"]
+    assert final["warning"]["code"] == "validation_capped"
+    assert all(s["exact"] is False for s in final["suggestions"])

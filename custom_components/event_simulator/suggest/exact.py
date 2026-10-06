@@ -5,11 +5,12 @@ The live side (websocket.py) replays the top suggestions in one sandbox child (`
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
-from .evaluate import Fire
+from .evaluate import Evaluator, Fire
+from .model import Candidate
 from .score import Stats, rank_key, score_fires
 from .search import Suggestion, SuggestResult, _hints, explain, tie_break
 from .timeline import to_ts
@@ -20,6 +21,33 @@ NOT_FIRES = frozenset({"condition_failed", "not_triggered"})
 MATCH_WINDOW = 60.0
 # Share of fires (approximate and exact together) left unmatched above which a suggestion counts as diverged.
 DIVERGED = 0.5
+# Most runs one validation replays, counted as `estimated_runs`. Home Assistant takes about 50 µs a run in the sandbox: eight any-change suggestions on two sensors reporting every minute and a half were 300 000 runs over a month, 25 s, holding a sandbox slot that other replays waited on (issue #36). This keeps the runs to about two seconds on top of boot and playback (room for one suggestion firing every minute and a half for a month); suggestions past it keep the miner's estimate (`plan_validation`).
+MAX_VALIDATION_RUNS = 40_000
+
+
+def estimated_runs(evaluator: Evaluator, candidate: Candidate) -> int:
+    """Runs the candidate starts in Home Assistant over the window: its triggers' fires, before conditions (a run stopped by a condition costs as much as one that fires)."""
+    return sum(len(evaluator.trigger_fires(trigger)) for trigger in candidate.triggers)
+
+
+def plan_validation(result: SuggestResult, budget: int | None = None) -> tuple[list[int], int]:
+    """Which suggestions to replay: best first, each one whose `estimated_runs` still fit in `budget` (default `MAX_VALIDATION_RUNS`) with those before it (one that does not fit is passed over and the next tried). Returns their indices and the runs of those passed over."""
+    if budget is None:
+        budget = MAX_VALIDATION_RUNS
+    context = result.context
+    if context is None:
+        return list(range(len(result.suggestions))), 0
+    evaluator = context.search.ev
+    chosen: list[int] = []
+    spent = skipped = 0
+    for n, suggestion in enumerate(result.suggestions):
+        runs = estimated_runs(evaluator, suggestion.candidate)
+        if spent + runs <= budget:
+            chosen.append(n)
+            spent += runs
+        else:
+            skipped += runs
+    return chosen, skipped
 
 
 def fires_from_runs(runs: Iterable[Mapping[str, Any]], count: int) -> list[list[Fire]]:
@@ -85,10 +113,11 @@ def apply_exact(
     exact: Sequence[Sequence[Fire] | None],
     *,
     warning: dict[str, str] | None = None,
+    unchecked: Collection[int] = (),
 ) -> SuggestResult:
     """`result` with each suggestion re-scored on its exact fires (`exact[n]` for `result.suggestions[n]`; None where the sandbox could not run it), re-ranked, and hints recomputed.
 
-    Order: suggestions that validated and agree with the miner, then those that diverged, then any the sandbox could not run (kept with the miner's stats, `exact: false`). Within each group, `score.rank_key` on the exact stats, then the miner's tie-breaks.
+    Order: suggestions that validated and agree with the miner, then those that diverged, then any the sandbox could not run (kept with the miner's stats, `exact: false`). Within each group, `score.rank_key` on the exact stats, then the miner's tie-breaks. Suggestions in `unchecked` were not replayed on purpose (too many runs, `plan_validation`): they keep the miner's stats, `exact: false`, and rank among the ones that agree on those stats, since nothing says they are wrong.
     """
     context = result.context
     if context is None or not result.suggestions:
@@ -98,6 +127,11 @@ def apply_exact(
     ranked: list[tuple[tuple[Any, ...], Suggestion]] = []
     for n, suggestion in enumerate(result.suggestions):
         candidate = suggestion.candidate
+        if n in unchecked:
+            fires = [Fire(at, 0) for at in suggestion.stats.fire_times]
+            key = (0, *rank_key(suggestion.stats, candidate), *tie_break(suggestion.stats, candidate, labels.anchors, fires))
+            ranked.append((key, replace(suggestion, exact=False)))
+            continue
         fires = exact[n] if n < len(exact) else None
         if fires is None:
             key = (2, n)

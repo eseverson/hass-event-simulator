@@ -259,4 +259,5 @@ test("the suggest check's warnings have their own headings", () => {
   // websocket.py: the sandbox could not check any suggestion, or only some of them.
   assert.equal(warningLabel("validation_failed"), "The sandbox could not check the suggestions");
   assert.equal(warningLabel("partly_validated"), "Some suggestions were not checked in the sandbox");
+  assert.equal(warningLabel("validation_capped"), "Some suggestions fire too often to check in the sandbox");
 });

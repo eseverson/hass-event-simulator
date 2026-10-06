@@ -571,6 +571,7 @@ export const WARNING_LABELS = {
   // suggest/subscribe's own (websocket.py): the exact check of the suggestions.
   validation_failed: "The sandbox could not check the suggestions",
   partly_validated: "Some suggestions were not checked in the sandbox",
+  validation_capped: "Some suggestions fire too often to check in the sandbox",
 };
 
 /* A heading for a warning code nobody listed: `some_code` -> "Some code". */
@@ -1894,6 +1895,7 @@ export const SUGGEST_STAGES = {
   loading: "Loading history",
   mining: "Searching for triggers and conditions",
   validating: "Checking the best ones in Home Assistant's sandbox",
+  queued: "Waiting for another check to finish",
 };
 
 /* A suggest/subscribe event (or a rejected subscribe, as {error}) for the panel:

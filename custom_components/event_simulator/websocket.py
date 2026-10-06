@@ -43,7 +43,8 @@ from .store import (
     TOLERANCE_SCHEMA,
     ScenarioStore,
 )
-from .suggest.exact import apply_exact, fires_from_runs, mark_approximate
+from .suggest.evaluate import Fire
+from .suggest.exact import apply_exact, fires_from_runs, mark_approximate, plan_validation
 from .suggest.labels import Labels, Tolerance
 from .suggest.search import SuggestOptions, SuggestResult, suggest
 from .suggest.timeline import Timeline, to_ts
@@ -448,8 +449,7 @@ async def async_suggest(
         )
     )
     if result.suggestions:
-        progress({"stage": "validating", "candidates": len(result.suggestions)})
-        result = await _async_validate(hass, result, timeline, start, end)
+        result = await _async_validate(hass, result, timeline, start, end, progress)
     return await hass.async_add_executor_job(result.as_dict)
 
 
@@ -504,21 +504,41 @@ def _mine(
     )
 
 
+# Wall-clock budget for one validation child (it stops itself at `runner.TIME_LIMIT_SHARE` of it, and the suggestions then keep the miner's estimate). `exact.MAX_VALIDATION_RUNS` keeps a validation to a few seconds; this only bounds one that runs long anyway, so it never holds a sandbox slot for minutes.
+VALIDATION_TIMEOUT = 60.0
+
+
 async def _async_validate(
     hass: HomeAssistant,
     result: SuggestResult,
     timeline: dict[str, Any],
     start: datetime,
     end: datetime,
+    progress: Callable[[dict[str, Any]], None],
 ) -> SuggestResult:
-    """Replay every suggestion in one sandbox child and re-score them on what Home Assistant did (suggest/exact.py).
+    """Replay the top suggestions in one sandbox child and re-score them on what Home Assistant did (suggest/exact.py).
 
-    Only the entities the suggestions reference are sent, with their initial states, and only the bus events of the types their event triggers listen to; core config, registry snapshot and services come from this instance as for `simulate`. `traces: none` keeps a month of runs small.
+    Only the suggestions whose runs fit `exact.MAX_VALIDATION_RUNS` are replayed (`plan_validation`); the rest keep the miner's estimate, with a `validation_capped` warning. They replay without their actions: a run's fire is decided by its trigger and conditions, and the placeholder action only costs time. Only the entities the replayed suggestions reference are sent, with their initial states, and only the bus events of the types their event triggers listen to; core config, registry snapshot and services come from this instance as for `simulate`. `traces: none` keeps a month of runs small. The replay is a background one (`runner.MAX_BACKGROUND`), so it never takes the last sandbox slot from the panel's replays; while it waits for one, `progress` gets `{stage: "queued"}`.
     """
-    configs = [suggestion.config for suggestion in result.suggestions]
-    entity_ids = sorted(set().union(*(s.candidate.entity_ids for s in result.suggestions)))
+    chosen, skipped_runs = await hass.async_add_executor_job(plan_validation, result)
+    unchecked = sorted(set(range(len(result.suggestions))) - set(chosen))
+    capped = None
+    if unchecked:
+        capped = {
+            "code": "validation_capped",
+            "message": (
+                f"{len(unchecked)} of {len(result.suggestions)} suggestions fire too often to check in the sandbox quickly "
+                f"(about {skipped_runs} runs over the window) and keep the miner's estimate"
+            ),
+        }
+    if not chosen:
+        return mark_approximate(result, capped)
+    progress({"stage": "validating", "candidates": len(chosen)})
+    replayed = [result.suggestions[n] for n in chosen]
+    configs = [{**suggestion.config, "actions": []} for suggestion in replayed]
+    entity_ids = sorted(set().union(*(s.candidate.entity_ids for s in replayed)))
     wanted = set(entity_ids)
-    event_types = set().union(*(s.candidate.event_types for s in result.suggestions))
+    event_types = set().union(*(s.candidate.event_types for s in replayed))
     scenario = {
         "version": 1,
         "start": start.isoformat(),
@@ -540,49 +560,72 @@ async def _async_validate(
         },
         "traces": "none",
     }
-
-    def approximate(message: str) -> SuggestResult:
-        _LOGGER.warning("Suggestions could not be validated in the sandbox: %s", message)
-        return mark_approximate(
-            result,
-            {
-                "code": "validation_failed",
-                "message": f"The suggestions could not be checked in the sandbox, so their stats are the miner's estimate: {message}",
-            },
-        )
-
     try:
-        replay = await runner.async_run_scenario(hass, scenario, timeout=runner.DEFAULT_TIMEOUT)
+        replay = await runner.async_run_scenario(
+            hass,
+            scenario,
+            timeout=VALIDATION_TIMEOUT,
+            background=True,
+            on_queued=lambda: progress({"stage": "queued"}),
+        )
     except SimulatorError as err:
-        return approximate(str(err))
+        return _approximate(result, str(err))
+    return await hass.async_add_executor_job(
+        partial(_apply_replay, result, replay, chosen, unchecked, end, capped)
+    )
+
+
+def _approximate(result: SuggestResult, message: str) -> SuggestResult:
+    """The miner's result, every suggestion `exact: false`, because the validation replay failed."""
+    _LOGGER.warning("Suggestions could not be validated in the sandbox: %s", message)
+    return mark_approximate(
+        result,
+        {
+            "code": "validation_failed",
+            "message": f"The suggestions could not be checked in the sandbox, so their stats are the miner's estimate: {message}",
+        },
+    )
+
+
+def _apply_replay(
+    result: SuggestResult,
+    replay: dict[str, Any],
+    chosen: list[int],
+    unchecked: list[int],
+    end: datetime,
+    capped: dict[str, str] | None,
+) -> SuggestResult:
+    """Executor: `result` re-scored on the validation replay of the suggestions `chosen` (automation `i` of the replay is suggestion `chosen[i]`). A month of runs is too much work to do on the event loop."""
     if isinstance(error := replay.get("error"), dict):
-        return approximate(str(error.get("message") or error.get("code") or "the sandbox refused the scenario"))
+        return _approximate(result, str(error.get("message") or error.get("code") or "the sandbox refused the scenario"))
     if cut := _cut_short(replay, end):
         # The window was not replayed to its end: every suggestion's fires after that point are missing.
-        return approximate(cut)
+        return _approximate(result, cut)
     loaded = {
         item.get("index"): item for item in replay.get("automations") or [] if isinstance(item, dict)
     }
-    fires = fires_from_runs(replay.get("runs") or [], len(configs))
-    # One that loaded but was stopped mid-replay (`runaway_loop`, `time_limit`) has only its fires up to there: not exact.
-    exact = [
-        fires[n] if (item := loaded.get(n) or {}).get("loaded") and not item.get("error") else None
-        for n in range(len(configs))
-    ]
-    refused = [n for n, found in enumerate(exact) if found is None]
-    if len(refused) == len(configs):
+    fires = fires_from_runs(replay.get("runs") or [], len(chosen))
+    exact: list[list[Fire] | None] = [None] * len(result.suggestions)
+    refused: list[int] = []
+    for i, n in enumerate(chosen):
+        # One that loaded but was stopped mid-replay (`runaway_loop`, `time_limit`) has only its fires up to there: not exact.
+        if (item := loaded.get(i) or {}).get("loaded") and not item.get("error"):
+            exact[n] = fires[i]
+        else:
+            refused.append(i)
+    if len(refused) == len(chosen) and not unchecked:
         reason = ((loaded.get(0) or {}).get("error") or {}).get("message")
-        return approximate(
-            "the sandbox could not run any of them" + (f" ({reason})" if reason else "")
+        return _approximate(
+            result, "the sandbox could not run any of them" + (f" ({reason})" if reason else "")
         )
-    warning = None
+    warning = capped
     if refused:
         reason = ((loaded.get(refused[0]) or {}).get("error") or {}).get("message") or "not loaded"
-        warning = {
-            "code": "partly_validated",
-            "message": f"{len(refused)} of {len(configs)} suggestions could not be checked in the sandbox and keep the miner's estimate ({reason})",
-        }
-    return await hass.async_add_executor_job(partial(apply_exact, result, exact, warning=warning))
+        message = f"{len(refused)} of {len(result.suggestions)} suggestions could not be checked in the sandbox and keep the miner's estimate ({reason})"
+        if capped is not None:
+            message += f"; {capped['message']}"
+        warning = {"code": "partly_validated", "message": message}
+    return apply_exact(result, exact, warning=warning, unchecked=unchecked)
 
 
 def _cut_short(replay: dict[str, Any], end: datetime) -> str | None:

@@ -77,7 +77,7 @@ The selected suggestion's fires show on a **Fires** row: green on an anchor, red
 
 Switch the panel to **Suggest** mode to have the simulator analyze your history and propose automation triggers and conditions. See the [Suggest design spec](docs/superpowers/specs/2026-10-05-suggestions-design.md) for details.
 
-**How it works.** Label periods in the history as should-fire or must-not-fire, then the simulator searches for trigger + condition combinations that match your labels. It generates candidates from state transitions, numeric thresholds, time-of-day, sun events and recorded bus events (a ZHA remote's `zha_event`, a `tag_scanned`, a phone's notification action: the event type plus the `event_data` keys that single out the labeled ones), then adds conditions (greedily) to remove unwanted fires. Top candidates are validated by replaying them in the sandbox so the stats are exact.
+**How it works.** Label periods in the history as should-fire or must-not-fire, then the simulator searches for trigger + condition combinations that match your labels. It generates candidates from state transitions, numeric thresholds, time-of-day, sun events and recorded bus events (a ZHA remote's `zha_event`, a `tag_scanned`, a phone's notification action: the event type plus the `event_data` keys that single out the labeled ones), then adds conditions (greedily) to remove unwanted fires. Top candidates are validated by replaying them in the sandbox so the stats are exact. A suggestion that fires thousands of times (a trigger on any change of a chatty sensor) is checked only while the replay stays short; the rest keep the search's estimate and say so.
 
 **Understanding suggestion stats.** Each suggestion shows:
 

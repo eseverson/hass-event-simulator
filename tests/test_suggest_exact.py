@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,8 +12,10 @@ from custom_components.event_simulator.suggest.evaluate import Evaluator, Fire
 from custom_components.event_simulator.suggest.exact import (
     apply_exact,
     divergence,
+    estimated_runs,
     fires_from_runs,
     mark_approximate,
+    plan_validation,
 )
 from custom_components.event_simulator.suggest.labels import Labels
 from custom_components.event_simulator.suggest.model import Candidate, StateTrigger
@@ -117,6 +120,47 @@ def test_a_suggestion_the_sandbox_could_not_run_keeps_the_miner_stats_last():
     assert last.candidate == result.suggestions[0].candidate
     assert last.exact is False and last.stats == result.suggestions[0].stats
     assert validated.as_dict()["warning"] == {"code": "partly_validated", "message": "x"}
+
+
+def test_estimated_runs_count_trigger_fires_before_conditions():
+    tl, labels = door_day()
+    result = run(tl, labels)
+    ev = result.context.search.ev
+    for suggestion in result.suggestions:
+        # A run a condition stops costs as much as one that fires.
+        assert estimated_runs(ev, suggestion.candidate) == sum(len(ev.trigger_fires(t)) for t in suggestion.candidate.triggers)
+        assert estimated_runs(ev, suggestion.candidate) >= suggestion.stats.fires
+    assert any(estimated_runs(ev, s.candidate) > s.stats.fires for s in result.suggestions)
+
+
+def test_plan_validation_takes_the_best_suggestions_whose_runs_fit_the_budget():
+    """Best first; one that does not fit is passed over and the ones after it still get their turn."""
+    runs = {"a": 30_000, "b": 30_000, "c": 5_000, "d": 4_000}
+    ev = SimpleNamespace(trigger_fires=lambda trigger: [0.0] * runs[trigger])
+    result = SimpleNamespace(
+        suggestions=[SimpleNamespace(candidate=SimpleNamespace(triggers=(name,))) for name in runs],
+        context=SimpleNamespace(search=SimpleNamespace(ev=ev)),
+    )
+    assert plan_validation(result, budget=40_000) == ([0, 2, 3], 30_000)
+    assert plan_validation(result, budget=8_000) == ([2], 64_000)
+    assert plan_validation(result, budget=0) == ([], 69_000)
+    assert plan_validation(result, budget=10**6) == ([0, 1, 2, 3], 0)
+
+
+def test_suggestions_left_unchecked_keep_the_miner_stats_and_their_rank():
+    """Not replayed for their cost, a suggestion is not suspect: it ranks on the miner's stats among the ones that validated, not after them."""
+    tl, labels = door_day()
+    result = run(tl, labels)
+    exact: list[list[Fire] | None] = [[Fire(f + 0.2, 0) for f in s.stats.fire_times] for s in result.suggestions]
+    exact[0] = None
+
+    validated = apply_exact(result, exact, unchecked=[0], warning={"code": "validation_capped", "message": "x"})
+
+    assert [s.candidate for s in validated.suggestions] == [s.candidate for s in result.suggestions]
+    top = validated.suggestions[0]
+    assert top.exact is False and top.stats == result.suggestions[0].stats and top.approx_stats is None
+    assert all(s.exact is True for s in validated.suggestions[1:])
+    assert validated.as_dict()["warning"]["code"] == "validation_capped"
 
 
 def test_mark_approximate():
