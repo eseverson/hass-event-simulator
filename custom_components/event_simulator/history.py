@@ -41,6 +41,10 @@ from homeassistant.util.json import json_loads
 MAX_ENTITIES = 50
 MAX_WINDOW = timedelta(days=7)
 MAX_EVENTS = 50_000
+# Suggest mode learns from repetition, so it reads a longer window (the suggestions spec); replays stay capped at MAX_WINDOW.
+MAX_SUGGEST_WINDOW = timedelta(days=30)
+# State changes the suggest command reads for its window: the miner holds them in memory (about 0.3 s for 60k), and only the entities the candidates reference go on to the sandbox.
+MAX_SUGGEST_EVENTS = 200_000
 # Registry snapshot caps: an area or label on a big install can pull in hundreds of
 # entities, and each entry is around a kilobyte of scenario.
 MAX_SNAPSHOT_ENTITIES = 500
@@ -70,13 +74,14 @@ class SimulatorError(Exception):
         self.code = code
 
 
-def check_window(start: datetime, end: datetime) -> None:
-    """Refuse a window that is empty, reversed, or longer than MAX_WINDOW."""
+def check_window(start: datetime, end: datetime, max_window: timedelta | None = None) -> None:
+    """Refuse a window that is empty, reversed, or longer than `max_window` (a replay's MAX_WINDOW unless said otherwise)."""
+    max_window = MAX_WINDOW if max_window is None else max_window
     if end <= start:
         raise SimulatorError("invalid_window", "The window must end after it starts")
-    if end - start > MAX_WINDOW:
+    if end - start > max_window:
         raise SimulatorError(
-            "window_too_long", f"The window is longer than the limit of {MAX_WINDOW}"
+            "window_too_long", f"The window is longer than the limit of {max_window}"
         )
 
 
@@ -151,7 +156,13 @@ def _entity_ids(hass: HomeAssistant, references: Iterable[str]) -> set[str]:
 
 
 async def async_get_timeline(
-    hass: HomeAssistant, entity_ids: list[str], start: datetime, end: datetime
+    hass: HomeAssistant,
+    entity_ids: list[str],
+    start: datetime,
+    end: datetime,
+    *,
+    max_window: timedelta | None = None,
+    max_events: int | None = None,
 ) -> dict[str, Any]:
     """The state of each entity at `start`, plus every state write in [start, end).
 
@@ -162,14 +173,18 @@ async def async_get_timeline(
     state that has held for hours as brand new. Entities with nothing recorded
     before `start` are left out of `initial_states`; the recorder is the only
     source, and a made-up start state would present a guess as history.
+
+    The window and the number of state changes are capped at `max_window` / `max_events` (a replay's limits unless the caller is Suggest mode).
     """
     start, end = dt_util.as_utc(start), dt_util.as_utc(end)
+    max_window = MAX_WINDOW if max_window is None else max_window
+    max_events = MAX_EVENTS if max_events is None else max_events
     if len(entity_ids) > MAX_ENTITIES:
         raise SimulatorError(
             "too_many_entities",
             f"{len(entity_ids)} entities requested; the limit is {MAX_ENTITIES}",
         )
-    check_window(start, end)
+    check_window(start, end, max_window)
     if not entity_ids:
         return {"initial_states": {}, "events": []}
 
@@ -193,10 +208,10 @@ async def async_get_timeline(
                     "last_changed": last_changed.isoformat(),
                     "last_updated": last_updated.isoformat(),
                 }
-    if len(changes) > MAX_EVENTS:
+    if len(changes) > max_events:
         raise SimulatorError(
             "too_many_events",
-            f"{len(changes)} state changes in the window; the limit is {MAX_EVENTS}."
+            f"{len(changes)} state changes in the window; the limit is {max_events}."
             " Shorten the window or drop the busiest entities.",
         )
     changes.sort(key=lambda state: state.last_updated)

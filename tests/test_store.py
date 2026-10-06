@@ -157,6 +157,20 @@ async def test_save_refuses_a_window_too_long_to_replay(store: ScenarioStore):
     assert err.value.code == "window_too_long"
 
 
+async def test_a_suggest_scenario_may_span_a_suggest_window(store: ScenarioStore):
+    """#23: one saved in Suggest mode (it carries suggest_options) may be up to 30 days; anything longer is still refused."""
+    options = {"tolerance_before": 120.0, "tolerance_after": 600.0}
+    saved = await store.async_save_scenario(
+        {**SCENARIO, "end": "2026-11-03T00:00:00+00:00", "suggest_options": options}
+    )
+    assert store.get(saved["scenario_id"])["suggest_options"] == options
+    with pytest.raises(SimulatorError) as err:
+        await store.async_save_scenario(
+            {**SCENARIO, "end": "2026-11-04T00:00:01+00:00", "suggest_options": options}
+        )
+    assert err.value.code == "window_too_long"
+
+
 async def test_delete_removes_it(store: ScenarioStore):
     saved = await store.async_save_scenario(dict(SCENARIO))
 

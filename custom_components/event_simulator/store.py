@@ -25,7 +25,7 @@ from homeassistant.util.hass_dict import HassKey
 from homeassistant.util.ulid import ulid_now
 
 from .const import DOMAIN
-from .history import MAX_ENTITIES, MAX_EVENTS, SimulatorError, check_window
+from .history import MAX_ENTITIES, MAX_EVENTS, MAX_SUGGEST_WINDOW, MAX_WINDOW, SimulatorError, check_window
 from .packed import event_count, pack_events, unpack_events
 from .suggest.labels import ANCHORS, KINDS
 
@@ -47,12 +47,14 @@ MAX_TOLERANCE = 24 * 3600
 
 __all__ = [
     "DATA_STORE",
+    "LABEL_SCHEMA",
     "MAX_EVENTS",
     "MAX_LABELS",
     "MAX_SCENARIOS",
     "MAX_STORED_EVENTS",
     "SCENARIO_FIELDS",
     "STORAGE_KEY",
+    "TOLERANCE_SCHEMA",
     "ScenarioStore",
 ]
 
@@ -92,7 +94,7 @@ def _check_label(label: dict[str, Any]) -> dict[str, Any]:
 
 
 # A labeled period for Suggest mode, in the shape `suggest/subscribe` takes (suggest/labels.py).
-_LABEL = vol.All(
+LABEL_SCHEMA = vol.All(
     vol.Schema(
         {
             vol.Required("start"): _aware_iso,
@@ -104,13 +106,13 @@ _LABEL = vol.All(
     _check_label,
 )
 
-_TOLERANCE = vol.All(vol.Coerce(float), vol.Range(min=0, max=MAX_TOLERANCE))
+TOLERANCE_SCHEMA = vol.All(vol.Coerce(float), vol.Range(min=0, max=MAX_TOLERANCE))
 
 # Suggest mode's options: how far (seconds) a fire may land before / after an anchor and still match it.
 _SUGGEST_OPTIONS = vol.Schema(
     {
-        vol.Optional("tolerance_before"): _TOLERANCE,
-        vol.Optional("tolerance_after"): _TOLERANCE,
+        vol.Optional("tolerance_before"): TOLERANCE_SCHEMA,
+        vol.Optional("tolerance_after"): TOLERANCE_SCHEMA,
     }
 )
 
@@ -128,7 +130,7 @@ SCENARIO_FIELDS: dict[vol.Marker, Any] = {
     # Only sent when a track is shifted, and only stored then.
     vol.Optional("track_shifts"): {cv.entity_id: _TRACK_SHIFT},
     # Suggest mode: the labeled periods and the options, stored only when sent non-empty.
-    vol.Optional("labels"): vol.All([_LABEL], vol.Length(max=MAX_LABELS)),
+    vol.Optional("labels"): vol.All([LABEL_SCHEMA], vol.Length(max=MAX_LABELS)),
     vol.Optional("suggest_options"): _SUGGEST_OPTIONS,
 }
 
@@ -229,7 +231,9 @@ class ScenarioStore:
 
 
 def _check_limits(body: dict[str, Any]) -> None:
-    check_window(_parse(body["start"]), _parse(body["end"]))
+    # A scenario saved in Suggest mode (it carries `suggest_options`) may span a Suggest window.
+    max_window = MAX_SUGGEST_WINDOW if body.get("suggest_options") else MAX_WINDOW
+    check_window(_parse(body["start"]), _parse(body["end"]), max_window)
     if (count := event_count(body.get("events"))) > MAX_EVENTS:
         raise SimulatorError(
             "too_large", f"A scenario holds at most {MAX_EVENTS} events; this one has {count}"

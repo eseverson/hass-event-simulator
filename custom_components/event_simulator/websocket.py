@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import date, datetime
+from functools import partial
 import logging
+import threading
 from typing import Any
 
 import voluptuous as vol
@@ -14,15 +17,34 @@ from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.sun import get_astral_location
 from homeassistant.util import dt as dt_util
 from homeassistant.util.yaml import parse_yaml
 
 from . import history, runner
 from .const import DOMAIN
-from .history import MAX_ENTITIES, MAX_EVENTS, SimulatorError, check_window
+from .history import (
+    MAX_ENTITIES,
+    MAX_EVENTS,
+    MAX_SUGGEST_EVENTS,
+    MAX_SUGGEST_WINDOW,
+    SimulatorError,
+    check_window,
+)
 from .packed import unpack_events
 from .runner import SandboxError
-from .store import DATA_STORE, SCENARIO_FIELDS, ScenarioStore
+from .store import (
+    DATA_STORE,
+    LABEL_SCHEMA,
+    MAX_LABELS,
+    SCENARIO_FIELDS,
+    TOLERANCE_SCHEMA,
+    ScenarioStore,
+)
+from .suggest.exact import apply_exact, fires_from_runs, mark_approximate
+from .suggest.labels import Labels, Tolerance
+from .suggest.search import SuggestOptions, SuggestResult, suggest
+from .suggest.timeline import Timeline, to_ts
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -77,6 +99,7 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_scenarios_delete)
     websocket_api.async_register_command(hass, ws_simulate)
     websocket_api.async_register_command(hass, ws_simulate_subscribe)
+    websocket_api.async_register_command(hass, ws_suggest_subscribe)
 
 
 @websocket_api.require_admin
@@ -109,9 +132,12 @@ async def ws_automation(hass, connection, msg: dict[str, Any]) -> None:
 @websocket_api.async_response
 @_wrap
 async def ws_history(hass, connection, msg: dict[str, Any]) -> None:
+    """The recorded timeline of the entities in the window, up to a Suggest window long (the panel shows Suggest mode's longer windows too); `simulate` still refuses a replay longer than `history.MAX_WINDOW`."""
     connection.send_result(
         msg["id"],
-        await history.async_get_timeline(hass, msg["entity_ids"], msg["start"], msg["end"]),
+        await history.async_get_timeline(
+            hass, msg["entity_ids"], msg["start"], msg["end"], max_window=MAX_SUGGEST_WINDOW
+        ),
     )
 
 
@@ -233,6 +259,20 @@ class _Replay:
         self.task.cancel()
 
 
+def _supersede(connection: websocket_api.ActiveConnection, kind: type[_Replay], message: str) -> None:
+    """Cancel every unfinished subscription of exactly `kind` on the connection and tell each it was `superseded` (newest wins)."""
+    for sub_id, sub in list(connection.subscriptions.items()):
+        # A finished one has answered already and waits for the client's unsubscribe.
+        if type(sub) is kind and not sub.task.done():
+            del connection.subscriptions[sub_id]
+            sub()
+            connection.send_message(
+                websocket_api.event_message(
+                    sub_id, {"error": {"code": "superseded", "message": message}}
+                )
+            )
+
+
 @websocket_api.require_admin
 @websocket_api.websocket_command(
     {vol.Required("type"): f"{DOMAIN}/simulate/subscribe", vol.Required("scenario"): SIMULATE_SCENARIO}
@@ -247,17 +287,7 @@ def ws_simulate_subscribe(
     """
     msg_id = msg["id"]
     connection.send_result(msg_id)
-    for sub_id, sub in list(connection.subscriptions.items()):
-        # A finished one has answered already and waits for the client's unsubscribe.
-        if isinstance(sub, _Replay) and not sub.task.done():
-            del connection.subscriptions[sub_id]
-            sub()
-            connection.send_message(
-                websocket_api.event_message(
-                    sub_id,
-                    {"error": {"code": "superseded", "message": "A newer replay replaced this one"}},
-                )
-            )
+    _supersede(connection, _Replay, "A newer replay replaced this one")
 
     async def replay() -> None:
         try:
@@ -273,6 +303,240 @@ def ws_simulate_subscribe(
         )
     )
     connection.subscriptions[msg_id] = handle
+
+
+# Most suggestions one request may ask for: they are validated together in one sandbox child, which takes at most this many automations (sandbox/engine.py MAX_AUTOMATIONS; the engine is child-only, so not imported here).
+MAX_SUGGESTIONS = 25
+MAX_SUGGEST_CONDITIONS = 4
+
+# What the panel sends in `options`: the match tolerance (seconds before / after an anchor), and optionally the search's size.
+SUGGEST_OPTIONS = vol.Schema(
+    {
+        vol.Optional("tolerance_before"): TOLERANCE_SCHEMA,
+        vol.Optional("tolerance_after"): TOLERANCE_SCHEMA,
+        vol.Optional("max_conditions"): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=MAX_SUGGEST_CONDITIONS)
+        ),
+        vol.Optional("top_k"): vol.All(vol.Coerce(int), vol.Range(min=1, max=MAX_SUGGESTIONS)),
+    }
+)
+
+
+class _Suggesting(_Replay):
+    """A `suggest/subscribe` in flight. Cancelling it also raises `stop`, which the miner polls in its executor thread (a thread cannot be cancelled from outside)."""
+
+    def __init__(self, task: asyncio.Task[None], stop: threading.Event) -> None:
+        super().__init__(task)
+        self.stop = stop
+
+    def __call__(self) -> None:
+        self.stop.set()
+        super().__call__()
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/suggest/subscribe",
+        vol.Required("entity_ids"): vol.All([cv.entity_id], vol.Length(min=1, max=MAX_ENTITIES)),
+        vol.Required("start"): cv.datetime,
+        vol.Required("end"): cv.datetime,
+        vol.Required("labels"): vol.All([LABEL_SCHEMA], vol.Length(max=MAX_LABELS)),
+        vol.Optional("options", default=dict): SUGGEST_OPTIONS,
+    }
+)
+@callback
+def ws_suggest_subscribe(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Suggest automations from labeled history, as a cancellable subscription (see `async_suggest`).
+
+    Acknowledged at once; then progress events `{stage: "loading" | "mining" | "validating", ...counts}`, and one final event: the result `{suggestions, hints, evaluated[, warning]}` or `{error: {code, message}}`. Newest wins per connection, as with `simulate/subscribe`: a newer suggest supersedes the one in flight (`superseded` error event), and unsubscribing or closing the connection stops the miner at its next check and kills the validation child.
+
+    Every field but `options` is required, so a request with none is refused as `invalid_format`: the panel probes for the command that way.
+    """
+    msg_id = msg["id"]
+    connection.send_result(msg_id)
+    _supersede(connection, _Suggesting, "A newer suggestion request replaced this one")
+    stop = threading.Event()
+
+    def send(payload: dict[str, Any]) -> None:
+        if connection.subscriptions.get(msg_id) is handle:  # not unsubscribed or superseded meanwhile
+            connection.send_message(websocket_api.event_message(msg_id, payload))
+
+    async def run() -> None:
+        try:
+            payload = await async_suggest(hass, msg, send, stop)
+        except Exception as err:  # noqa: BLE001
+            payload = {"error": _error_payload(err)}
+        send(payload)
+
+    handle = _Suggesting(
+        hass.async_create_background_task(run(), f"{DOMAIN}.suggest:{msg_id}", eager_start=False),
+        stop,
+    )
+    connection.subscriptions[msg_id] = handle
+
+
+async def async_suggest(
+    hass: HomeAssistant,
+    msg: dict[str, Any],
+    progress: Callable[[dict[str, Any]], None],
+    stop: threading.Event,
+) -> dict[str, Any]:
+    """Load the window's history, mine suggestions from it in the executor, validate the top ones exactly in one sandbox child, and return the result dict.
+
+    Validation failing (the child crashed, timed out, refused the scenario) is not an error: the miner's own result comes back with every suggestion `exact: false` and a `warning`.
+    """
+    start, end = dt_util.as_utc(msg["start"]), dt_util.as_utc(msg["end"])
+    check_window(start, end, MAX_SUGGEST_WINDOW)
+    entity_ids = list(dict.fromkeys(msg["entity_ids"]))
+    progress({"stage": "loading", "entities": len(entity_ids)})
+    timeline = await history.async_get_timeline(
+        hass,
+        entity_ids,
+        start,
+        end,
+        max_window=MAX_SUGGEST_WINDOW,
+        max_events=MAX_SUGGEST_EVENTS,
+    )
+    progress(
+        {"stage": "mining", "events": len(timeline["events"]), "labels": len(msg["labels"])}
+    )
+    result = await hass.async_add_executor_job(
+        partial(
+            _mine,
+            timeline,
+            start,
+            end,
+            msg["labels"],
+            msg["options"],
+            hass.config.time_zone,
+            async_sun_events(hass),
+            stop.is_set,
+        )
+    )
+    if result.suggestions:
+        progress({"stage": "validating", "candidates": len(result.suggestions)})
+        result = await _async_validate(hass, result, timeline, start, end)
+    return await hass.async_add_executor_job(result.as_dict)
+
+
+@callback
+def async_sun_events(hass: HomeAssistant) -> Callable[[date], dict[str, datetime | None]]:
+    """The miner's `sun_events(date)`: what `homeassistant.helpers.sun.get_astral_event_date` returns for sunrise and sunset at this instance's location (None when the sun does not rise or set that day). The location is looked up here, on the event loop; the returned function is pure astral math, safe in the executor."""
+    location, elevation = get_astral_location(hass)
+
+    def sun_events(day: date) -> dict[str, datetime | None]:
+        events: dict[str, datetime | None] = {}
+        for event in ("sunrise", "sunset"):
+            try:
+                events[event] = getattr(location, event)(
+                    day, local=False, observer_elevation=elevation
+                )
+            except ValueError:
+                events[event] = None
+        return events
+
+    return sun_events
+
+
+def _mine(
+    data: dict[str, Any],
+    start: datetime,
+    end: datetime,
+    raw_labels: list[dict[str, Any]],
+    options: dict[str, Any],
+    time_zone: str,
+    sun_events: Callable[[date], dict[str, datetime | None]],
+    should_stop: Callable[[], bool],
+) -> SuggestResult:
+    """Executor: the miner over the loaded timeline (labels outside the window are left out)."""
+    timeline = Timeline.from_scenario(data["initial_states"], data["events"], start, end)
+    tolerance = Tolerance(
+        **{
+            edge: options[f"tolerance_{edge}"]
+            for edge in ("before", "after")
+            if f"tolerance_{edge}" in options
+        }
+    )
+    lo, hi = start.timestamp(), end.timestamp()
+    in_window = [label for label in raw_labels if to_ts(label["end"]) > lo and to_ts(label["start"]) < hi]
+    return suggest(
+        timeline,
+        Labels.from_dicts(in_window, tolerance),
+        time_zone=time_zone,
+        sun_events=sun_events,
+        options=SuggestOptions.from_dict(options),
+        should_stop=should_stop,
+    )
+
+
+async def _async_validate(
+    hass: HomeAssistant,
+    result: SuggestResult,
+    timeline: dict[str, Any],
+    start: datetime,
+    end: datetime,
+) -> SuggestResult:
+    """Replay every suggestion in one sandbox child and re-score them on what Home Assistant did (suggest/exact.py).
+
+    Only the entities the suggestions reference are sent, with their initial states; core config, registry snapshot and services come from this instance as for `simulate`. `traces: none` keeps a month of runs small.
+    """
+    configs = [suggestion.config for suggestion in result.suggestions]
+    entity_ids = sorted(set().union(*(s.candidate.entity_ids for s in result.suggestions)))
+    wanted = set(entity_ids)
+    scenario = {
+        "version": 1,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "automations": configs,
+        "initial_states": {
+            entity_id: state
+            for entity_id, state in timeline["initial_states"].items()
+            if entity_id in wanted
+        },
+        "events": [event for event in timeline["events"] if event["entity_id"] in wanted],
+        "core": history.async_core_config(hass),
+        "registry": history.async_registry_snapshot(hass, {"automations": configs}, entity_ids),
+        "services": {
+            domain: sorted(services) for domain, services in hass.services.async_services().items()
+        },
+        "traces": "none",
+    }
+
+    def approximate(message: str) -> SuggestResult:
+        _LOGGER.warning("Suggestions could not be validated in the sandbox: %s", message)
+        return mark_approximate(
+            result,
+            {
+                "code": "validation_failed",
+                "message": f"The suggestions could not be checked in the sandbox, so their stats are the miner's estimate: {message}",
+            },
+        )
+
+    try:
+        replay = await runner.async_run_scenario(hass, scenario, timeout=runner.DEFAULT_TIMEOUT)
+    except SimulatorError as err:
+        return approximate(str(err))
+    if isinstance(error := replay.get("error"), dict):
+        return approximate(str(error.get("message") or error.get("code") or "the sandbox refused the scenario"))
+    loaded = {
+        item.get("index"): item for item in replay.get("automations") or [] if isinstance(item, dict)
+    }
+    fires = fires_from_runs(replay.get("runs") or [], len(configs))
+    exact = [fires[n] if (loaded.get(n) or {}).get("loaded") else None for n in range(len(configs))]
+    refused = [n for n, found in enumerate(exact) if found is None]
+    if len(refused) == len(configs):
+        return approximate("the sandbox could not run any of them")
+    warning = None
+    if refused:
+        reason = ((loaded.get(refused[0]) or {}).get("error") or {}).get("message") or "not loaded"
+        warning = {
+            "code": "partly_validated",
+            "message": f"{len(refused)} of {len(configs)} suggestions could not be checked in the sandbox and keep the miner's estimate ({reason})",
+        }
+    return await hass.async_add_executor_job(partial(apply_exact, result, exact, warning=warning))
 
 
 async def async_simulate(hass: HomeAssistant, scenario: dict[str, Any]) -> dict[str, Any]:

@@ -55,7 +55,7 @@ Click a mark (or anywhere on a track) to edit the state and attributes in effect
 
 Runs land on a results row under the shared time axis, each with its own marker shape and color: fired, stopped by a condition, aborted inside the actions, cancelled (by a `restart` re-trigger), dropped by the automation's `mode` (the legend says which: `single`, `max_runs`, or recursive), still running after the overrun, or errored. On Home Assistant 2026.9 and newer, a trigger that looked at a change and decided not to fire (a non-numeric reading for a threshold, say) shows as **not triggered**, with the reason in the run details. The legend above the row counts each. Selecting a run shows when it started and how long it took, the trigger, each condition's result, the step that stopped it, any error, and the service calls it recorded. Warnings from the replay (an event outside the window, a call to a service your instance does not have, a run still going when the replay ended) are listed with the results.
 
-**Suggest mode (labeling).** Switch the mode from **Replay** to **Suggest** to label history instead of replaying it. Suggest mode keeps the same timeline, tracks and window, and the window can be longer, up to 30 days, because patterns need repetition. For now, history still loads at most 7 days at a time, and the panel says so if you pick a longer window. You don't need an automation: add the entities to learn from as tracks, or pick an automation to add the entities it references. To label a period, drag across the **Labels** row or the time axis (on a touch screen, long-press first, then drag). Then say what the period is:
+**Suggest mode (labeling).** Switch the mode from **Replay** to **Suggest** to label history instead of replaying it. Suggest mode keeps the same timeline, tracks and window, and the window can be longer, up to 30 days, because patterns need repetition (a replay is still limited to 7 days). You don't need an automation: add the entities to learn from as tracks, or pick an automation to add the entities it references. To label a period, drag across the **Labels** row or the time axis (on a touch screen, long-press first, then drag). Then say what the period is:
 
 - **Should fire** at its start, at its end, at both (the classic on/off pair), or **while** (conditions should hold throughout). Should-fire periods are drawn green, with a tick at each anchor.
 - **Must not fire**: any fire inside it is a failure. These periods are drawn red and hatched.
@@ -99,9 +99,9 @@ The replay attaches the automation at the window start, writes each timeline cha
 
 | Limit | Value |
 | --- | --- |
-| Window | 7 days |
+| Window | 7 days (Suggest mode: 30 days) |
 | Tracked entities | 50 |
-| Timeline changes | 50,000 |
+| Timeline changes | 50,000 (Suggest mode reads up to 200,000) |
 | One request to Home Assistant (replays and saves send the timeline packed, so a week of a sensor reporting every 15 s fits) | 4 MB |
 | Registry slice sent to the sandbox | 500 entities, 250 devices (the rest is dropped with a warning) |
 | Edited automation YAML | 256 KiB, 100,000 nodes |
