@@ -44,9 +44,13 @@ MAX_STORED_EVENTS = 500_000
 MAX_LABELS = 500
 # The longest match tolerance either side of an anchor, in seconds.
 MAX_TOLERANCE = 24 * 3600
+# The sandbox's helper domains and cap (sandbox/helpers.py ENTITY_DOMAINS, MAX_HELPERS; the sandbox is child-only, so not imported here).
+HELPER_DOMAINS = ("trend", "derivative")
+MAX_HELPERS = 20
 
 __all__ = [
     "DATA_STORE",
+    "HELPERS_SCHEMA",
     "LABEL_SCHEMA",
     "MAX_EVENTS",
     "MAX_LABELS",
@@ -117,6 +121,21 @@ _SUGGEST_OPTIONS = vol.Schema(
 )
 
 # The body of a scenario, shared with the websocket `save` command's schema.
+# Trend / Derivative helpers a scenario replays with (`[{domain, entity_id, options, title?}]`, sandbox/helpers.py): the sandbox checks the options.
+HELPERS_SCHEMA = vol.All(
+    [
+        vol.Schema(
+            {
+                vol.Required("domain"): vol.In(HELPER_DOMAINS),
+                vol.Required("entity_id"): cv.entity_id,
+                vol.Required("options"): dict,
+            },
+            extra=vol.ALLOW_EXTRA,
+        )
+    ],
+    vol.Length(max=MAX_HELPERS),
+)
+
 SCENARIO_FIELDS: dict[vol.Marker, Any] = {
     vol.Required("name"): vol.All(cv.string, vol.Strip, vol.Length(min=1, max=MAX_NAME_LENGTH)),
     vol.Optional("automation_entity_id", default=None): vol.Any(None, cv.entity_id),
@@ -132,9 +151,11 @@ SCENARIO_FIELDS: dict[vol.Marker, Any] = {
     # Suggest mode: the labeled periods and the options, stored only when sent non-empty.
     vol.Optional("labels"): vol.All([LABEL_SCHEMA], vol.Length(max=MAX_LABELS)),
     vol.Optional("suggest_options"): _SUGGEST_OPTIONS,
+    # The helpers it replays with (a scenario opened from a suggestion that needs one, #42), stored only when sent non-empty.
+    vol.Optional("helpers"): HELPERS_SCHEMA,
 }
 
-_OPTIONAL_KEYS = ("track_shifts", "labels", "suggest_options")
+_OPTIONAL_KEYS = ("track_shifts", "labels", "suggest_options", "helpers")
 _BODY_KEYS = tuple(
     marker.schema for marker in SCENARIO_FIELDS if marker.schema not in _OPTIONAL_KEYS
 )

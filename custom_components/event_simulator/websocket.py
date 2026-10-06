@@ -37,6 +37,7 @@ from .packed import unpack_events
 from .runner import SandboxError
 from .store import (
     DATA_STORE,
+    HELPERS_SCHEMA,
     LABEL_SCHEMA,
     MAX_LABELS,
     SCENARIO_FIELDS,
@@ -252,10 +253,6 @@ def _aware_utc_iso(value: Any) -> str:
 
 # The sandbox's `traces` modes (sandbox/engine.py TRACE_MODES; the engine is child-only, so not imported here).
 TRACE_MODES = ("full", "summary", "none")
-# The sandbox's helper domains and cap (sandbox/helpers.py ENTITY_DOMAINS, MAX_HELPERS).
-HELPER_DOMAINS = ("trend", "derivative")
-MAX_HELPERS = 20
-
 # Only what the live side needs is checked here; the child validates the rest and answers with a structured error.
 SIMULATE_SCENARIO = vol.Schema(
     {
@@ -272,10 +269,7 @@ SIMULATE_SCENARIO = vol.Schema(
         # Calendar events by calendar (`event_simulator/calendar_events`), for calendar triggers; the child checks each event.
         vol.Optional("calendars"): dict,
         # Trend / Derivative helpers the sandbox sets up before the automation (`[{domain, entity_id, options, title?}]`, see sandbox/helpers.py); their states come back as `helper_states`. The child checks the options.
-        vol.Optional("helpers"): vol.All(
-            [vol.Schema({vol.Required("domain"): vol.In(HELPER_DOMAINS), vol.Required("entity_id"): cv.entity_id, vol.Required("options"): dict}, extra=vol.ALLOW_EXTRA)],
-            vol.Length(max=MAX_HELPERS),
-        ),
+        vol.Optional("helpers"): HELPERS_SCHEMA,
         # How much each run carries (the engine's TRACE_MODES): the panel needs `full`; a long validation can ask for `summary` or `none` to stay under the output cap.
         vol.Optional("traces"): vol.In(TRACE_MODES),
     },

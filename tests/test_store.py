@@ -348,3 +348,41 @@ def test_save_refuses_too_many_labels():
 def test_save_refuses_malformed_suggest_options(options: dict[str, Any]):
     with pytest.raises(vol.Invalid):
         _FIELDS({**SCENARIO, "suggest_options": options})
+
+
+HELPERS = [
+    {
+        "domain": "trend",
+        "entity_id": "binary_sensor.bathroom_humidity_rising",
+        "title": "Bathroom humidity rising",
+        "options": {"entity_id": "sensor.bathroom_humidity", "invert": False, "max_samples": 25, "min_gradient": 0.0111, "min_samples": 2, "sample_duration": 900},
+    }
+]
+
+
+async def test_helpers_round_trip(store: ScenarioStore, hass: HomeAssistant):
+    """The Trend / Derivative helpers a scenario opened from a suggestion replays with (#42, #43) are saved and loaded with it."""
+    saved = await store.async_save_scenario(_FIELDS({**SCENARIO, "helpers": HELPERS}))
+    assert store.get(saved["scenario_id"])["helpers"] == HELPERS
+
+    reopened = ScenarioStore(hass)
+    await reopened.async_load()
+    assert reopened.get(saved["scenario_id"])["helpers"] == HELPERS
+
+    plain = await store.async_save_scenario(_FIELDS({**SCENARIO, "helpers": []}))
+    assert "helpers" not in store.get(plain["scenario_id"])
+
+
+@pytest.mark.parametrize(
+    "helpers",
+    [
+        [{"domain": "statistics", "entity_id": "sensor.x", "options": {}}],
+        [{"domain": "trend", "entity_id": "not an entity", "options": {}}],
+        [{"domain": "trend", "entity_id": "binary_sensor.x"}],
+        [{"domain": "trend", "entity_id": "binary_sensor.x", "options": []}],
+        [HELPERS[0]] * 21,
+    ],
+)
+def test_save_refuses_malformed_helpers(helpers: list[Any]):
+    with pytest.raises(vol.Invalid):
+        _FIELDS({**SCENARIO, "helpers": helpers})
