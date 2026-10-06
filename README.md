@@ -73,6 +73,29 @@ The selected suggestion's fires show on a **Fires** row: green on an anchor, red
 
 **Save** the setup as a named scenario to come back to it: the automation config (edited or not) and the automation it came from, the window, the tracked entities and the timeline, edits included. Scenarios are kept in `.storage/event_simulator.scenarios`, up to 100 of them. Loading one puts it back on screen as saved; it does not re-read the recorder, so a scenario still replays after the history behind it has been purged.
 
+## Suggest mode
+
+Switch the panel to **Suggest** mode to have the simulator analyze your history and propose automation triggers and conditions. See the [Suggest design spec](docs/superpowers/specs/2026-10-05-suggestions-design.md) for details.
+
+**How it works.** Label periods in the history as should-fire or must-not-fire, then the simulator searches for trigger + condition combinations that match your labels. It generates candidates from state transitions, numeric thresholds, time-of-day, and sun events, then adds conditions (greedily) to remove unwanted fires. Top candidates are validated by replaying them in the sandbox so the stats are exact.
+
+**Understanding suggestion stats.** Each suggestion shows:
+
+- **anchors hit / total** — how many should-fire anchor times the automation fires within the tolerance window (default: 2 min before to 10 min after). Missed anchors link to the time so you can see the gap.
+- **no-fire violations** — fires inside labeled must-not-fire periods. Each is linked.
+- **outside fires** — fires in unlabeled time. If the candidate fires often where nothing is labeled, it is penalized.
+
+Click **Open in simulator** to load the suggestion into Replay mode on the same window and tracks, with your labels shown as an overlay row, so you can verify it by hand.
+
+**Limits.** Suggest mode is a deterministic search — no ML models, no randomness. Every suggestion is explainable from the stats shown. It works within the following constraints:
+
+- **No actions.** The simulator generates only triggers and conditions; the action is a placeholder (`logbook.log`) that you replace. Template triggers are not supported.
+- **No multi-entity "and" triggers.** Each candidate uses a single-entity trigger. Conditions across multiple entities are supported.
+- **Supported trigger platforms:** `state`, `numeric_state`, `time`, `sun`.
+- **Supported condition platforms:** `state`, `numeric_state`, `time` (after/before, weekday), `sun` (before/after).
+- **Window:** up to 30 days (vs 7 for replay mode), because patterns need repetition.
+- **Entities:** same 50-track limit as replay mode.
+
 ## How it works
 
 Each replay starts a child process with the same Python interpreter Home Assistant runs on, importing the same `homeassistant` package, so triggers, conditions, templates and script steps behave as they do live, version for version. The child boots a throwaway Home Assistant in a temporary config directory with no recorder, HTTP server, frontend or network-facing integrations, sets up only the automation under test, and deletes the directory when it is done. It gets a minimal environment, so tokens and credentials in the live process's environment do not reach it. It copies the live instance's time zone, location, elevation and unit system, any Labs preview features you have turned on, and a slice of the entity, device, area, floor and label registries — the entries the automation and its tracks can see — so `area_entities()`, `device_attr()` and similar templates, and device triggers of entity-domain integrations such as `binary_sensor` and `light`, resolve as they do live.
