@@ -8,7 +8,7 @@ Timeline of a replay (all virtual time, see `vclock.py`)
 --------------------------------------------------------
 1. `start - BOOT_LEAD`: a `HomeAssistant` boots on the virtual loop with a temporary config dir (deleted afterwards). The scenario's `registry` snapshot is written into that dir's `.storage` first, so the entity/device/area/floor/label registries load it through their own load path (config entries as disabled stubs, never set up); registered entities with no initial state get HA's own `unavailable` placeholder at start, as live HA gives entities whose integration did not load. It loads the base registries, sets up only the `homeassistant` and `labs` integrations (turning on the scenario's `core.preview_features`, so Labs-gated triggers and conditions validate as they do live), then runs `async_start`; the automation integration and whatever it pulls in (`trace`, `blueprint`, trigger/condition platforms) come later. No recorder, http, frontend or network-facing integrations, and `skip_pip` is on, so nothing is installed or fetched. `BOOT_LEAD` absorbs any timers boot waits on, so the window starts with everything settled.
 2. `start`: initial states are seeded with their recorded `last_changed` / `last_updated` (`StateMachine.async_set(..., timestamp=...)`; an attribute-only update is reproduced by a second write at `last_updated`); states without them are stamped `start`, the same clamp the recorder applies. The automation's own entity is the exception: its recorded state is not seeded but stored as its last state before boot, so it loads enabled or disabled (and with its `last_triggered`) as live HA restores it. Then the automation is checked for platforms the sandbox cannot run (custom integrations' triggers/conditions, integration-specific device automations -> `unsupported_automation`, naming each by config path), validated with HA's own automation schema (invalid -> structured `invalid_automation` error) and set up. It attaches after `async_start`, so a `homeassistant: start` trigger does not fire, and at `start` exactly, so a time trigger at the window start does.
-3. `[start, end)`: timeline events are written with `async_set` at their `at`; events at the same instant are written in list order. The optional `bus_events` (`[{at, event_type, data}]`, recorded events such as `zha_event` or `tag_scanned`) are fired on the bus at their `at` (`time_fired` set to it), after the state writes of the same instant, so event triggers replay and a condition reads the states of that instant. Home Assistant's own lifecycle and bookkeeping events (`state_changed`, `call_service`, `homeassistant_start`, ...) are refused: the sandbox's Home Assistant fires those itself. A recorded on/off of a replayed automation's own entity turns that automation on/off instead (`automation.turn_on` / `turn_off` semantics), so the entity's state, and every template reading it, is the sandbox's own. Every service call is intercepted at the `ServiceRegistry` (see `RecordingServiceRegistry`): recorded, answered with success (an empty response when one is asked for), and never executed, so recorded calls change no state.
+3. `[start, end)`: timeline events are written with `async_set` at their `at`; events at the same instant are written in list order. The optional `bus_events` (`[{at, event_type, data}]`, recorded events such as `zha_event` or `tag_scanned`) are fired on the bus at their `at` (`time_fired` set to it), after the state writes of the same instant, so event triggers replay and a condition reads the states of that instant. Home Assistant's own lifecycle and bookkeeping events (`state_changed`, `call_service`, `homeassistant_start`, ...) are refused: the sandbox's Home Assistant fires those itself. Calendar triggers ask a stub calendar per calendar entity for its events (see `_Replay._serve_calendars`): the scenario's optional `calendars` (`{entity_id: [{start, end, summary, description?, location?}]}`, the shape `calendar.get_events` answers with; see `calendars.py`), else the events the calendar's own recorded states name (a `calendar_from_states` warning, or `calendar_no_events` when there are none); the calendar's recorded states still replay as recorded. A recorded on/off of a replayed automation's own entity turns that automation on/off instead (`automation.turn_on` / `turn_off` semantics), so the entity's state, and every template reading it, is the sandbox's own. Every service call is intercepted at the `ServiceRegistry` (see `RecordingServiceRegistry`): recorded, answered with success (an empty response when one is asked for), and never executed, so recorded calls change no state.
 4. `end`: the automation's triggers are detached (`async_turn_off(stop_actions=False)`), so nothing new starts; the window is half-open and a run triggered at `end` itself is discarded. Runs already in flight (a `delay`, a `wait_for_trigger`, a queue) keep going for up to `overrun_seconds` of virtual time (default `DEFAULT_OVERRUN`, at most `MAX_OVERRUN`); a run still going at that bound is reported with outcome `unfinished` and a warning. Then HA is stopped.
 
 Runs that never let time move on
@@ -48,6 +48,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Home Assistant before voluptuous: from 2026.9 importing `homeassistant` aliases `voluptuous` to probatio, which then raises the validation errors. Imported the other way round, `vol` here is the real voluptuous, `vol.Invalid` misses them, and an invalid automation crashes the replay.
 from homeassistant import bootstrap, config_entries, loader
@@ -103,6 +104,7 @@ from homeassistant.util import slugify
 import voluptuous as vol  # noqa: I001 - after homeassistant, see above
 from voluptuous.humanize import humanize_error
 
+from . import calendars as calendar_events
 from .vclock import VirtualClock, patch_homeassistant_clock
 
 _LOGGER = logging.getLogger(__name__)
@@ -252,6 +254,9 @@ class _Scenario:
     traces: str = DEFAULT_TRACES
     time_limit: float = DEFAULT_TIME_LIMIT
     bus_events: list[_BusEvent] = field(default_factory=list)
+    # Every calendar the sandbox serves (see `_calendars`): entity_id -> its events, sorted by start.
+    calendars: dict[str, list[calendar_events.Event]] = field(default_factory=dict)
+    time_zone: Any = UTC
 
 
 def error_result(code: str, message: str, warnings: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -445,10 +450,82 @@ def _parse_scenario(raw: dict[str, Any]) -> _Scenario:
 
     registry = _parse_registry(raw.get("registry"), warnings)
     automations = _automations(items, multi, registry, warnings)
+    time_zone = _time_zone(core.get("time_zone"))
+    calendars = _calendars(raw.get("calendars"), items, initial_states, events, time_zone, warnings)
     for automation in automations:
         automation.own_initial = initial_states.pop(automation.entity_id, None)
 
-    return _Scenario(core, start, end, automations, initial_states, events, services, overrun, seed, preview_features, registry, warnings, multi, traces, time_limit, bus_events)
+    return _Scenario(
+        core, start, end, automations, initial_states, events, services, overrun, seed, preview_features, registry, warnings, multi, traces, time_limit, bus_events, calendars, time_zone
+    )
+
+
+def _time_zone(name: Any) -> Any:
+    """The scenario's time zone (UTC when it has none, or one Home Assistant will refuse anyway)."""
+    try:
+        return ZoneInfo(name) if isinstance(name, str) and name else UTC
+    except (ZoneInfoNotFoundError, ValueError):
+        return UTC
+
+
+def _calendars(
+    value: Any, items: list[Any], initial_states: dict[str, _InitialState], events: list[_Event], tz: Any, warnings: list[dict[str, Any]]
+) -> dict[str, list[calendar_events.Event]]:
+    """The calendars the sandbox serves to calendar triggers: those of the scenario's `calendars`, every calendar a calendar trigger names, and every calendar entity on the timeline.
+
+    A calendar not in `calendars` serves the events its recorded states name (`calendars.events_from_states`), a lower bound. A calendar trigger on a calendar served that way gets a `calendar_from_states` warning, and one on a calendar with no events at all a `calendar_no_events` warning: it attaches and never fires.
+    """
+    try:
+        given = calendar_events.parse_calendars(value, tz)
+    except ValueError as err:
+        raise ScenarioError("invalid_scenario", str(err)) from err
+    named = _calendar_trigger_entities(items)
+    attributes: dict[str, list[dict[str, Any]]] = {}
+    for entity_id, item in initial_states.items():
+        if entity_id.startswith("calendar."):
+            attributes.setdefault(entity_id, []).append(item.attributes)
+    for event in events:
+        if event.entity_id.startswith("calendar."):
+            attributes.setdefault(event.entity_id, []).append(event.attributes)
+    served = dict(given)
+    for entity_id in sorted(set(named) | set(attributes)):
+        if entity_id in served:
+            continue
+        served[entity_id] = calendar_events.events_from_states(attributes.get(entity_id, ()), tz)
+        if entity_id not in named:
+            continue
+        if served[entity_id]:
+            count = len(served[entity_id])
+            warnings.append(
+                _warning(
+                    "calendar_from_states",
+                    f"{entity_id}: no events given, so its {count} event{'' if count == 1 else 's'} come from its recorded states (the event each one names): "
+                    "events at the same time as another, or that it never showed as the next one, are missing",
+                )
+            )
+        else:
+            warnings.append(_warning("calendar_no_events", f"{entity_id}: no events given and none in its recorded states, so its calendar trigger never fires"))
+    return served
+
+
+def _calendar_trigger_entities(items: list[Any]) -> list[str]:
+    """The calendars the automations' calendar triggers name (`trigger: calendar`, and the target of `calendar.event_started` / `event_ended`)."""
+    found: list[str] = []
+    for config in items:
+        for _, node in _walk(config, ""):
+            platform = node.get("trigger", node.get("platform"))
+            if not isinstance(platform, str) or "condition" in node:
+                continue
+            if platform == "calendar":
+                named = node.get("entity_id")
+            elif platform.startswith("calendar."):
+                named = (node.get("target") or {}).get("entity_id") if isinstance(node.get("target"), dict) else None
+            else:
+                continue
+            for entity_id in named if isinstance(named, list) else [named]:
+                if isinstance(entity_id, str) and entity_id.startswith("calendar.") and valid_entity_id(entity_id) and entity_id not in found:
+                    found.append(entity_id)
+    return found
 
 
 def _parse_bus_events(value: Any, start: datetime, end: datetime, warnings: list[dict[str, Any]]) -> list[_BusEvent]:
@@ -789,6 +866,16 @@ class _Watchdog:
         raise _Overtime("Stopped by the replay's time limit")
 
 
+class _StubCalendars:
+    """What the calendar trigger reads from the calendar integration's entity component: the calendar entity of an entity id (see `_Replay._serve_calendars`)."""
+
+    def __init__(self, entities: dict[str, Any]) -> None:
+        self._entities = entities
+
+    def get_entity(self, entity_id: str) -> Any:
+        return self._entities.get(entity_id)
+
+
 class _LogCollector(logging.Handler):
     """Turns HA warnings/errors logged during the window into result warnings (capped)."""
 
@@ -859,6 +946,7 @@ class _Replay:
                     return error_result(err.code, str(err), self.warnings)
                 await self._sleep_until(self.scenario.start)
                 self._seed_states()
+                self._serve_calendars()
                 ha_logger.addHandler(collector)
                 try:
                     await self._load_automations()
@@ -1011,6 +1099,41 @@ class _Replay:
                 # Written twice so last_changed and last_updated both match the record: the state at last_changed, then an attribute update at last_updated.
                 states.async_set(entity_id, item.state, {_SEED_MARKER: True}, timestamp=last_changed.timestamp())
             states.async_set(entity_id, item.state, item.attributes, timestamp=last_updated.timestamp())
+
+    def _serve_calendars(self) -> None:
+        """Stand in for the calendar integration: each calendar the scenario serves (`_Scenario.calendars`) answers calendar triggers with its events.
+
+        Home Assistant's calendar trigger looks its calendar up in the calendar integration's entity component and asks it for the events of each 15-minute span ahead. That lookup gets a stub calendar entity per calendar, never added to the state machine, so the calendar's recorded states still replay as recorded and nothing the stub does writes one. The calendar integration itself (its HTTP views, frontend panel and services) is not set up.
+        """
+        if not self.scenario.calendars:
+            return
+        from homeassistant.components.calendar import CalendarEntity, CalendarEvent  # noqa: PLC0415 - only when there is a calendar to serve
+        from homeassistant.components.calendar.const import DATA_COMPONENT as CALENDAR_COMPONENT  # noqa: PLC0415
+
+        tz = self.scenario.time_zone
+
+        class _StubCalendar(CalendarEntity):
+            def __init__(self, entity_id: str, events: list[calendar_events.Event]) -> None:
+                self.entity_id = entity_id
+                self._events = events
+                self._ha_events = [
+                    CalendarEvent(event.start, event.end, event.summary, description=event.description, location=event.location) for event in events
+                ]
+
+            @property
+            def event(self) -> Any:
+                return None
+
+            async def async_get_events(self, hass: HomeAssistant, start_date: datetime, end_date: datetime) -> list[Any]:
+                return [self._ha_events[n] for n in calendar_events.active(self._events, start_date, end_date, tz)]
+
+        stubs = {}
+        for entity_id, events in self.scenario.calendars.items():
+            try:
+                stubs[entity_id] = _StubCalendar(entity_id, events)
+            except HomeAssistantError as err:
+                raise ScenarioError("invalid_scenario", f"calendars[{entity_id!r}]: {err}") from err
+        self.hass.data[CALENDAR_COMPONENT] = _StubCalendars(stubs)
 
     def _loaded(self) -> list[_Automation]:
         return [automation for automation in self.scenario.automations if automation.entity is not None]
