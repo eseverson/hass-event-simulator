@@ -238,7 +238,7 @@ test("outcomes classify", () => {
   assert.equal(classifyOutcome("FIRED"), "fired");
   assert.equal(classifyOutcome(undefined, { error: "x" }), "error");
   // every outcome sandbox/engine.py reports keeps its own name
-  for (const o of ["fired", "condition_failed", "dropped", "aborted", "cancelled", "error", "unfinished"]) assert.equal(classifyOutcome(o), o);
+  for (const o of ["fired", "condition_failed", "not_triggered", "dropped", "aborted", "cancelled", "error", "unfinished"]) assert.equal(classifyOutcome(o), o);
   assert.equal(classifyOutcome("weird"), "other");
   assert.equal(classifyOutcome(undefined), "other");
 });
@@ -262,6 +262,10 @@ test("an outcome reads as what happened, with why a run was dropped", () => {
   assert.equal(outcomeText(run("dropped", { stopped_by: "recursion" })), "Dropped as recursive");
   assert.equal(outcomeText(run("unfinished")), "Still running after the overrun");
   assert.equal(outcomeText(run("weird")), "Other (weird)");
+  // HA 2026.9's not-triggered traces: their own entry, the reason kept as stopped_by.
+  const nt = run("not_triggered", { stopped_by: "entity_value_not_numeric" });
+  assert.equal(outcomeText(nt), "Not triggered");
+  assert.equal(nt.stoppedBy, "entity_value_not_numeric");
 });
 
 test("the legend counts each outcome by name, in a fixed order", () => {

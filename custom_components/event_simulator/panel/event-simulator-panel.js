@@ -264,11 +264,13 @@ export function stateColor(state) {
 /* Every run outcome sandbox/engine.py reports, in legend order; `other` is only for a
  * value the panel does not know. Each has its own marker shape as well as color, so
  * they stay apart without color vision. */
-export const OUTCOMES = ["fired", "condition_failed", "aborted", "cancelled", "dropped", "unfinished", "error", "other"];
+export const OUTCOMES = ["fired", "condition_failed", "not_triggered", "aborted", "cancelled", "dropped", "unfinished", "error", "other"];
 
 export const OUTCOME_STYLE = {
   fired: { label: "Fired", color: "var(--success-color, #43a047)", shape: "dot" },
   condition_failed: { label: "Stopped by condition", color: "var(--warning-color, #ff9800)", shape: "ring" },
+  // HA 2026.9+: a trigger looked at a change and decided not to fire (stopped_by: why).
+  not_triggered: { label: "Not triggered", color: "#78909c", shape: "dash" },
   aborted: { label: "Aborted", color: "#c2185b", shape: "open-diamond" },
   cancelled: { label: "Cancelled", color: "#5c6bc0", shape: "cross" },
   dropped: { label: "Dropped", color: "#8d6e63", shape: "open-triangle" },
@@ -315,6 +317,8 @@ export function outcomeMarker(outcome, x, y, color = (OUTCOME_STYLE[outcome] || 
       return `<circle cx="${x}" cy="${y}" r="5" fill="${color}" class="marker"/>`;
     case "ring":
       return `<circle cx="${x}" cy="${y}" r="4.5" ${open} class="marker"/>`;
+    case "dash":
+      return `<path d="M${x - 5},${y}L${x + 5},${y}" fill="none" stroke="${color}" stroke-width="3" stroke-linecap="round" class="marker"/>`;
     case "diamond":
       return `<path d="M${x},${y - 6}L${x + 6},${y}L${x},${y + 6}L${x - 6},${y}Z" fill="${color}" class="marker"/>`;
     case "open-diamond":
@@ -4069,7 +4073,7 @@ class EventSimulatorPanel extends Base {
             <dt>Started</dt><dd class="mono">${esc(this._fullTime(run.started))}</dd>
             <dt>Duration</dt><dd>${run.finished > run.started ? esc(formatDuration(run.finished - run.started)) : "instant"}</dd>
             <dt>Trigger</dt><dd>${esc(describeTrigger(run.trigger)) || `<span class="muted">not reported</span>`}</dd>
-            ${run.stoppedBy ? `<dt>Stopped by</dt><dd class="mono">${esc(typeof run.stoppedBy === "string" ? run.stoppedBy : JSON.stringify(run.stoppedBy))}</dd>` : ""}
+            ${run.stoppedBy ? `<dt>${run.outcome === "not_triggered" ? "Why not" : "Stopped by"}</dt><dd class="mono">${esc(typeof run.stoppedBy === "string" ? run.stoppedBy : JSON.stringify(run.stoppedBy))}</dd>` : ""}
             ${run.error ? `<dt>Error</dt><dd class="err">${esc(typeof run.error === "string" ? run.error : JSON.stringify(run.error))}</dd>` : ""}
           </dl>
           <h3>Conditions</h3>
