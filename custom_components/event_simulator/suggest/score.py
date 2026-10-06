@@ -13,6 +13,7 @@ from .evaluate import Evaluator, Fire
 from .labels import Anchor, Labels
 from .model import (
     Candidate,
+    EntityTimeTrigger,
     NumericStateCondition,
     NumericStateTrigger,
     StateCondition,
@@ -156,6 +157,9 @@ def simplicity(candidate: Candidate) -> tuple[int, int, int, int]:
                     rough += clock_roundness(part.for_)
             case TimeTrigger():
                 rough += clock_roundness(part.at)
+            case EntityTimeTrigger():
+                # One more than a clock time as round: when a helper's time and a clock time fire alike (the helper never changed), the clock time reads simpler.
+                rough += clock_roundness(part.offset) + 1
             case TimeCondition():
                 rough += sum(clock_roundness(v) for v in (part.after, part.before) if v is not None)
             case SunTrigger():

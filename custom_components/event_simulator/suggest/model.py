@@ -94,6 +94,25 @@ class TimeTrigger:
         _check_weekdays(self.weekdays)
 
 
+TIME_ENTITY_DOMAINS = ("input_datetime", "sensor")
+
+
+@dataclass(frozen=True, slots=True)
+class EntityTimeTrigger:
+    """`trigger: time` at the time an entity holds, plus `offset` seconds (negative: before): an input_datetime (a date and time is one moment, a time alone is every day at it, a date alone is its local midnight) or a `device_class: timestamp` sensor. Home Assistant re-reads the time whenever the entity changes, so the time in effect is the one that counts.
+
+    Home Assistant 2026.2 and 2026.9 both take `at: <entity>` and `at: {entity_id, offset}`; 2026.9 also takes `device_class: uptime` sensors, which the miner leaves out.
+    """
+
+    entity_id: str
+    offset: float = 0
+    id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.entity_id.split(".", 1)[0] not in TIME_ENTITY_DOMAINS:
+            raise ValueError(f"a time trigger reads the time of an entity of {TIME_ENTITY_DOMAINS}")
+
+
 @dataclass(frozen=True, slots=True)
 class SunTrigger:
     """`trigger: sun` at sunrise or sunset plus `offset` seconds (negative: before)."""
@@ -185,7 +204,7 @@ class SunCondition:
                 raise ValueError(f"sun events are {SUN_EVENTS}")
 
 
-Trigger = StateTrigger | NumericStateTrigger | TimeTrigger | SunTrigger | EventTrigger
+Trigger = StateTrigger | NumericStateTrigger | TimeTrigger | EntityTimeTrigger | SunTrigger | EventTrigger
 Condition = StateCondition | NumericStateCondition | TimeCondition | SunCondition
 
 
@@ -205,7 +224,7 @@ class Candidate:
         return {
             part.entity_id
             for part in (*self.triggers, *self.conditions)
-            if isinstance(part, (StateTrigger, NumericStateTrigger, StateCondition, NumericStateCondition))
+            if isinstance(part, (StateTrigger, NumericStateTrigger, EntityTimeTrigger, StateCondition, NumericStateCondition))
         }
 
     @property
@@ -281,6 +300,13 @@ def render_trigger(trigger: Trigger) -> dict[str, Any]:
             out["at"] = format_time(trigger.at)
             if trigger.weekdays is not None:
                 out["weekday"] = list(trigger.weekdays)
+            return out
+        case EntityTimeTrigger():
+            out = {"trigger": "time"}
+            if trigger.id is not None:
+                out["id"] = trigger.id
+            # No offset: the plain entity id. Home Assistant 2026.2 reads `{entity_id}` without `offset` as a clock time and fails to attach it.
+            out["at"] = {"entity_id": trigger.entity_id, "offset": format_duration(trigger.offset)} if trigger.offset else trigger.entity_id
             return out
         case SunTrigger():
             out = {"trigger": "sun"}

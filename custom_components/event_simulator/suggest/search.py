@@ -10,10 +10,12 @@ How it searches (see docs/superpowers/specs/2026-10-05-suggestions-design.md):
    - `numeric_state`: `above` / `below`, the threshold searched over the full window's values. The behavior of a threshold only changes at observed values, so each gap between consecutive distinct values is one candidate, represented by its roundest number; gaps are scored by how many anchors a crossing hits and how often the value crosses elsewhere. `for:` as for state. And a state trigger with no from/to (every report, as blueprint controllers re-evaluate), with `to: null` too when some reports change attributes only, when the anchors line up with its writes (within `ALIGN` seconds, more often than chance: any chatty sensor has some write within the tolerance of every anchor). A numeric attribute that changes while the state stays put gets the same trigger on the attribute. Conditions at fire time (`numeric_state` above/below) then narrow it, the template-free form of "every report while it is warm".
    - `event`: for each type of recorded bus event (`zha_event`, `tag_scanned`, ...) with events near the anchors, the type alone and the `event_data` that picks out the anchored events: greedily, the `(key, value)` of the anchored events that removes the most other events of the type while keeping every anchor the trigger hits, from no data and from each value the anchored events share (a command, a button). Only scalar values are used, and no string Home Assistant's template rendering would read as another type ("1" becomes 1). A type is offered only when the anchors fall near its events more often than chance would.
    - `time` / `sun`: when the anchors cluster by local clock time, or by sunrise/sunset offset; whichever clusters more anchors with less spread wins. The time is chosen at or just before the cluster and rounded.
+   - `time` at an entity: for each input_datetime and `device_class: timestamp` sensor, the anchors' lag behind the time it holds around them (a moment, or for a time-only helper a time of day, circularly), clustered; the offset is chosen as a clock time is (at or just before, rounded, at most `MAX_ENTITY_OFFSET`). Offered when the anchors fall near its fires more often than chance (a sensor stamping its own reports meets any label).
    Triggers that hit fewer than `min_recall` of the best trigger's anchors are dropped before any condition search, and only the best `beam` go on.
    When no single trigger hits every anchor of a side, ORs of up to `max_triggers` triggers (possibly on different entities or of different kinds) join them: greedy set cover from each of the best `union_seeds` triggers, each step adding the trigger, searched again around the anchors still missed, that hits the most of them with the fewest bad fires. A trigger joins only as evidence, not chance: it hits the missed anchors more often than its fires would at random (binomial tail at `union_alpha`), and one fitted to a single moment (a clock time, a threshold, a `for:`) never joins for one anchor. The parts of an OR keep their side's trigger id, so a start/end pair stays a pair; each extra part costs as much simplicity as a condition.
 3. Conditions, greedily: from each trigger (or trigger pair), add the condition that removes the most bad fires (must-not first, then unlabeled within the labeled stretch, then beyond it) while keeping every anchor hit and every `while` period held, up to `max_conditions`, branching on the best `branch` choices at each step. Condition values come from the state at the anchor fires (and throughout `while` periods) against the state at the bad fires; numeric thresholds are the roundest number between the good and the bad values.
 4. Every candidate is scored exactly by the evaluator, deduplicated (candidates that fire at the same instants keep only the simplest), ranked by `score.rank_key` and `tie_break` (fewer options, fires closer to the anchors, fewer unlabeled fires overall) and cut to `top_k`.
+5. When the best suggestion still misses anchors or fires where it should not, one tracked numeric entity rising above another of the same unit (what only a template trigger expresses) is checked against the anchors; one that fits them better is named in the explanations (`Relation`), never generated.
 """
 
 from __future__ import annotations
@@ -28,13 +30,14 @@ from datetime import timedelta, tzinfo
 from statistics import median
 from typing import Any, Literal
 
-from .evaluate import Evaluator, Fire, SunEvents
+from .evaluate import Evaluator, Fire, SunEvents, entity_time
 from .labels import Anchor, Label, Labels, Tolerance
 from .model import (
     DAY,
     WEEKDAYS,
     Candidate,
     Condition,
+    EntityTimeTrigger,
     EventTrigger,
     NumericStateCondition,
     NumericStateTrigger,
@@ -61,6 +64,9 @@ MAX_SUN_OFFSET = 3 * 3600  # a sun trigger or condition further from the event r
 _MERGE = 60  # outside fires of several suggestions closer than this are one hint
 ALIGN = 5.0  # an any-change trigger is offered when anchors fall this close (seconds) to the entity's writes ...
 ALIGN_ALPHA = 0.05  # ... more often than chance would, at this level
+MAX_ENTITY_OFFSET = 7 * DAY  # the furthest a time trigger at an entity's time fires from that time
+RELATION_ENTITIES = 12  # numeric entities (with a unit) whose pairs are checked for a relation that needs a template trigger
+RELATION_RECALL = 0.8  # share of the anchors such a relation must hit
 # `event_data` keys in the order they are preferred when several pick out the same events (a device's id over its radio address).
 EVENT_KEYS = ("device_id", "entity_id", "tag_id", "device_ieee", "unique_id", "id", "command", "type", "subtype", "action", "event", "button")
 
@@ -304,6 +310,11 @@ def describe_trigger(trigger: Trigger) -> str:
             if trigger.weekdays:
                 text += f" on {_weekdays_text(trigger.weekdays)}"
             return text
+        case EntityTimeTrigger():
+            held = f"the time in {trigger.entity_id}"
+            if not trigger.offset:
+                return f"at {held}"
+            return f"{_duration_text(trigger.offset)} {'before' if trigger.offset < 0 else 'after'} {held}"
         case SunTrigger():
             return f"at {trigger.event}" if not trigger.offset else _sun_text(trigger.event, trigger.offset)
         case EventTrigger():
@@ -357,7 +368,7 @@ def _either(triggers: Sequence[Trigger]) -> str:
     after_clock = True
     for trigger in triggers:
         phrase = describe_trigger(trigger)
-        clock = isinstance(trigger, (TimeTrigger, SunTrigger))
+        clock = isinstance(trigger, (TimeTrigger, EntityTimeTrigger, SunTrigger))
         phrases.append(phrase if clock or not after_clock else f"when {phrase}")
         after_clock = clock
     return " or ".join(phrases)
@@ -381,8 +392,29 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
-def explain(candidate: Candidate, stats: Stats, anchor_words: str) -> str:
-    """`describe` plus how it did: "...; hits 4/4 marked starts, fires 2 other times"."""
+@dataclass(frozen=True, slots=True)
+class Relation:
+    """One tracked numeric entity rising above another (`rising` > `over`): what a template trigger would say, and how it does on the labels."""
+
+    rising: str
+    over: str
+    anchors_hit: int
+    violations: int  # fires in must-not periods
+    outside_nearby: int  # unlabeled fires within the labeled stretch
+
+    def beats(self, stats: Stats) -> bool:
+        """Whether a suggestion that misses anchors, fires in must-not periods or fires unlabeled within the labeled stretch would do better as this relation."""
+        if not (stats.missed or stats.no_fire_violations or stats.outside_nearby):
+            return False
+        return (-self.anchors_hit, self.violations, self.outside_nearby) < (-stats.anchors_hit, len(stats.no_fire_violations), stats.outside_nearby)
+
+    @property
+    def note(self) -> str:
+        return f"The labeled moments line up with {self.rising} rising above {self.over}; that needs a template trigger"
+
+
+def explain(candidate: Candidate, stats: Stats, anchor_words: str, relation: Relation | None = None) -> str:
+    """`describe` plus how it did: "...; hits 4/4 marked starts, fires 2 other times". With a `relation` the labels follow better than this candidate, a sentence saying a template trigger would be needed."""
     text = f"{describe(candidate)}; hits {stats.anchors_hit}/{stats.anchors_total} {anchor_words}"
     if stats.no_fire_violations:
         text += f", fires {_plural(len(stats.no_fire_violations), 'time')} in must-not periods"
@@ -390,6 +422,8 @@ def explain(candidate: Candidate, stats: Stats, anchor_words: str) -> str:
         text += f", fires {len(stats.outside_fires)} other {'time' if len(stats.outside_fires) == 1 else 'times'}"
     if stats.while_total:
         text += f", holds throughout {stats.while_held}/{stats.while_total} while periods"
+    if relation is not None and relation.beats(stats):
+        text += f". {relation.note}."
     return text
 
 
@@ -612,6 +646,43 @@ def clock_triggers(
     return found
 
 
+def _anchor_cluster(lags: Sequence[tuple[float, int]], width: float) -> list[tuple[float, int]]:
+    """Of `(lag, anchor index)` pairs, the run of lags within `width` of each other covering the most distinct anchors (smallest spread among equals)."""
+    ordered = sorted(lags)
+    best: list[tuple[float, int]] = []
+    best_key: tuple[int, float] = (0, 0.0)
+    lo = 0
+    for hi in range(len(ordered)):
+        while ordered[hi][0] - ordered[lo][0] > width:
+            lo += 1
+        window = ordered[lo : hi + 1]
+        key = (len({n for _, n in window}), window[0][0] - window[-1][0])
+        if key > best_key:
+            best, best_key = window, key
+    return best
+
+
+def _relation_crossings(a: StepFunction, b: StepFunction, lo: float, hi: float) -> tuple[list[float], list[float]]:
+    """When `a` rises above `b`, and when `b` rises above `a`, in `(lo, hi)`: the moments a template trigger on `a > b` (or `b > a`) turns true, at the writes of either. Not comparable (a value missing or not a number) resets; a relation already true at `lo` has not risen."""
+    va, vb = a.numeric_values(), b.numeric_values()
+    writes = sorted({a.times[i] for i in a.write_range(lo, hi)} | {b.times[i] for i in b.write_range(lo, hi)})
+    a_up: list[float] = []
+    b_up: list[float] = []
+    previous: int | None = None
+    for n, t in enumerate((lo, *(t for t in writes if t > lo))):
+        i, j = a.index_at(t), b.index_at(t)
+        x = va[i] if i >= 0 else None
+        y = vb[j] if j >= 0 else None
+        state = (x > y) - (x < y) if isinstance(x, float) and isinstance(y, float) else None
+        if n and previous is not None and state is not None and state != previous:
+            if state == 1:
+                a_up.append(t)
+            elif state == -1:
+                b_up.append(t)
+        previous = state
+    return a_up, b_up
+
+
 def _sun_offset(evaluator: Evaluator, t: float, index: int) -> float | None:
     """`t` minus the nearest sunrise (index 0) or sunset (1), over the local day before, of and after `t`."""
     day = evaluator.local(t).date()
@@ -724,6 +795,7 @@ class _Search:
         self._crossing_cache: dict[tuple[str, str], _Crossings] = {}
         self._while_cache: dict[Condition, bool] = {}
         self._entries: dict[tuple[str, str | None], Counter[Any]] = {}
+        self._held: dict[str, list[tuple[str, Any] | None]] = {}
         self._unlabeled = labels.unlabeled_intervals(timeline.start, timeline.end)
         lo, hi = labels.span or (0.0, 0.0)
         self._unlabeled_near = [(max(a, lo), min(b, hi)) for a, b in self._unlabeled if a < hi and b > lo]
@@ -778,6 +850,7 @@ class _Search:
             else:
                 found |= self._state_triggers(entity_id, anchors, trigger_id, min_hits)
         found |= self._event_triggers(anchors, trigger_id, min_hits)
+        found |= self._entity_time_triggers(anchors, trigger_id, min_hits)
         found.update(clock_triggers(self.ev, self.labels, anchors, trigger_id, min_hits))
         return found
 
@@ -845,6 +918,102 @@ class _Search:
                         best[key] = (order, candidate)
             found.update(candidate for _, candidate in best.values())
         return found
+
+    def held_times(self, entity_id: str) -> list[tuple[str, Any] | None]:
+        """The time each entry of an entity holds for a time trigger at it (`evaluate.entity_time`), computed once."""
+        if (found := self._held.get(entity_id)) is None:
+            step = self.timeline[entity_id]
+            found = self._held[entity_id] = [entity_time(entity_id, step.states[i], step.attributes[i]) for i in range(len(step))]
+        return found
+
+    def _entity_time_triggers(self, anchors: Sequence[Anchor], tid: str | None, min_hits: int) -> set[Trigger]:
+        """Time triggers at the time an input_datetime or a timestamp sensor holds, plus an offset: when the anchors lie a constant offset from the time in effect around them (a moment, or a time of day for a time-only helper), more often than chance would."""
+        found: set[Trigger] = set()
+        before, after = self.tolerance.before, self.tolerance.after
+        span = max(self.timeline.end - self.timeline.start, 1.0)
+        for entity_id in self.timeline.entity_ids:
+            domain = entity_id.split(".", 1)[0]
+            step = self.timeline[entity_id]
+            if domain == "sensor":
+                # The device class is static: a look at the first and last entries spares reading a chatty sensor's every state.
+                if not any(step.attributes[i].get("device_class") == "timestamp" for i in {0, len(step) - 1} if len(step)):
+                    continue
+            elif domain != "input_datetime":
+                continue
+            held = self.held_times(entity_id)
+            if not any(held):
+                continue
+            lags: list[tuple[float, int]] = []
+            for n, anchor in enumerate(anchors):
+                for i in range(max(step.index_at(anchor.at - before), 0), step.index_at(anchor.at + after) + 1):
+                    if (value := held[i]) is None:
+                        continue
+                    if value[0] == "daily":
+                        clock = self._local_clock(anchor.at)[0]
+                        lag = (clock - value[1] + DAY / 2) % DAY - DAY / 2
+                    else:
+                        lag = anchor.at - self.ev.entity_moment(value, 0)
+                    if abs(lag) <= MAX_ENTITY_OFFSET:
+                        lags.append((lag, n))
+            cluster = _anchor_cluster(lags, before + after)
+            if len({n for _, n in cluster}) < min_hits:
+                continue
+            offset = _pick_moment(sorted(lag for lag, _ in cluster), self.tolerance)
+            if offset is None:
+                continue
+            trigger = EntityTimeTrigger(entity_id, offset=offset, id=tid)
+            fires = self.ev.trigger_fires(trigger)
+            hits = self._anchors_hit(fires, anchors)
+            chance = min(1.0, len(fires) * (before + after) / span)
+            if hits >= min_hits and _binomial_tail(len(anchors), hits, chance) <= ALIGN_ALPHA:
+                found.add(trigger)
+        return found
+
+    def relation(self, anchors: Sequence[Anchor]) -> Relation | None:
+        """The best "one sensor rises above another" among the tracked numeric entities that share a unit, when the anchors follow it (at least `RELATION_RECALL` of them, more often than chance): what only a template trigger could express."""
+        if len(anchors) < 2:
+            return None
+        by_unit: dict[str, list[str]] = defaultdict(list)
+        for entity_id in self.timeline.entity_ids:
+            step = self.timeline[entity_id]
+            unit = step.attributes[-1].get("unit_of_measurement") if len(step) else None
+            if unit and self.is_numeric(entity_id):
+                by_unit[str(unit)].append(entity_id)
+        entities = [e for group in by_unit.values() if len(group) > 1 for e in group][:RELATION_ENTITIES]
+        before, after = self.tolerance.before, self.tolerance.after
+        span = max(self.timeline.end - self.timeline.start, 1.0)
+        needed = max(2, math.ceil(len(anchors) * RELATION_RECALL))
+        best: tuple[tuple[Any, ...], Relation] | None = None
+        for group in by_unit.values():
+            members = [e for e in group if e in entities]
+            for k, a in enumerate(members):
+                for b in members[k + 1 :]:
+                    sa, sb = self.timeline[a], self.timeline[b]
+                    # Around the anchors first (cheap), the whole window only for a pair crossing near enough of them.
+                    near = [0, 0]
+                    for anchor in anchors:
+                        for side, found in enumerate(_relation_crossings(sa, sb, anchor.at - before, anchor.at + after + 1e-6)):
+                            near[side] += bool(found)
+                    if max(near) < needed:
+                        continue
+                    whole = _relation_crossings(sa, sb, self.timeline.start, self.timeline.end)
+                    for rising, over, fires in zip((a, b), (b, a), whole, strict=True):
+                        hits = self._anchors_hit(fires, anchors)
+                        if hits < needed or _binomial_tail(len(anchors), hits, min(1.0, len(fires) * (before + after) / span)) > ALIGN_ALPHA:
+                            continue
+                        kinds = [self.labels.classify(t) for t in fires]
+                        matched = {anchor for t in fires for anchor in self.labels.anchors_matching(t)}
+                        relation = Relation(
+                            rising,
+                            over,
+                            len(matched),
+                            kinds.count("no_fire"),
+                            sum(kind == "unlabeled" and self.labels.in_span(t) for kind, t in zip(kinds, fires, strict=True)),
+                        )
+                        key = (-relation.anchors_hit, relation.violations, relation.outside_nearby, rising, over)
+                        if best is None or key < best[0]:
+                            best = (key, relation)
+        return None if best is None else best[1]
 
     def _state_triggers(self, entity_id: str, anchors: Sequence[Anchor], tid: str | None, min_hits: int) -> set[Trigger]:
         step = self.timeline[entity_id]
@@ -1059,7 +1228,7 @@ class _Search:
     def _evidence(self, trigger: Trigger, part: _Part, new: Iterable[int], missed: int) -> bool:
         """Whether a trigger hitting the `new` anchors (of `missed` ones) is evidence, not chance. What counts is the moments it fires at (one fire near a burst of labels is one moment): one fitted to a single moment (a clock time, a threshold, a `for:`) never is evidence, and anything else must fire near more of them than its fires would at random (binomial tail at `union_alpha`). An any-change trigger on a chatty sensor fires near every anchor, so for it the anchors landing on its reports (within `ALIGN`) count instead."""
         moments = len({part.nearest[n] for n in new})
-        fitted = isinstance(trigger, (TimeTrigger, SunTrigger, NumericStateTrigger)) or bool(getattr(trigger, "for_", 0))
+        fitted = isinstance(trigger, (TimeTrigger, EntityTimeTrigger, SunTrigger, NumericStateTrigger)) or bool(getattr(trigger, "for_", 0))
         if fitted and moments < 2:
             return False
         alpha = self.options.union_alpha
@@ -1461,6 +1630,7 @@ def _hints(search: _Search, anchors: Sequence[Anchor], suggestions: Sequence[Sug
 class SearchContext:
     search: _Search
     anchor_words: str  # how explanations name the anchors ("marked starts", ...)
+    relation: Relation | None = None  # what the labels follow that only a template trigger could express
 
 
 def suggest(
@@ -1530,12 +1700,17 @@ def suggest(
         words = "marked ends"
     else:
         words = "marked starts and ends"
+    # Only when the best suggestion still misses (a cheap check, only then): a relation between two sensors the labels follow, which no single-entity trigger expresses.
+    relation = None
+    if kept and not paired and (kept[0].stats.missed or kept[0].stats.no_fire_violations or kept[0].stats.outside_nearby):
+        check()
+        relation = search.relation(anchors)
     suggestions = []
     for rank, item in enumerate(kept):
-        explanation = explain(item.candidate, item.stats, words)
+        explanation = explain(item.candidate, item.stats, words, relation)
         alias = f"Suggested: {describe(item.candidate)[:80]}"
         config = render_automation(item.candidate, alias=alias, description=explanation)
         suggestions.append(Suggestion(rank, item.candidate, item.stats, config, explanation))
     return SuggestResult(
-        suggestions, _hints(search, anchors, suggestions), search.evaluated, context=SearchContext(search, words)
+        suggestions, _hints(search, anchors, suggestions), search.evaluated, context=SearchContext(search, words, relation)
     )

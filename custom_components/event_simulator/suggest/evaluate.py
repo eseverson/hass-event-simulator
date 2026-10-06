@@ -5,6 +5,7 @@ The miner scores thousands of candidates, so this re-implements the trigger and 
 - state: a write fires when the from/to options match the old/new value; with no from/to option every write fires (attribute-only ones too); with `attribute`, only writes that change that attribute count. `for:` starts a timer that a later write of the entity cancels unless the value still equals the new value (or, from-only, still differs from the old one).
 - numeric_state: fires on crossing into the range, not while staying in it. The entity is armed while out of range; `unavailable` / `unknown` / a missing attribute count as out of range, while any other non-number is an error that neither arms nor disarms (and cancels a pending `for:`). An entity in range when the automation attaches is not armed.
 - time: fires at the local wall time each day, DST-correct: on a fall-back day an ambiguous time fires twice, on a spring-forward day a skipped time does not fire.
+- time at an entity (`at: input_datetime.x`, a timestamp sensor, optionally `offset`): every write of the entity re-arms it at the time the new state holds plus the offset. An input_datetime with a date (local midnight without a time) adds the offset to the local wall time and arms when that is now or later; one with only a time fires every day at that time plus the offset, wrapped around midnight; a `device_class: timestamp` sensor arms when its time plus the offset is strictly later than now. A state without a time (unknown, unavailable, a sensor without the device class, a timestamp without a zone) arms nothing.
 - sun: fires at every `sun_events(date)[event] + offset`.
 - event: fires at every bus event of its type whose data holds each of its `(key, value)` pairs, compared as they are (the event trigger's items comparison).
 - conditions read the state at the fire time; errors (unknown entity, non-numeric value) fail the condition, as a condition error stops the run in Home Assistant.
@@ -15,7 +16,8 @@ Where this knowingly differs from Home Assistant (the sandbox is the exact answe
 - Time-change triggers fire exactly on the second; Home Assistant adds a 50-500 ms random offset.
 - Every fire counts as a run. The automation's `mode` only matters while an action runs, and the placeholder action finishes at once; two triggers firing at the same instant count twice.
 - The automation attaches at the window start, after the initial states are seeded (as the sandbox does); fires and `for:` timers due at or after the window end do not count.
-- Not represented: templates, `value_template`, entity-valued options (`at: input_datetime.x`, `above: sensor.y`, a state condition's `state: input_select.x`), several entities in one trigger.
+- An entity's time due at the instant of its next write does not fire (that write re-arms it); Home Assistant compares an input_datetime's time with now on the local wall clock, which differs in the repeated hour of a fall-back day.
+- Not represented: templates, `value_template`, other entity-valued options (`above: sensor.y`, a time condition's `after: input_datetime.x`, a state condition's `state: input_select.x`), several entities in one trigger.
 - Sun: `sun_events(date)` must return what `homeassistant.helpers.sun.get_astral_event_date(hass, event, date)` does (aware datetimes, None on a polar day); where Home Assistant's sun condition errors on a missing event, this returns False.
 - `holds_throughout` samples conditions at their breakpoints; a time boundary inside a skipped DST hour lands within that hour, not exactly at the gap.
 """
@@ -32,6 +34,7 @@ from .model import (
     WEEKDAYS,
     Candidate,
     Condition,
+    EntityTimeTrigger,
     EventTrigger,
     NumericStateCondition,
     NumericStateTrigger,
@@ -43,13 +46,35 @@ from .model import (
     TimeTrigger,
     Trigger,
 )
-from .timeline import NON_NUMERIC, StepFunction, Timeline
+from .timeline import NON_NUMERIC, UNAVAILABLE_STATES, StepFunction, Timeline
 
 SunEvents = Callable[[date], Mapping[str, datetime | None]]
 
 # Breakpoints are sampled again just after, for boundaries that are strict on the left (`for:`, sun offsets).
 _EPSILON = 0.001
 _LAST_INSTANT_OF_DAY = DAY - 1e-6  # 23:59:59.999999, the time condition's default `before`
+
+
+def entity_time(entity_id: str, state: str, attributes: Mapping[str, Any]) -> tuple[str, Any] | None:
+    """The time a state holds for a time trigger at its entity, as Home Assistant's time trigger reads it: `("wall", naive local datetime)` (an input_datetime with a date), `("daily", seconds since midnight)` (one with only a time), `("instant", POSIX seconds)` (a timestamp sensor), or None."""
+    domain = entity_id.split(".", 1)[0]
+    if domain == "input_datetime":
+        try:
+            has_date, has_time = attributes["has_date"], attributes["has_time"]
+            hour, minute, second = (attributes["hour"], attributes["minute"], attributes["second"]) if has_time else (0, 0, 0)
+            if has_date:
+                return "wall", datetime(attributes["year"], attributes["month"], attributes["day"], hour, minute, second)
+        except (KeyError, TypeError, ValueError):
+            return None  # Home Assistant's trigger raises on the missing attribute and arms nothing
+        return ("daily", hour * 3600 + minute * 60 + second) if has_time else None
+    if domain != "sensor" or attributes.get("device_class") != "timestamp" or state in UNAVAILABLE_STATES:
+        return None
+    try:
+        parsed = datetime.fromisoformat(state)
+    except ValueError:
+        return None
+    # A naive timestamp cannot be compared with now: Home Assistant's trigger raises and arms nothing.
+    return None if parsed.tzinfo is None else ("instant", parsed.timestamp())
 
 
 class Fire(NamedTuple):
@@ -133,6 +158,8 @@ class Evaluator:
                 fires = self._numeric_fires(trigger)
             case TimeTrigger():
                 fires = self._time_fires(trigger)
+            case EntityTimeTrigger():
+                fires = self._entity_time_fires(trigger)
             case SunTrigger():
                 fires = self._sun_fires(trigger)
             case EventTrigger():
@@ -220,6 +247,36 @@ class Evaluator:
         if trigger.weekdays is not None:
             fires = [t for t in fires if WEEKDAYS[self.local(t).weekday()] in trigger.weekdays]
         return fires
+
+    def entity_moment(self, held: tuple[str, Any], offset: float) -> float | None:
+        """When a held `("wall", ...)` or `("instant", ...)` time plus `offset` is, as POSIX seconds (None for a daily time)."""
+        kind, value = held
+        if kind == "instant":
+            return value + offset
+        if kind == "wall":
+            # Home Assistant adds the offset to the aware local datetime: wall-clock arithmetic, so 24 h after noon is noon the next day across a DST change.
+            return (value + timedelta(seconds=offset)).replace(tzinfo=self.tz).timestamp()
+        return None
+
+    def _entity_time_fires(self, trigger: EntityTimeTrigger) -> list[float]:
+        step = self.timeline.get(trigger.entity_id)
+        if step is None:
+            return []
+        found: set[float] = set()
+        times = step.times
+        for i in range(len(step)):
+            lo = max(times[i], self.start)
+            hi = min(times[i + 1] if i + 1 < len(times) else self.end, self.end)
+            if hi <= lo or (held := entity_time(trigger.entity_id, step.states[i], step.attributes[i])) is None:
+                continue
+            if held[0] == "daily":
+                found.update(self.local_instants((held[1] + trigger.offset) % DAY, lo, hi))
+                continue
+            at = self.entity_moment(held, trigger.offset)
+            # An input_datetime arms a time that is now or later, a sensor only a later one.
+            if at is not None and (at >= lo if held[0] == "wall" else at > lo) and at < hi:
+                found.add(at)
+        return sorted(found)
 
     def _sun_fires(self, trigger: SunTrigger) -> list[float]:
         index = 0 if trigger.event == "sunrise" else 1

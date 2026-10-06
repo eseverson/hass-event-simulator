@@ -5,6 +5,7 @@ The synthetic-rule tests build timelines from a known generating rule and check 
 
 from __future__ import annotations
 
+import math
 import random
 import time
 from datetime import UTC, date, datetime, timedelta
@@ -16,6 +17,7 @@ from custom_components.event_simulator.suggest.evaluate import Evaluator
 from custom_components.event_simulator.suggest.labels import Label, Labels, Tolerance
 from custom_components.event_simulator.suggest.model import (
     Candidate,
+    EntityTimeTrigger,
     EventTrigger,
     NumericStateTrigger,
     StateCondition,
@@ -661,8 +663,11 @@ async def test_every_suggestion_passes_home_assistant_validation(hass: HomeAssis
     rng = random.Random(34)  # any change of a numeric attribute
     reports = [(at, "climate.x", "heat", {"current_temperature": value}) for at, _, value in wandering(rng, "climate.x", 1)]
     configs += [s.config for s in run(timeline({"climate.x": "heat"}, reports, 1), Labels([fire(at) for at, *_ in reports[1:10]])).suggestions]
+    tl, anchors = boot_dryer(random.Random(38))  # time at a helper plus an offset
+    configs += [s.config for s in run(tl, Labels([fire(at) for at in anchors[:3]])).suggestions]
     assert any(len(c["triggers"]) > 1 for c in configs)
     assert any(c["triggers"][0].get("attribute") and "to" not in c["triggers"][0] for c in configs)
+    assert any(isinstance(c["triggers"][0].get("at"), dict) for c in configs)
     assert len(configs) > 10
     for n, config in enumerate(configs):
         validated = await async_validate_config_item(hass, f"suggested_{n}", config)
@@ -939,3 +944,136 @@ def test_of_event_data_picking_out_the_same_events_the_device_key_stays():
     tl = with_bus(timeline({}, [], days), bus)
     result = run(tl, Labels([fire(at) for at in learned[:3]]))
     assert top(result).candidate.triggers == (EventTrigger("zha_event", (("device_id", "dev-cc"),)),), top(result).explanation
+
+
+# Time triggers at an entity's time (#38)
+
+DRYER = "input_datetime.boot_dryer_start_time"
+
+
+def helper_state(at, *, date=True, time=True):
+    """An input_datetime holding `at` seconds after T0 (UTC), as Home Assistant's state and attributes spell it."""
+    local = datetime.fromtimestamp(T0 + at, UTC)
+    attributes = {"has_date": date, "has_time": time}
+    if date:
+        attributes |= {"year": local.year, "month": local.month, "day": local.day}
+    if time:
+        attributes |= {"hour": local.hour, "minute": local.minute, "second": local.second}
+    state = " ".join(part for part, wanted in ((local.strftime("%Y-%m-%d"), date), (local.strftime("%H:%M:%S"), time)) if wanted)
+    return state, attributes
+
+
+def with_states(tl, initial, changes):
+    """`tl` plus entities whose states carry attributes: `initial` {entity_id: (state, attributes)}, `changes` [(at, entity_id, state, attributes)]."""
+    events = [{"at": datetime.fromtimestamp(T0 + at, UTC).isoformat(), "entity_id": e, "state": st, "attributes": a} for at, e, st, a in changes]
+    extra = Timeline.from_scenario({e: {"state": st, "attributes": a} for e, (st, a) in initial.items()}, events, tl.start, tl.end)
+    return Timeline(tl.start, tl.end, {**tl._entities, **extra._entities}, tl._bus)  # noqa: SLF001
+
+
+def boot_dryer(rng, days=14):
+    """The user's boot dryer: started at a random time every few days (the helper records when), turned off 24 h later.
+
+    The real automation is a template (`now() >= start + 24 h`); its template-free form is a time trigger at the helper plus 24 h. The dryer's own switch turns on at the start, so its changes are the action's effects, not the cause.
+    """
+    initial, changes = distractors(rng, days)
+    tl = timeline({**initial, "switch.boot_dryer": "off"}, changes, days)
+    helper = {DRYER: helper_state(-30 * D)}
+    writes = []
+    anchors = []
+    day = 0.0
+    while True:
+        start = float(round(day * D + rng.uniform(7 * H, 21 * H)))  # the helper holds whole seconds
+        if start + D >= days * D:
+            break
+        writes.append((start, DRYER, *helper_state(start)))
+        anchors.append(start + D)
+        day += rng.choice((2, 3))
+    # The dryer switch is noise here (the real one turns off at the labels, the action's own effect, which the user would not track).
+    switch = [(t, "switch.boot_dryer", "on", {}) for t, *_ in writes] + [(t + 2 * H, "switch.boot_dryer", "off", {}) for t, *_ in writes]
+    return with_states(tl, helper, writes + switch), anchors
+
+
+def test_recovers_a_time_trigger_at_a_helper_plus_an_offset():
+    tl, anchors = boot_dryer(random.Random(38))
+    assert len(anchors) >= 4
+    result = run(tl, Labels([fire(at) for at in anchors[:3]]))
+    best = top(result)
+    assert best.candidate.triggers == (EntityTimeTrigger(DRYER, offset=D),), best.explanation
+    assert best.config["triggers"] == [{"trigger": "time", "at": {"entity_id": DRYER, "offset": "24:00:00"}}]
+    assert list(best.stats.fire_times) == [T0 + at for at in anchors]
+    assert best.explanation.startswith(f"Fires 24 h after the time in {DRYER};"), best.explanation
+
+
+def test_a_time_only_helper_with_an_offset():
+    """Coffee 15 minutes before the alarm, whose time changes every few days: no clock time hits every morning."""
+    rng = random.Random(39)
+    days = 10
+    initial, changes = distractors(rng, days)
+    tl = timeline(initial, changes, days)
+    alarm = "input_datetime.alarm"
+    clock = 6.5 * H
+    helper = {alarm: helper_state(clock, date=False)}
+    writes, anchors = [], []
+    for day in range(days):
+        if day and day % 3 == 0:
+            clock = rng.choice((5.75, 6, 6.25, 7, 7.5)) * H
+            writes.append((day * D + 2 * H, alarm, *helper_state(clock, date=False)))
+        anchors.append(day * D + clock - 15 * M)
+    tl = with_states(tl, helper, writes)
+    best = top(run(tl, Labels([fire(at) for at in anchors[:7]])))
+    assert best.candidate.triggers == (EntityTimeTrigger(alarm, offset=-15 * M),), best.explanation
+    assert list(best.stats.fire_times) == [T0 + at for at in anchors]
+    assert "15 min before the time in input_datetime.alarm" in best.explanation
+
+
+def test_a_chatty_timestamp_sensor_meeting_labels_by_chance_is_not_suggested():
+    """A sensor stamping its own last report every 5 minutes has some time within reach of any label: no evidence."""
+    rng = random.Random(40)
+    days = 3
+    initial, changes = distractors(rng, days)
+    tl = timeline(initial, changes, days)
+    seen = "sensor.phone_last_update"
+    stamp = {"device_class": "timestamp"}
+    reports = [(at, seen, datetime.fromtimestamp(T0 + at - 20, UTC).isoformat(), stamp) for at in range(300, days * D, 300)]
+    tl = with_states(tl, {seen: (datetime.fromtimestamp(T0, UTC).isoformat(), stamp)}, reports)
+    result = run(tl, Labels([fire(rng.uniform(0, days * D)) for _ in range(4)]))
+    assert not any(isinstance(t, EntityTimeTrigger) for s in result.suggestions for t in s.candidate.triggers)
+
+
+# Saying when a template would be needed (#38)
+
+INDOOR_T, OUTDOOR_T = "sensor.living_room_temperature", "sensor.outdoor_temperature_2"
+
+
+def test_labels_at_one_sensor_rising_above_another_name_the_template_it_needs():
+    """Open the windows when it gets warmer inside than outside: both drift, so no threshold on either is the moment."""
+    rng = random.Random(41)
+    days = 4
+    unit = {"unit_of_measurement": "°C"}
+    changes = []
+    inside, outside = 21.0, 15.0
+    phase = rng.uniform(0, D)
+    anchors = []
+    previous = None
+    for at in range(300, days * D, 300):
+        inside = round(inside + rng.uniform(-0.15, 0.15), 2)
+        outside = round(18 + 7 * math.sin(2 * math.pi * (at - phase) / D) + rng.uniform(-0.2, 0.2), 2)
+        changes += [(at, INDOOR_T, str(inside), unit), (at + 1, OUTDOOR_T, str(outside), unit)]
+        warmer = inside > outside
+        if previous is False and warmer:
+            anchors.append(at + 1)
+        previous = warmer
+    assert len(anchors) >= 3
+    tl = with_states(timeline({}, [], days), {INDOOR_T: ("21.0", unit), OUTDOOR_T: ("15.0", unit)}, changes)
+    result = run(tl, Labels([fire(at) for at in anchors]))
+    note = f"The labeled moments line up with {INDOOR_T} rising above {OUTDOOR_T}; that needs a template trigger"
+    assert note in top(result).explanation, top(result).explanation
+    assert top(result).config["description"] == top(result).explanation
+    # The note says what is needed: it is not a suggestion of its own.
+    assert not any("template" in str(s.config["triggers"]) for s in result.suggestions)
+
+
+def test_no_template_note_when_a_suggestion_already_fits():
+    tl, anchors = boot_dryer(random.Random(38))
+    result = run(tl, Labels([fire(at) for at in anchors[:3]]))
+    assert "template" not in top(result).explanation

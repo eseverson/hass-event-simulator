@@ -10,6 +10,7 @@ from homeassistant.core import HomeAssistant
 
 from custom_components.event_simulator.suggest.model import (
     Candidate,
+    EntityTimeTrigger,
     EventTrigger,
     NumericStateCondition,
     NumericStateTrigger,
@@ -122,6 +123,21 @@ def test_conditions_render():
     }
 
 
+def test_entity_time_trigger_renders_the_entity_alone_or_with_its_offset():
+    # Without an offset, the plain entity id: Home Assistant 2026.2 takes `{entity_id}` without `offset` for a clock time and fails to attach it.
+    assert render_trigger(EntityTimeTrigger("input_datetime.wake_up")) == {"trigger": "time", "at": "input_datetime.wake_up"}
+    assert render_trigger(EntityTimeTrigger("input_datetime.boot_dryer_start", offset=86_400, id="end")) == {
+        "trigger": "time",
+        "id": "end",
+        "at": {"entity_id": "input_datetime.boot_dryer_start", "offset": "24:00:00"},
+    }
+    assert render_trigger(EntityTimeTrigger("sensor.next_alarm", offset=-1800))["at"] == {"entity_id": "sensor.next_alarm", "offset": "-00:30:00"}
+    # The entity is read: the sandbox needs its states.
+    assert Candidate((EntityTimeTrigger("sensor.next_alarm"),)).entity_ids == {"sensor.next_alarm"}
+    with pytest.raises(ValueError):
+        EntityTimeTrigger("binary_sensor.door")
+
+
 def test_format_duration():
     assert format_duration(0) == "00:00:00"
     assert format_duration(3725) == "01:02:05"
@@ -164,6 +180,9 @@ EVERYTHING = Candidate(
         SunTrigger("sunset", offset=-1800),
         SunTrigger("sunrise", offset=900),
         EventTrigger("zha_event", (("device_ieee", "b0:e8:e8:ff:fe:48:0b:83"), ("command", "learned_ir_code"), ("endpoint_id", 1))),
+        EntityTimeTrigger("input_datetime.boot_dryer_start", offset=86_400),
+        EntityTimeTrigger("sensor.next_alarm", offset=-1800),
+        EntityTimeTrigger("input_datetime.wake_up"),
     ),
     conditions=(
         StateCondition("person.me", ("home", "work"), for_=120),
@@ -179,7 +198,7 @@ def test_render_automation_shape():
     config = render_automation(EVERYTHING, alias="Suggested")
     assert config["alias"] == "Suggested"
     assert config["mode"] == "single"
-    assert len(config["triggers"]) == 11 and len(config["conditions"]) == 5
+    assert len(config["triggers"]) == 14 and len(config["conditions"]) == 5
     assert config["actions"][0]["action"] == "logbook.log"
     custom = render_automation(EVERYTHING, alias="x", actions=[{"action": "light.turn_on"}])
     assert custom["actions"] == [{"action": "light.turn_on"}]
@@ -190,7 +209,7 @@ async def test_rendered_automation_passes_home_assistant_validation(hass: HomeAs
     validated = await async_validate_config_item(hass, "suggested", config)
     assert validated is not None
     assert validated.validation_error is None, validated.validation_error
-    assert len(validated["triggers"]) == 11
+    assert len(validated["triggers"]) == 14
     assert len(validated["conditions"]) == 5
 
     # The check has teeth: a broken trigger is reported.

@@ -10,6 +10,7 @@ import pytest
 from custom_components.event_simulator.suggest.evaluate import Evaluator, Fire
 from custom_components.event_simulator.suggest.model import (
     Candidate,
+    EntityTimeTrigger,
     EventTrigger,
     NumericStateCondition,
     NumericStateTrigger,
@@ -383,3 +384,85 @@ def test_trigger_fires_are_cached_and_a_month_of_chatty_sensor_is_fast():
     assert len(fires) > 1000
     assert time.perf_counter() - began < 2
     assert ev.trigger_fires(NumericStateTrigger(HUM, above=100, for_=60)) is fires
+
+
+# Time triggers at an entity's time (`at: input_datetime.x`, a timestamp sensor, with an offset)
+
+
+def stamp(at, *, date=True, time=True, start=UTC_START, tz="UTC", **extra):
+    """An input_datetime state holding `at` seconds after `start`, as its attributes spell it (in `tz`)."""
+    local = datetime.fromtimestamp(to_ts(start) + at, ZoneInfo(tz))
+    attributes = {"has_date": date, "has_time": time, **extra}
+    if date:
+        attributes |= {"year": local.year, "month": local.month, "day": local.day}
+    if time:
+        attributes |= {"hour": local.hour, "minute": local.minute, "second": local.second}
+    state = " ".join(part for part, wanted in ((local.strftime("%Y-%m-%d"), date), (local.strftime("%H:%M:%S"), time)) if wanted)
+    return state, attributes
+
+
+def helper_changes(entity_id, writes, **kwargs):
+    return [(at, entity_id, *stamp(value, **kwargs)) for at, value in writes]
+
+
+DRYER = "input_datetime.boot_dryer_start"
+
+
+def dryer():
+    state, attributes = stamp(2 * H)
+    writes = [(4 * H, 6 * H), (5 * H, 8 * H), (11 * H, 13 * H), (15 * H, 13.5 * H)]
+    changes = helper_changes(DRYER, writes)
+    # An attribute-only write re-arms the same time (it fires once), and a cleared helper has no time.
+    changes.insert(3, (12 * H, DRYER, *stamp(13 * H, friendly_name="Dryer")))
+    changes.append((16 * H, DRYER, "unknown", {"has_date": True, "has_time": True}))
+    return make({DRYER: {"state": state, "attributes": attributes}}, changes)
+
+
+def test_entity_time_fires_at_the_value_in_effect_plus_the_offset():
+    ev = dryer()
+    # A value replaced before its time never fires; one already past when it is set does not either.
+    assert rel(ev.trigger_fires(EntityTimeTrigger(DRYER))) == [2 * H, 8 * H, 13 * H]
+    assert rel(ev.trigger_fires(EntityTimeTrigger(DRYER, offset=H))) == [3 * H, 9 * H, 14 * H]
+    # Before the time: 06:00 - 1.5 h fires before 08:00 replaces it, and a time that is due right when it is set (the seeded one at the window start too) fires: Home Assistant compares with `>=`.
+    assert rel(ev.trigger_fires(EntityTimeTrigger(DRYER, offset=-1.5 * H))) == [0.5 * H, 4.5 * H, 6.5 * H, 11.5 * H]
+    assert rel(ev.trigger_fires(EntityTimeTrigger(DRYER, offset=-2 * H))) == [0, 4 * H, 6 * H, 11 * H]
+
+
+def test_a_time_only_helper_fires_every_day_with_the_offset_wrapping_around_midnight():
+    alarm = "input_datetime.alarm"
+    state, attributes = stamp(6.5 * H, date=False)
+    ev = make({alarm: {"state": state, "attributes": attributes}}, helper_changes(alarm, [(24 * H + 3 * H, 7.25 * H)], date=False), days=2)
+    assert rel(ev.trigger_fires(EntityTimeTrigger(alarm))) == [6.5 * H, 24 * H + 7.25 * H]
+    assert rel(ev.trigger_fires(EntityTimeTrigger(alarm, offset=30 * M))) == [7 * H, 24 * H + 7.75 * H]
+    # 06:30 - 7 h is 23:30 every day while 06:30 holds; 07:15 - 7 h is 00:15, the day after the window.
+    assert rel(ev.trigger_fires(EntityTimeTrigger(alarm, offset=-7 * H))) == [23.5 * H]
+
+
+def test_a_date_only_helper_is_local_midnight_and_offsets_add_wall_time_across_dst():
+    start, tz = "2026-10-31T00:00:00-05:00", "America/Chicago"  # clocks go back on Sunday 2026-11-01
+    day = "input_datetime.day"
+    state, attributes = stamp(0, time=False, start=start, tz=tz)
+    noon = "input_datetime.noon"
+    noon_state, noon_attributes = stamp(12 * H, start=start, tz=tz)
+    ev = make({day: {"state": state, "attributes": attributes}, noon: {"state": noon_state, "attributes": noon_attributes}}, [], start=start, days=3, tz=tz)
+    assert rel(ev.trigger_fires(EntityTimeTrigger(day, offset=8 * H)), to_ts(start)) == [8 * H]
+    # 12:00 on Saturday + 24 h is 12:00 on Sunday, 25 real hours later: Home Assistant adds the offset to the local wall time.
+    assert rel(ev.trigger_fires(EntityTimeTrigger(noon, offset=24 * H)), to_ts(start)) == [37 * H]
+
+
+def test_a_timestamp_sensor_fires_at_its_time_only_when_still_ahead():
+    alarm = "sensor.next_alarm"
+    timestamp = {"device_class": "timestamp"}
+
+    def iso(at):
+        return datetime.fromtimestamp(T0 + at, UTC).isoformat()
+
+    ev = make(
+        {alarm: {"state": iso(5 * H), "attributes": timestamp}, "sensor.plain": {"state": iso(5 * H), "attributes": {}}},
+        [(7 * H, alarm, iso(7 * H), timestamp), (8 * H, alarm, iso(9 * H), timestamp), (10 * H, alarm, "unavailable", timestamp), (11 * H, alarm, "soon", timestamp)],
+    )
+    # A sensor's time must be strictly ahead when it is set (an input_datetime's may be now).
+    assert rel(ev.trigger_fires(EntityTimeTrigger(alarm))) == [5 * H, 9 * H]
+    assert rel(ev.trigger_fires(EntityTimeTrigger(alarm, offset=-30 * M))) == [4.5 * H, 8.5 * H]
+    # Without `device_class: timestamp` a sensor holds no time.
+    assert ev.trigger_fires(EntityTimeTrigger("sensor.plain")) == []

@@ -145,7 +145,7 @@ def apply_exact(
             *rank_key(stats, candidate),
             *tie_break(stats, candidate, labels.anchors, fires),
         )
-        explanation = explain(candidate, stats, context.anchor_words)
+        explanation = explain(candidate, stats, context.anchor_words, context.relation)
         ranked.append(
             (
                 key,

@@ -16,6 +16,7 @@ import pytest
 from custom_components.event_simulator.suggest.evaluate import Evaluator
 from custom_components.event_simulator.suggest.model import (
     Candidate,
+    EntityTimeTrigger,
     NumericStateCondition,
     NumericStateTrigger,
     StateCondition,
@@ -35,6 +36,20 @@ CORE = {"time_zone": "Europe/Berlin", "latitude": 52.52, "longitude": 13.405, "e
 START = "2026-10-24T22:00:00+00:00"
 END = "2026-10-25T23:00:00+00:00"
 DOOR, HUM, PERSON = "binary_sensor.door", "sensor.humidity", "person.me"
+START_AT, NOON, ALARM, NEXT = "input_datetime.start", "input_datetime.noon", "input_datetime.alarm", "sensor.next_alarm"
+
+
+def helper(value: str, **extra: Any) -> dict[str, Any]:
+    """An input_datetime's attributes for its state ("YYYY-MM-DD HH:MM:SS", or "HH:MM:SS" for a time-only one)."""
+    attributes: dict[str, Any] = {"has_date": " " in value, "has_time": True, **extra}
+    if " " in value:
+        day, value = value.split(" ")
+        attributes |= dict(zip(("year", "month", "day"), map(int, day.split("-")), strict=True))
+    attributes |= dict(zip(("hour", "minute", "second"), map(int, value.split(":")), strict=True))
+    return attributes
+
+
+TIMESTAMP = {"device_class": "timestamp"}
 
 CHANGES = [
     ("05:00", DOOR, "on", {}), ("05:10", DOOR, "off", {}),
@@ -46,6 +61,15 @@ CHANGES = [
     ("11:00", HUM, "75", {}), ("11:01", HUM, "garbage", {}), ("11:02", HUM, "75", {}),
     ("12:00", HUM, "unavailable", {}), ("12:30", HUM, "72", {}), ("13:00", HUM, "50", {}), ("16:00", HUM, "71", {}),
     ("15:00", PERSON, "not_home", {}), ("19:00", PERSON, "home", {}),
+    # Times held by entities (#38): replaced before they are due, re-armed by an attribute-only write, cleared.
+    ("04:00", START_AT, "2026-10-25 09:00:00", helper("2026-10-25 09:00:00")),
+    ("08:30", START_AT, "2026-10-25 10:00:00", helper("2026-10-25 10:00:00")),
+    ("09:30", START_AT, "2026-10-25 10:00:00", helper("2026-10-25 10:00:00", friendly_name="Start")),
+    ("14:00", START_AT, "unknown", {"has_date": True, "has_time": True}),
+    ("12:00", ALARM, "07:15:00", helper("07:15:00")),
+    ("10:00", NEXT, "2026-10-25T10:00:00+00:00", TIMESTAMP),
+    ("11:00", NEXT, "2026-10-25T13:00:00+00:00", TIMESTAMP),
+    ("12:55", NEXT, "unavailable", TIMESTAMP),
 ]
 EVENTS = [
     {"at": f"2026-10-25T{hhmm}:00+00:00", "entity_id": entity_id, "state": state, "attributes": attributes}
@@ -55,6 +79,10 @@ INITIAL = {
     DOOR: {"state": "off", "attributes": {}, "last_changed": "2026-10-24T12:00:00+00:00", "last_updated": "2026-10-24T12:00:00+00:00"},
     HUM: {"state": "60", "attributes": {"unit_of_measurement": "%"}},
     PERSON: {"state": "home", "attributes": {}},
+    START_AT: {"state": "2026-10-25 01:30:00", "attributes": helper("2026-10-25 01:30:00")},
+    NOON: {"state": "2026-10-24 12:00:00", "attributes": helper("2026-10-24 12:00:00")},
+    ALARM: {"state": "06:30:00", "attributes": helper("06:30:00")},
+    NEXT: {"state": "2026-10-25T03:00:00+00:00", "attributes": TIMESTAMP},
 }
 
 H = 3600
@@ -77,6 +105,18 @@ CANDIDATES = {
     "time": Candidate(
         (TimeTrigger(2 * H + 30 * 60), TimeTrigger(23 * H + 30 * 60), TimeTrigger(12 * H)),
         (TimeCondition(after=22 * H, before=3 * H), NumericStateCondition(HUM, below=65)),
+    ),
+    # 01:30 + 1 h is 02:30 on the fall-back night (the first, summer-time one); 12:00 on Saturday + 24 h is 25 real hours later; 07:15 - 8 h wraps to 23:15.
+    "entity_time": Candidate(
+        (
+            EntityTimeTrigger(START_AT),
+            EntityTimeTrigger(START_AT, offset=H),
+            EntityTimeTrigger(NOON, offset=24 * H),
+            EntityTimeTrigger(ALARM, offset=-1800),
+            EntityTimeTrigger(ALARM, offset=-8 * H),
+            EntityTimeTrigger(NEXT),
+            EntityTimeTrigger(NEXT, offset=-600),
+        )
     ),
     "sun": Candidate(
         (SunTrigger("sunrise", offset=60), SunTrigger("sunset", offset=-1800), SunTrigger("sunset", offset=1800)),
@@ -141,3 +181,21 @@ def test_evaluator_matches_the_sandbox(name, sandbox_runs):
     assert triggered == sandbox_started, [datetime.fromtimestamp(t, UTC).isoformat() for t, _ in sandbox_started]
     assert fired == sandbox_fired
     assert 0 < len(fired) < len(triggered) or not candidate.conditions
+
+
+def test_entity_times_fire_where_home_assistant_arms_them():
+    """The `entity_time` scenario covers what it says: the sandbox agrees with these through `test_evaluator_matches_the_sandbox`."""
+    evaluator = Evaluator(Timeline.from_scenario(INITIAL, EVENTS, START, END), time_zone=CORE["time_zone"])
+    utc = [
+        [datetime.fromtimestamp(t, UTC).strftime("%d %H:%M") for t in evaluator.trigger_fires(trigger)]
+        for trigger in CANDIDATES["entity_time"].triggers
+    ]
+    assert utc == [
+        ["24 23:30", "25 08:00", "25 09:00"],
+        ["25 00:30", "25 10:00"],  # 09:00 + 1 h is replaced at 08:30
+        ["25 11:00"],
+        ["25 05:00"],
+        ["25 22:15"],
+        ["25 03:00"],
+        ["25 02:50", "25 12:50"],
+    ]
