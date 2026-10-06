@@ -8,7 +8,8 @@ The child gets a minimal environment and a scratch working directory, so nothing
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+import contextlib
 import json
 import os
 import shutil
@@ -31,6 +32,8 @@ DEFAULT_TIMEOUT = 300.0
 TIME_LIMIT_SHARE = 0.8
 # Replays running at once; more wait their turn. Each child is a whole Home Assistant boot.
 MAX_CONCURRENT = 2
+# Of those, how many may be background replays (`background=True`: suggest's validation). The rest stay free for what the user is waiting on (the panel's replays), so a slow validation never queues them behind it.
+MAX_BACKGROUND = 1
 # Caps on what crosses the pipes.
 MAX_INPUT_BYTES = 32 * 1024 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024 * 1024
@@ -41,7 +44,15 @@ STDERR_TAIL_CHARS = 4000
 ENV_PASSTHROUGH = ("PATH", "PYTHONPATH", "HOME", "TMPDIR", "TZ", "LANG", "LC_ALL")
 
 _READ_CHUNK = 64 * 1024
-_DATA_SEMAPHORE: HassKey[asyncio.Semaphore] = HassKey(f"{DOMAIN}_runner_semaphore")
+_DATA_SLOTS: HassKey[_Slots] = HassKey(f"{DOMAIN}_runner_slots")
+
+
+class _Slots:
+    """The sandbox slots of one Home Assistant instance: `MAX_CONCURRENT` in all, at most `MAX_BACKGROUND` of them for background replays."""
+
+    def __init__(self) -> None:
+        self.all = asyncio.Semaphore(MAX_CONCURRENT)
+        self.background = asyncio.Semaphore(MAX_BACKGROUND)
 
 
 class SandboxError(SimulatorError):
@@ -58,10 +69,14 @@ async def async_run_scenario(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     command: Sequence[str] | None = None,
+    background: bool = False,
+    on_queued: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Replay `scenario` in a fresh sandbox child and return the result dict it wrote.
 
     Raises `SandboxError` when the child times out, crashes, floods its output or writes no result, and `SimulatorError("too_large")` for a scenario over the input cap. A result carrying a structured `error` (invalid scenario or automation) is returned as is; it is an answer, not a failure. The child is told to stop by itself at `TIME_LIMIT_SHARE` of `timeout` (`time_limit_seconds`, unless the scenario sets it), so a replay that runs long still ends with the runs so far. `command` replaces `child_command()`, for tests.
+
+    At most `MAX_CONCURRENT` replays run at once, and at most `MAX_BACKGROUND` of them `background` ones. A replay that has to wait for a slot calls `on_queued` once, before it waits; cancelling it while it waits gives up its place at once, without starting a child. `timeout` counts from when the child starts.
     """
     if "time_limit_seconds" not in scenario:
         scenario = {**scenario, "time_limit_seconds": round(timeout * TIME_LIMIT_SHARE, 3)}
@@ -71,10 +86,15 @@ async def async_run_scenario(
             "too_large",
             f"The scenario is {len(payload) // 1024} KiB; the limit is {MAX_INPUT_BYTES // 1024} KiB",
         )
-    if (semaphore := hass.data.get(_DATA_SEMAPHORE)) is None:
-        semaphore = hass.data[_DATA_SEMAPHORE] = asyncio.Semaphore(MAX_CONCURRENT)
+    if (slots := hass.data.get(_DATA_SLOTS)) is None:
+        slots = hass.data[_DATA_SLOTS] = _Slots()
     argv = list(command) if command is not None else child_command()
-    async with semaphore:
+    semaphores = (slots.background, slots.all) if background else (slots.all,)
+    if on_queued is not None and any(semaphore.locked() for semaphore in semaphores):
+        on_queued()
+    async with contextlib.AsyncExitStack() as held:
+        for semaphore in semaphores:
+            await held.enter_async_context(semaphore)
         cwd = await hass.async_add_executor_job(tempfile.mkdtemp, None, f"{DOMAIN}-")
         try:
             return await _async_run(hass, argv, payload, timeout, cwd)

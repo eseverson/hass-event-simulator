@@ -261,3 +261,70 @@ async def test_real_child_round_trip(hass: HomeAssistant):
 
     assert result["error"] is None
     assert [run["outcome"] for run in result["runs"]] == ["fired", "fired"]
+
+
+def held_child(directory: Path) -> list[str]:
+    """A child that marks itself started (a file named after its pid in `directory`) and answers once the file `release` appears there."""
+    return fake_child(
+        f"""
+        import json, os, sys, time
+        sys.stdin.read()
+        open(os.path.join({str(directory)!r}, str(os.getpid())), "w").close()
+        while not os.path.exists(os.path.join({str(directory)!r}, "release")):
+            time.sleep(0.02)
+        json.dump({{"runs": []}}, sys.stdout)
+        """
+    )
+
+
+async def wait_started(directory: Path, count: int) -> None:
+    for _ in range(400):
+        if len([p for p in directory.iterdir() if p.name != "release"]) >= count:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"{count} children did not start")
+
+
+async def test_background_replays_leave_a_slot_for_the_others(hass: HomeAssistant, tmp_path: Path):
+    """A second background replay (suggest's validation) waits for the first, saying so; a foreground one (the panel's) still starts at once."""
+    child = held_child(tmp_path)
+    queued: list[str] = []
+    first = hass.async_create_task(
+        async_run_scenario(hass, SCENARIO, timeout=30, command=child, background=True, on_queued=lambda: queued.append("first"))
+    )
+    await wait_started(tmp_path, 1)
+    second = hass.async_create_task(
+        async_run_scenario(hass, SCENARIO, timeout=30, command=child, background=True, on_queued=lambda: queued.append("second"))
+    )
+    panel = hass.async_create_task(
+        async_run_scenario(hass, SCENARIO, timeout=30, command=child, on_queued=lambda: queued.append("panel"))
+    )
+    await wait_started(tmp_path, 2)
+    await asyncio.sleep(0.3)
+    assert queued == ["second"]
+    assert len(list(tmp_path.iterdir())) == 2  # the second background replay has not started
+    (tmp_path / "release").touch()
+    assert [result["runs"] for result in await asyncio.gather(first, second, panel)] == [[], [], []]
+    assert len(list(tmp_path.iterdir())) == 4
+
+
+async def test_cancelling_a_queued_replay_gives_up_its_place_at_once(hass: HomeAssistant, tmp_path: Path):
+    child = held_child(tmp_path)
+    with patch.object(runner, "MAX_CONCURRENT", 1):
+        running = hass.async_create_task(async_run_scenario(hass, SCENARIO, timeout=30, command=child))
+        await wait_started(tmp_path, 1)
+        queued = asyncio.Event()
+        waiting = hass.async_create_task(
+            async_run_scenario(hass, SCENARIO, timeout=30, command=child, on_queued=queued.set)
+        )
+        await asyncio.wait_for(queued.wait(), 5)
+        began = time.monotonic()
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        assert time.monotonic() - began < 1
+        # It never started a child, and the slot goes to the next one when the running replay ends.
+        after = hass.async_create_task(async_run_scenario(hass, SCENARIO, timeout=30, command=child))
+        (tmp_path / "release").touch()
+        assert (await running)["runs"] == [] and (await after)["runs"] == []
+    assert len(list(tmp_path.iterdir())) == 3  # two children and the release file
