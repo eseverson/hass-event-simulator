@@ -305,7 +305,15 @@ async def boot(config: Path) -> Any:
         else:
             writer.close()
             break
-    user =await hass.auth.async_create_user("benchmark", group_ids=["system-admin"])
+    try:  # Home Assistant 2026.9 tries an `http:` config moved out of YAML as pending, and restarts (dropping every websocket) unless it is confirmed within 5 minutes
+        from homeassistant.components.http.config import async_get_and_load_store
+    except ImportError:
+        pass
+    else:
+        store = await async_get_and_load_store(hass)
+        if store.pending is not None:
+            await store.async_promote_pending()
+    user = await hass.auth.async_create_user("benchmark", group_ids=["system-admin"])
     refresh = await hass.auth.async_create_refresh_token(user, client_id="http://127.0.0.1/")
     token = hass.auth.async_create_access_token(refresh)
     return hass, run, token
