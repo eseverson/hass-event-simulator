@@ -7,6 +7,7 @@ the panel can feed results straight into a scenario without reshaping them.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable, Iterator
 from datetime import datetime, timedelta
 from functools import partial
@@ -15,6 +16,7 @@ from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+import voluptuous as vol
 
 from homeassistant.components.automation import DATA_COMPONENT
 from homeassistant.components.labs.const import LABS_DATA
@@ -25,6 +27,7 @@ from homeassistant.components.recorder.history import (
 )
 from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant, State, callback, valid_entity_id
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import (
     area_registry as ar,
     device_registry as dr,
@@ -37,6 +40,8 @@ from homeassistant.helpers.recorder import session_scope
 from homeassistant.helpers.template import Template, is_template_string
 from homeassistant.util import dt as dt_util
 from homeassistant.util.json import json_loads
+
+from .sandbox.calendars import MAX_CALENDAR_EVENTS, MAX_CALENDARS, events_from_states, merge_events, parse_event
 
 MAX_ENTITIES = 50
 MAX_WINDOW = timedelta(days=7)
@@ -74,6 +79,10 @@ SYSTEM_EVENT_TYPES = frozenset(
     }
 )
 _SYSTEM_EVENT_TYPE = re.compile(r"^(homeassistant_|recorder_)|(_registry_updated|_reloaded)$")
+# How far around the window a calendar's events are read: a calendar trigger with an offset fires this far from its events (the miner's `MAX_CALENDAR_OFFSET`).
+CALENDAR_MARGIN = timedelta(days=2)
+# Seconds `calendar.get_events` may take per calendar (a cloud calendar answers over the network) before its recorded states stand in.
+CALENDAR_TIMEOUT = 10.0
 # Registry snapshot caps: an area or label on a big install can pull in hundreds of
 # entities, and each entry is around a kilobyte of scenario.
 MAX_SNAPSHOT_ENTITIES = 500
@@ -289,6 +298,74 @@ async def async_get_bus_events(
         ],
         "dropped_event_types": dropped,
     }
+
+
+async def async_get_calendar_events(
+    hass: HomeAssistant,
+    entity_ids: Iterable[str],
+    start: datetime,
+    end: datetime,
+    *,
+    timeline: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The events of each calendar around [start, end) (`CALENDAR_MARGIN` either side), for calendar triggers: the scenario's `calendars`.
+
+    Returns `{calendars: {entity_id: [{start, end, summary, description?, location?}]}, sources: {entity_id: {calendar, states, error?}}}`. Each calendar is asked with `calendar.get_events` (a read-only service call on this instance), and the events its recorded states name (`timeline`, the window's `initial_states` / `events`, read here when not given) are added where the calendar does not return them: an event deleted since, or a past one it no longer serves. When the calendar cannot answer (its integration is not loaded, it is unavailable, it timed out), the recorded states alone stand in and `error` says why. `sources` counts the events from each. Only `calendar.` entities are read, at most `MAX_CALENDARS`, each capped at `MAX_CALENDAR_EVENTS`.
+    """
+    start, end = dt_util.as_utc(start), dt_util.as_utc(end)
+    check_window(start, end, MAX_SUGGEST_WINDOW)
+    ids = [entity_id for entity_id in dict.fromkeys(entity_ids) if entity_id.startswith("calendar.")][:MAX_CALENDARS]
+    if not ids:
+        return {"calendars": {}, "sources": {}}
+    if timeline is None:
+        timeline = await async_get_timeline(hass, ids, start, end, max_window=MAX_SUGGEST_WINDOW)
+    tz = dt_util.get_default_time_zone()
+    lo, hi = start - CALENDAR_MARGIN, end + CALENDAR_MARGIN
+    calendars: dict[str, list[dict[str, Any]]] = {}
+    sources: dict[str, dict[str, Any]] = {}
+    for entity_id in ids:
+        states = [item.get("attributes") or {} for item in timeline.get("events") or () if item.get("entity_id") == entity_id]
+        if (initial := (timeline.get("initial_states") or {}).get(entity_id)) is not None:
+            states.append(initial.get("attributes") or {})
+        recorded = events_from_states(states, tz)
+        live, error = await _async_calendar_get_events(hass, entity_id, lo, hi, tz)
+        merged = [event for event in merge_events(live, recorded, tz) if event.start_local(tz) < hi and event.end_local(tz) >= lo]
+        from_calendar = sum(any(event is mine for mine in live) for event in merged)
+        source: dict[str, Any] = {"calendar": from_calendar, "states": len(merged) - from_calendar}
+        if error is not None:
+            source["error"] = error
+        sources[entity_id] = source
+        calendars[entity_id] = [event.as_dict() for event in merged[:MAX_CALENDAR_EVENTS]]
+    return {"calendars": calendars, "sources": sources}
+
+
+async def _async_calendar_get_events(hass: HomeAssistant, entity_id: str, start: datetime, end: datetime, tz: Any) -> tuple[list[Any], str | None]:
+    """The calendar's own events in [start, end) through `calendar.get_events`, and why there are none when it could not answer."""
+    if not hass.services.has_service("calendar", "get_events"):
+        return [], "the calendar integration is not loaded"
+    try:
+        async with asyncio.timeout(CALENDAR_TIMEOUT):
+            response = await hass.services.async_call(
+                "calendar",
+                "get_events",
+                {"entity_id": entity_id, "start_date_time": start, "end_date_time": end},
+                blocking=True,
+                return_response=True,
+            )
+    except TimeoutError:
+        return [], f"calendar.get_events did not answer within {CALENDAR_TIMEOUT:g} s"
+    except (HomeAssistantError, vol.Invalid) as err:
+        return [], str(err) or type(err).__name__
+    items = ((response or {}).get(entity_id) or {}).get("events")
+    if not isinstance(items, list):
+        return [], "calendar.get_events returned no events list"
+    events = []
+    for item in items:
+        try:
+            events.append(parse_event(item, tz))
+        except ValueError:
+            continue
+    return events, None
 
 
 def _read_bus_events(

@@ -97,6 +97,7 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_automation)
     websocket_api.async_register_command(hass, ws_history)
     websocket_api.async_register_command(hass, ws_bus_events)
+    websocket_api.async_register_command(hass, ws_calendar_events)
     websocket_api.async_register_command(hass, ws_scenarios_list)
     websocket_api.async_register_command(hass, ws_scenarios_get)
     websocket_api.async_register_command(hass, ws_scenarios_save)
@@ -161,6 +162,25 @@ async def ws_bus_events(hass, connection, msg: dict[str, Any]) -> None:
     connection.send_result(
         msg["id"],
         await history.async_get_bus_events(hass, msg["start"], msg["end"], event_types=msg.get("event_types")),
+    )
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/calendar_events",
+        vol.Required("entity_ids"): vol.All([cv.entity_id], vol.Length(max=MAX_ENTITIES)),
+        vol.Required("start"): cv.datetime,
+        vol.Required("end"): cv.datetime,
+    }
+)
+@websocket_api.async_response
+@_wrap
+async def ws_calendar_events(hass, connection, msg: dict[str, Any]) -> None:
+    """The events of the calendars around the window (`history.async_get_calendar_events`): what the panel's calendar lane shows, and what a replay's calendar triggers fire on."""
+    connection.send_result(
+        msg["id"],
+        await history.async_get_calendar_events(hass, msg["entity_ids"], msg["start"], msg["end"]),
     )
 
 
@@ -246,6 +266,8 @@ SIMULATE_SCENARIO = vol.Schema(
         vol.Optional("events", default=list): vol.Any(list, unpack_events),
         # Recorded bus events fired at their times (`event_simulator/bus_events`), for event triggers.
         vol.Optional("bus_events"): vol.All(list, vol.Length(max=MAX_BUS_EVENTS)),
+        # Calendar events by calendar (`event_simulator/calendar_events`), for calendar triggers; the child checks each event.
+        vol.Optional("calendars"): dict,
         # How much each run carries (the engine's TRACE_MODES): the panel needs `full`; a long validation can ask for `summary` or `none` to stay under the output cap.
         vol.Optional("traces"): vol.In(TRACE_MODES),
     },
@@ -427,6 +449,10 @@ async def async_suggest(
     )
     # Every recorded bus event of the window but Home Assistant's own, for event triggers (#35).
     timeline["bus_events"] = (await history.async_get_bus_events(hass, start, end))["bus_events"]
+    # The events of the tracked calendars, for calendar triggers (#37): the calendar's own, plus those its recorded states name.
+    timeline["calendars"] = (
+        await history.async_get_calendar_events(hass, entity_ids, start, end, timeline=timeline)
+    )["calendars"]
     progress(
         {
             "stage": "mining",
@@ -483,7 +509,13 @@ def _mine(
 ) -> SuggestResult:
     """Executor: the miner over the loaded timeline (labels outside the window are left out)."""
     timeline = Timeline.from_scenario(
-        data["initial_states"], data["events"], start, end, bus_events=data.get("bus_events")
+        data["initial_states"],
+        data["events"],
+        start,
+        end,
+        bus_events=data.get("bus_events"),
+        calendars=data.get("calendars"),
+        time_zone=time_zone,
     )
     tolerance = Tolerance(
         **{
@@ -518,7 +550,7 @@ async def _async_validate(
 ) -> SuggestResult:
     """Replay the top suggestions in one sandbox child and re-score them on what Home Assistant did (suggest/exact.py).
 
-    Only the suggestions whose runs fit `exact.MAX_VALIDATION_RUNS` are replayed (`plan_validation`); the rest keep the miner's estimate, with a `validation_capped` warning. They replay without their actions: a run's fire is decided by its trigger and conditions, and the placeholder action only costs time. Only the entities the replayed suggestions reference are sent, with their initial states, and only the bus events of the types their event triggers listen to; core config, registry snapshot and services come from this instance as for `simulate`. `traces: none` keeps a month of runs small. The replay is a background one (`runner.MAX_BACKGROUND`), so it never takes the last sandbox slot from the panel's replays; while it waits for one, `progress` gets `{stage: "queued"}`.
+    Only the suggestions whose runs fit `exact.MAX_VALIDATION_RUNS` are replayed (`plan_validation`); the rest keep the miner's estimate, with a `validation_capped` warning. They replay without their actions: a run's fire is decided by its trigger and conditions, and the placeholder action only costs time. Only the entities the replayed suggestions reference are sent, with their initial states, only the bus events of the types their event triggers listen to, and only the events of the calendars their calendar triggers read; core config, registry snapshot and services come from this instance as for `simulate`. `traces: none` keeps a month of runs small. The replay is a background one (`runner.MAX_BACKGROUND`), so it never takes the last sandbox slot from the panel's replays; while it waits for one, `progress` gets `{stage: "queued"}`.
     """
     chosen, skipped_runs = await hass.async_add_executor_job(plan_validation, result)
     unchecked = sorted(set(range(len(result.suggestions))) - set(chosen))
@@ -539,6 +571,7 @@ async def _async_validate(
     entity_ids = sorted(set().union(*(s.candidate.entity_ids for s in replayed)))
     wanted = set(entity_ids)
     event_types = set().union(*(s.candidate.event_types for s in replayed))
+    calendars = set().union(*(s.candidate.calendars for s in replayed))
     scenario = {
         "version": 1,
         "start": start.isoformat(),
@@ -553,6 +586,11 @@ async def _async_validate(
         "bus_events": [
             event for event in timeline.get("bus_events") or () if event["event_type"] in event_types
         ],
+        "calendars": {
+            entity_id: events
+            for entity_id, events in (timeline.get("calendars") or {}).items()
+            if entity_id in calendars
+        },
         "core": history.async_core_config(hass),
         "registry": history.async_registry_snapshot(hass, {"automations": configs}, entity_ids),
         "services": {

@@ -12,6 +12,7 @@ from typing import Any
 from .evaluate import Evaluator, Fire
 from .labels import Anchor, Labels
 from .model import (
+    CalendarTrigger,
     Candidate,
     EntityTimeTrigger,
     NumericStateCondition,
@@ -162,7 +163,7 @@ def simplicity(candidate: Candidate) -> tuple[int, int, int, int]:
                 rough += clock_roundness(part.offset) + 1
             case TimeCondition():
                 rough += sum(clock_roundness(v) for v in (part.after, part.before) if v is not None)
-            case SunTrigger():
+            case SunTrigger() | CalendarTrigger():
                 rough += clock_roundness(part.offset)
             case SunCondition():
                 rough += clock_roundness(part.after_offset) + clock_roundness(part.before_offset)

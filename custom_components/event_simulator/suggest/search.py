@@ -10,6 +10,7 @@ How it searches (see docs/superpowers/specs/2026-10-05-suggestions-design.md):
    - `numeric_state`: `above` / `below`, the threshold searched over the full window's values. The behavior of a threshold only changes at observed values, so each gap between consecutive distinct values is one candidate, represented by its roundest number; gaps are scored by how many anchors a crossing hits and how often the value crosses elsewhere. `for:` as for state. And a state trigger with no from/to (every report, as blueprint controllers re-evaluate), with `to: null` too when some reports change attributes only, when the anchors line up with its writes (within `ALIGN` seconds, more often than chance: any chatty sensor has some write within the tolerance of every anchor). A numeric attribute that changes while the state stays put gets the same trigger on the attribute. Conditions at fire time (`numeric_state` above/below) then narrow it, the template-free form of "every report while it is warm".
    - `event`: for each type of recorded bus event (`zha_event`, `tag_scanned`, ...) with events near the anchors, the type alone and the `event_data` that picks out the anchored events: greedily, the `(key, value)` of the anchored events that removes the most other events of the type while keeping every anchor the trigger hits, from no data and from each value the anchored events share (a command, a button). Only scalar values are used, and no string Home Assistant's template rendering would read as another type ("1" becomes 1). A type is offered only when the anchors fall near its events more often than chance would.
    - `time` / `sun`: when the anchors cluster by local clock time, or by sunrise/sunset offset; whichever clusters more anchors with less spread wins. The time is chosen at or just before the cluster and rounded.
+   - `calendar`: for each calendar with events (the scenario's `calendars`, else the events its recorded states name), the anchors' lag behind its events' starts and, separately, ends, clustered; the offset is chosen as a clock time is (at or just before, rounded, at most `MAX_CALENDAR_OFFSET` either way). Offered when the anchors fall near its fires more often than chance. A condition on the calendar's `message` attribute (the summary of the event it names at the fire) narrows it to some events; when that attribute cannot tell them apart (it names another event at the fire), the explanation says a template condition on the event's summary would.
    - `time` at an entity: for each input_datetime and `device_class: timestamp` sensor, the anchors' lag behind the time it holds around them (a moment, or for a time-only helper a time of day, circularly), clustered; the offset is chosen as a clock time is (at or just before, rounded, at most `MAX_ENTITY_OFFSET`). Offered when the anchors fall near its fires more often than chance (a sensor stamping its own reports meets any label).
    Triggers that hit fewer than `min_recall` of the best trigger's anchors are dropped before any condition search, and only the best `beam` go on.
    When no single trigger hits every anchor of a side, ORs of up to `max_triggers` triggers (possibly on different entities or of different kinds) join them: greedy set cover from each of the best `union_seeds` triggers, each step adding the trigger, searched again around the anchors still missed, that hits the most of them with the fewest bad fires. A trigger joins only as evidence, not chance: it hits the missed anchors more often than its fires would at random (binomial tail at `union_alpha`), and one fitted to a single moment (a clock time, a threshold, a `for:`) never joins for one anchor. The parts of an OR keep their side's trigger id, so a start/end pair stays a pair; each extra part costs as much simplicity as a condition.
@@ -35,6 +36,7 @@ from .labels import Anchor, Label, Labels, Tolerance
 from .model import (
     DAY,
     WEEKDAYS,
+    CalendarTrigger,
     Candidate,
     Condition,
     EntityTimeTrigger,
@@ -65,6 +67,7 @@ _MERGE = 60  # outside fires of several suggestions closer than this are one hin
 ALIGN = 5.0  # an any-change trigger is offered when anchors fall this close (seconds) to the entity's writes ...
 ALIGN_ALPHA = 0.05  # ... more often than chance would, at this level
 MAX_ENTITY_OFFSET = 7 * DAY  # the furthest a time trigger at an entity's time fires from that time
+MAX_CALENDAR_OFFSET = 2 * DAY  # the furthest a calendar trigger fires from its events' starts or ends
 RELATION_ENTITIES = 12  # numeric entities (with a unit) whose pairs are checked for a relation that needs a template trigger
 RELATION_RECALL = 0.8  # share of the anchors such a relation must hit
 # `event_data` keys in the order they are preferred when several pick out the same events (a device's id over its radio address).
@@ -317,6 +320,11 @@ def describe_trigger(trigger: Trigger) -> str:
             return f"{_duration_text(trigger.offset)} {'before' if trigger.offset < 0 else 'after'} {held}"
         case SunTrigger():
             return f"at {trigger.event}" if not trigger.offset else _sun_text(trigger.event, trigger.offset)
+        case CalendarTrigger():
+            moment = f"an event of {trigger.entity_id} {'starts' if trigger.event == 'start' else 'ends'}"
+            if not trigger.offset:
+                return moment
+            return f"{_duration_text(trigger.offset)} {'before' if trigger.offset < 0 else 'after'} {moment}"
         case EventTrigger():
             text = f"a {trigger.event_type} event arrives"
             if trigger.event_data:
@@ -368,7 +376,7 @@ def _either(triggers: Sequence[Trigger]) -> str:
     after_clock = True
     for trigger in triggers:
         phrase = describe_trigger(trigger)
-        clock = isinstance(trigger, (TimeTrigger, EntityTimeTrigger, SunTrigger))
+        clock = isinstance(trigger, (TimeTrigger, EntityTimeTrigger, SunTrigger)) or (isinstance(trigger, CalendarTrigger) and bool(trigger.offset))
         phrases.append(phrase if clock or not after_clock else f"when {phrase}")
         after_clock = clock
     return " or ".join(phrases)
@@ -413,8 +421,8 @@ class Relation:
         return f"The labeled moments line up with {self.rising} rising above {self.over}; that needs a template trigger"
 
 
-def explain(candidate: Candidate, stats: Stats, anchor_words: str, relation: Relation | None = None) -> str:
-    """`describe` plus how it did: "...; hits 4/4 marked starts, fires 2 other times". With a `relation` the labels follow better than this candidate, a sentence saying a template trigger would be needed."""
+def explain(candidate: Candidate, stats: Stats, anchor_words: str, relation: Relation | None = None, note: str | None = None) -> str:
+    """`describe` plus how it did: "...; hits 4/4 marked starts, fires 2 other times". With a `relation` the labels follow better than this candidate, a sentence saying a template trigger would be needed; a `note` (`_Search.calendar_note`) is one more sentence."""
     text = f"{describe(candidate)}; hits {stats.anchors_hit}/{stats.anchors_total} {anchor_words}"
     if stats.no_fire_violations:
         text += f", fires {_plural(len(stats.no_fire_violations), 'time')} in must-not periods"
@@ -424,6 +432,8 @@ def explain(candidate: Candidate, stats: Stats, anchor_words: str, relation: Rel
         text += f", holds throughout {stats.while_held}/{stats.while_total} while periods"
     if relation is not None and relation.beats(stats):
         text += f". {relation.note}."
+    if note:
+        text += f". {note}."
     return text
 
 
@@ -726,8 +736,8 @@ def _fit_error(stats: Stats, anchors: Sequence[Anchor], fires: Sequence[Fire]) -
 
 
 def tie_break(stats: Stats, candidate: Candidate, anchors: Sequence[Anchor], fires: Sequence[Fire]) -> tuple[Any, ...]:
-    """After `score.rank_key`: fewer options, fires closer to the anchors, fewer unlabeled fires overall (beyond the labeled stretch too), then the description, so the order is stable."""
-    return (complexity(candidate), _fit_error(stats, anchors, fires), len(stats.outside_fires), describe(candidate))
+    """After `score.rank_key`: fewer options, fires closer to the anchors, fewer unlabeled fires overall (beyond the labeled stretch too), a calendar trigger with the smallest offset (`_cause_rank`), then the description, so the order is stable."""
+    return (complexity(candidate), _fit_error(stats, anchors, fires), len(stats.outside_fires), _cause_rank(candidate), describe(candidate))
 
 
 def dedupe(evaluator: Evaluator, labels: Labels, candidates: Iterable[Candidate]) -> list[Candidate]:
@@ -737,7 +747,13 @@ def dedupe(evaluator: Evaluator, labels: Labels, candidates: Iterable[Candidate]
         fires = evaluator.fires(candidate)
         stats = score_candidate(evaluator, candidate, labels, fires)
         groups.setdefault(_Scored(candidate, stats, fires).signature, []).append(candidate)
-    return [min(group, key=lambda c: (simplicity(c), complexity(c), describe(c))) for group in groups.values()]
+    return [min(group, key=lambda c: (simplicity(c), complexity(c), _cause_rank(c), describe(c))) for group in groups.values()]
+
+
+def _cause_rank(candidate: Candidate) -> tuple[int, float]:
+    """Among candidates firing at the same instants: a calendar trigger before anything else (it names why; a clock time on the event's weekday drifts the first time the event moves), the smallest offset first (7 h before an all-day event starts, not 31 h before it ends)."""
+    calendars = [trigger for trigger in candidate.triggers if isinstance(trigger, CalendarTrigger)]
+    return (-len(calendars), sum(abs(trigger.offset) for trigger in calendars))
 
 
 @dataclass(frozen=True, slots=True)
@@ -851,6 +867,7 @@ class _Search:
                 found |= self._state_triggers(entity_id, anchors, trigger_id, min_hits)
         found |= self._event_triggers(anchors, trigger_id, min_hits)
         found |= self._entity_time_triggers(anchors, trigger_id, min_hits)
+        found |= self._calendar_triggers(anchors, trigger_id, min_hits)
         found.update(clock_triggers(self.ev, self.labels, anchors, trigger_id, min_hits))
         return found
 
@@ -968,6 +985,60 @@ class _Search:
             if hits >= min_hits and _binomial_tail(len(anchors), hits, chance) <= ALIGN_ALPHA:
                 found.add(trigger)
         return found
+
+    def _calendar_triggers(self, anchors: Sequence[Anchor], tid: str | None, min_hits: int) -> set[Trigger]:
+        """Calendar triggers at its events' starts or ends plus an offset: when the anchors lie a constant offset from them, more often than chance would."""
+        found: set[Trigger] = set()
+        before, after = self.tolerance.before, self.tolerance.after
+        span = max(self.timeline.end - self.timeline.start, 1.0)
+        for entity_id in self.timeline.calendar_ids:
+            calendar = self.timeline.calendar(entity_id)
+            if calendar is None:
+                continue
+            for event, times in (("start", calendar.starts), ("end", calendar.ends_sorted)):
+                lags: list[tuple[float, int]] = []
+                for n, anchor in enumerate(anchors):
+                    lo = bisect_left(times, anchor.at - MAX_CALENDAR_OFFSET - after)
+                    hi = bisect_right(times, anchor.at + MAX_CALENDAR_OFFSET + before)
+                    lags += [(anchor.at - at, n) for at in times[lo:hi]]
+                cluster = _anchor_cluster(lags, before + after)
+                if len({n for _, n in cluster}) < min_hits:
+                    continue
+                offset = _pick_moment(sorted(lag for lag, _ in cluster), self.tolerance)
+                if offset is None or abs(offset) > MAX_CALENDAR_OFFSET:
+                    continue
+                trigger = CalendarTrigger(entity_id, event, offset=offset, id=tid)
+                fires = self.ev.trigger_fires(trigger)
+                hits = self._anchors_hit(fires, anchors)
+                chance = min(1.0, len(fires) * (before + after) / span)
+                if hits >= min_hits and _binomial_tail(len(anchors), hits, chance) <= ALIGN_ALPHA:
+                    found.add(trigger)
+        return found
+
+    def calendar_note(self, candidate: Candidate, stats: Stats) -> str | None:
+        """When a calendar trigger of the candidate fires for events that line up with the labels and for others that do not, and their summaries tell the two apart (no condition on the calendar's `message` does): what would."""
+        if not (stats.outside_nearby or stats.no_fire_violations):
+            return None
+        for trigger in candidate.triggers:
+            if not isinstance(trigger, CalendarTrigger) or (calendar := self.timeline.calendar(trigger.entity_id)) is None:
+                continue
+            if any(isinstance(c, StateCondition) and c.entity_id == trigger.entity_id and c.attribute == "message" for c in candidate.conditions):
+                continue
+            good: set[str] = set()
+            bad: set[str] = set()
+            for at, n in self.ev.calendar_fires(trigger):
+                if not self.ev.conditions_hold(candidate.conditions, at):
+                    continue
+                kind = self.labels.classify(at, trigger.id)
+                summary = calendar.events[n].summary
+                if kind == "anchor":
+                    good.add(summary)
+                elif kind == "no_fire" or (kind == "unlabeled" and self.labels.in_span(at)):
+                    bad.add(summary)
+            if good and bad and not good & bad:
+                names = " or ".join(f'"{name}"' for name in sorted(good)[:3]) + (" ..." if len(good) > 3 else "")
+                return f"Only the events of {trigger.entity_id} named {names} line up with the labels; a template condition on trigger.calendar_event.summary would keep just those"
+        return None
 
     def relation(self, anchors: Sequence[Anchor]) -> Relation | None:
         """The best "one sensor rises above another" among the tracked numeric entities that share a unit, when the anchors follow it (at least `RELATION_RECALL` of them, more often than chance): what only a template trigger could express."""
@@ -1170,7 +1241,7 @@ class _Search:
             hits, must_not, near, unlabeled, fires = self.screen(trigger, anchors)
             if hits:
                 single = Candidate((trigger,))
-                key = (-hits, must_not, near, simplicity(single), complexity(single), unlabeled, describe(single))
+                key = (-hits, must_not, near, simplicity(single), complexity(single), unlabeled, _cause_rank(single), describe(single))
                 screened.append((key, trigger, tuple(fires)))
         if not screened:
             return []
@@ -1228,7 +1299,7 @@ class _Search:
     def _evidence(self, trigger: Trigger, part: _Part, new: Iterable[int], missed: int) -> bool:
         """Whether a trigger hitting the `new` anchors (of `missed` ones) is evidence, not chance. What counts is the moments it fires at (one fire near a burst of labels is one moment): one fitted to a single moment (a clock time, a threshold, a `for:`) never is evidence, and anything else must fire near more of them than its fires would at random (binomial tail at `union_alpha`). An any-change trigger on a chatty sensor fires near every anchor, so for it the anchors landing on its reports (within `ALIGN`) count instead."""
         moments = len({part.nearest[n] for n in new})
-        fitted = isinstance(trigger, (TimeTrigger, EntityTimeTrigger, SunTrigger, NumericStateTrigger)) or bool(getattr(trigger, "for_", 0))
+        fitted = isinstance(trigger, (TimeTrigger, EntityTimeTrigger, SunTrigger, CalendarTrigger, NumericStateTrigger)) or bool(getattr(trigger, "for_", 0))
         if fitted and moments < 2:
             return False
         alpha = self.options.union_alpha
@@ -1323,10 +1394,27 @@ class _Search:
                 continue
             if any(step.state_at(t) not in states for t in bad):
                 pool.add(StateCondition(entity_id, tuple(sorted(states))))
+            if entity_id.startswith("calendar.") and (named := self._calendar_message_condition(entity_id, step, good, bad)) is not None:
+                pool.add(named)
         pool.update(self._time_conditions(good, periods))
         if self.ev._sun_events is not None:  # noqa: SLF001
             pool.update(self._sun_conditions(good))
         return sorted(pool, key=lambda c: (type(c).__name__, describe_condition(c)))
+
+    def _calendar_message_condition(self, entity_id: str, step: StepFunction, good: Sequence[float], bad: Sequence[float]) -> Condition | None:
+        """The calendar names one of a few event summaries (its `message`) at every good fire and another at some bad one: the template-free way to keep some of its events."""
+        def message(t: float) -> Any:
+            attributes = step.attributes_at(t)
+            return None if attributes is None else attributes.get("message")
+
+        if self.labels.while_periods:
+            return None
+        messages = {message(t) for t in good}
+        if not messages or None in messages or len(messages) > 3 or not all(isinstance(m, str) and self.recurs(entity_id, m, "message") for m in messages):
+            return None
+        if not any(message(t) not in messages for t in bad):
+            return None
+        return StateCondition(entity_id, tuple(sorted(messages)), attribute="message")
 
     def _numeric_conditions(self, entity_id: str, step: StepFunction, good: Sequence[float], bad: Sequence[float], periods: Sequence[Label]) -> list[Condition]:
         values = step.numeric_values()
@@ -1707,7 +1795,7 @@ def suggest(
         relation = search.relation(anchors)
     suggestions = []
     for rank, item in enumerate(kept):
-        explanation = explain(item.candidate, item.stats, words, relation)
+        explanation = explain(item.candidate, item.stats, words, relation, search.calendar_note(item.candidate, item.stats))
         alias = f"Suggested: {describe(item.candidate)[:80]}"
         config = render_automation(item.candidate, alias=alias, description=explanation)
         suggestions.append(Suggestion(rank, item.candidate, item.stats, config, explanation))

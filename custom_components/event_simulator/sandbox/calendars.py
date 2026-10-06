@@ -4,7 +4,7 @@ Standard library only: the sandbox child serves these events to Home Assistant's
 
 An event is `{start, end, summary, description?, location?}`, the shape `calendar.get_events` answers with: `start` / `end` are both dates (`2026-10-08`, an all-day event from that local midnight to the end's) or both datetimes (ISO 8601; one without an offset is local wall time in the instance's time zone).
 
-A calendar entity's state names one event, its current or next one, in its attributes: `message` (the summary), `start_time` / `end_time` (local wall time, `%Y-%m-%d %H:%M:%S`), `all_day`, `location` (the recorder leaves `description` out). The distinct events its recorded states name are a lower bound on the calendar's events (two events at once show only one, and an event the entity never showed as next is missing), but each is known before it starts, so a trigger firing ahead of an event (a negative offset) finds it.
+A calendar entity's state names one event, its current or next one, in its attributes: `message` (the summary), `start_time` / `end_time` (local wall time, `%Y-%m-%d %H:%M:%S`), `all_day`, `location` (the recorder leaves `description` out, so it is never read from states: one there came from the live state). The distinct events its recorded states name are a lower bound on the calendar's events (two events at once show only one, and an event the entity never showed as next is missing), but each is known before it starts, so a trigger firing ahead of an event (a negative offset) finds it.
 """
 
 from __future__ import annotations
@@ -138,11 +138,7 @@ def event_from_attributes(attributes: Mapping[str, Any], tz: tzinfo) -> Event | 
     message = attributes.get("message")
     summary = message if isinstance(message, str) else ""
     location = attributes.get("location")
-    description = attributes.get("description")
-    extra = {
-        "location": location if isinstance(location, str) and location else None,
-        "description": description if isinstance(description, str) and description else None,
-    }
+    extra = {"location": location if isinstance(location, str) and location else None}
     if attributes.get("all_day") is True:
         first, last = start.date(), end.date()
         if last == first:

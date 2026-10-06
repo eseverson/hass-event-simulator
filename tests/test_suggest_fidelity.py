@@ -15,6 +15,7 @@ import pytest
 
 from custom_components.event_simulator.suggest.evaluate import Evaluator
 from custom_components.event_simulator.suggest.model import (
+    CalendarTrigger,
     Candidate,
     EntityTimeTrigger,
     NumericStateCondition,
@@ -50,6 +51,24 @@ def helper(value: str, **extra: Any) -> dict[str, Any]:
 
 
 TIMESTAMP = {"device_class": "timestamp"}
+BINS, WORK = "calendar.bins", "calendar.work"
+
+
+def bins(day: str, summary: str) -> dict[str, Any]:
+    """The bins calendar's attributes naming an all-day pickup (as a calendar entity writes them)."""
+    after = f"{day[:8]}{int(day[8:]) + 1:02d}"
+    return {"message": summary, "all_day": True, "start_time": f"{day} 00:00:00", "end_time": f"{after} 00:00:00", "location": ""}
+
+
+# The work calendar's events are given (`calendars`); the bins calendar's come from its recorded states (#37).
+CALENDARS = {
+    WORK: [
+        {"start": "2026-10-25", "end": "2026-10-26", "summary": "Sunday"},
+        {"start": "2026-10-25T09:00:00+01:00", "end": "2026-10-25T10:00:00+01:00", "summary": "Standup"},
+        {"start": "2026-10-25T14:00:00+00:00", "end": "2026-10-25T14:30:00+00:00", "summary": "Standup"},
+        {"start": "2026-10-25T20:00:00", "end": "2026-10-25T21:00:00", "summary": "Late"},
+    ]
+}
 
 CHANGES = [
     ("05:00", DOOR, "on", {}), ("05:10", DOOR, "off", {}),
@@ -70,6 +89,9 @@ CHANGES = [
     ("10:00", NEXT, "2026-10-25T10:00:00+00:00", TIMESTAMP),
     ("11:00", NEXT, "2026-10-25T13:00:00+00:00", TIMESTAMP),
     ("12:55", NEXT, "unavailable", TIMESTAMP),
+    # The bins calendar names its next pickup; from 12:00 a later one (glass), so the 26th's paper pickup is known only from the states before.
+    ("06:00", BINS, "off", bins("2026-10-26", "Paper") | {"friendly_name": "Bins"}),
+    ("12:00", BINS, "off", bins("2026-10-27", "Glass")),
 ]
 EVENTS = [
     {"at": f"2026-10-25T{hhmm}:00+00:00", "entity_id": entity_id, "state": state, "attributes": attributes}
@@ -83,6 +105,7 @@ INITIAL = {
     NOON: {"state": "2026-10-24 12:00:00", "attributes": helper("2026-10-24 12:00:00")},
     ALARM: {"state": "06:30:00", "attributes": helper("06:30:00")},
     NEXT: {"state": "2026-10-25T03:00:00+00:00", "attributes": TIMESTAMP},
+    BINS: {"state": "off", "attributes": bins("2026-10-26", "Paper")},
 }
 
 H = 3600
@@ -118,6 +141,17 @@ CANDIDATES = {
             EntityTimeTrigger(NEXT, offset=-600),
         )
     ),
+    # The all-day event starts at the window start (local midnight); 09:00+01:00 is after the clocks went back; 20:00 is local wall time; the paper pickup starts after the window end, 7 h earlier is inside it.
+    "calendar": Candidate(
+        (
+            CalendarTrigger(WORK, "start"),
+            CalendarTrigger(WORK, "end", offset=1800),
+            CalendarTrigger(WORK, "start", offset=-H),
+            CalendarTrigger(BINS, "start", offset=-7 * H),
+            CalendarTrigger(BINS, "end", offset=-48 * H),
+        ),
+        (StateCondition(BINS, ("Paper",), attribute="message"),),
+    ),
     "sun": Candidate(
         (SunTrigger("sunrise", offset=60), SunTrigger("sunset", offset=-1800), SunTrigger("sunset", offset=1800)),
         (SunCondition(after="sunrise", after_offset=30, before="sunset", before_offset=-60), StateCondition(PERSON, ("home",))),
@@ -145,6 +179,7 @@ def scenario(name: str, candidate: Candidate) -> dict[str, Any]:
         "automation": automation,
         "initial_states": INITIAL,
         "events": EVENTS,
+        "calendars": CALENDARS,
         "services": {"logbook": ["log"]},
         "seed": 0,
     }
@@ -164,7 +199,8 @@ def sandbox_runs() -> dict[str, list[dict[str, Any]]]:
 
 @pytest.mark.parametrize("name", list(CANDIDATES))
 def test_evaluator_matches_the_sandbox(name, sandbox_runs):
-    evaluator = Evaluator(Timeline.from_scenario(INITIAL, EVENTS, START, END), time_zone=CORE["time_zone"], sun_events=sun_events)
+    timeline = Timeline.from_scenario(INITIAL, EVENTS, START, END, calendars=CALENDARS, time_zone=CORE["time_zone"])
+    evaluator = Evaluator(timeline, time_zone=CORE["time_zone"], sun_events=sun_events)
     candidate = CANDIDATES[name]
 
     def rounded(at: float) -> int:
@@ -198,4 +234,21 @@ def test_entity_times_fire_where_home_assistant_arms_them():
         ["25 22:15"],
         ["25 03:00"],
         ["25 02:50", "25 12:50"],
+    ]
+
+
+def test_calendar_triggers_fire_at_each_event_plus_the_offset():
+    """The `calendar` scenario covers what it says: the sandbox agrees with these through `test_evaluator_matches_the_sandbox`."""
+    timeline = Timeline.from_scenario(INITIAL, EVENTS, START, END, calendars=CALENDARS, time_zone=CORE["time_zone"])
+    evaluator = Evaluator(timeline, time_zone=CORE["time_zone"])
+    utc = [
+        [datetime.fromtimestamp(t, UTC).strftime("%d %H:%M") for t in evaluator.trigger_fires(trigger)]
+        for trigger in CANDIDATES["calendar"].triggers
+    ]
+    assert utc == [
+        ["24 22:00", "25 08:00", "25 14:00", "25 19:00"],
+        ["25 09:30", "25 15:00", "25 20:30"],  # the all-day event ends at the window end
+        ["25 07:00", "25 13:00", "25 18:00"],
+        ["25 16:00"],  # the paper pickup on the 26th, named only before 12:00
+        ["24 22:00"],  # it ends on the 27th at 00:00 CET: 48 h of wall time earlier is 00:00 CEST on the 25th, 49 real hours
     ]

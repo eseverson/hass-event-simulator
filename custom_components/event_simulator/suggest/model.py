@@ -126,6 +126,25 @@ class SunTrigger:
             raise ValueError(f"event must be one of {SUN_EVENTS}")
 
 
+CALENDAR_EVENTS = ("start", "end")
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarTrigger:
+    """`trigger: calendar`: at the start or end of each event of a calendar, plus `offset` seconds (negative: before). Home Assistant asks the calendar for its events ahead of time, so a negative offset fires before an event begins."""
+
+    entity_id: str
+    event: str = "start"
+    offset: float = 0
+    id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.entity_id.startswith("calendar."):
+            raise ValueError("a calendar trigger reads a calendar entity")
+        if self.event not in CALENDAR_EVENTS:
+            raise ValueError(f"event must be one of {CALENDAR_EVENTS}")
+
+
 @dataclass(frozen=True, slots=True)
 class EventTrigger:
     """`trigger: event`: an event of `event_type` on the bus whose data holds every `(key, value)` of `event_data` (other keys may be there too).
@@ -204,7 +223,7 @@ class SunCondition:
                 raise ValueError(f"sun events are {SUN_EVENTS}")
 
 
-Trigger = StateTrigger | NumericStateTrigger | TimeTrigger | EntityTimeTrigger | SunTrigger | EventTrigger
+Trigger = StateTrigger | NumericStateTrigger | TimeTrigger | EntityTimeTrigger | SunTrigger | CalendarTrigger | EventTrigger
 Condition = StateCondition | NumericStateCondition | TimeCondition | SunCondition
 
 
@@ -224,8 +243,13 @@ class Candidate:
         return {
             part.entity_id
             for part in (*self.triggers, *self.conditions)
-            if isinstance(part, (StateTrigger, NumericStateTrigger, EntityTimeTrigger, StateCondition, NumericStateCondition))
+            if isinstance(part, (StateTrigger, NumericStateTrigger, EntityTimeTrigger, CalendarTrigger, StateCondition, NumericStateCondition))
         }
+
+    @property
+    def calendars(self) -> set[str]:
+        """The calendars the candidate's calendar triggers read: whose events the sandbox needs."""
+        return {trigger.entity_id for trigger in self.triggers if isinstance(trigger, CalendarTrigger)}
 
     @property
     def event_types(self) -> set[str]:
@@ -312,6 +336,15 @@ def render_trigger(trigger: Trigger) -> dict[str, Any]:
             out = {"trigger": "sun"}
             if trigger.id is not None:
                 out["id"] = trigger.id
+            out["event"] = trigger.event
+            if trigger.offset:
+                out["offset"] = format_duration(trigger.offset)
+            return out
+        case CalendarTrigger():
+            out = {"trigger": "calendar"}
+            if trigger.id is not None:
+                out["id"] = trigger.id
+            out["entity_id"] = trigger.entity_id
             out["event"] = trigger.event
             if trigger.offset:
                 out["offset"] = format_duration(trigger.offset)

@@ -7,6 +7,7 @@ The miner scores thousands of candidates, so this re-implements the trigger and 
 - time: fires at the local wall time each day, DST-correct: on a fall-back day an ambiguous time fires twice, on a spring-forward day a skipped time does not fire.
 - time at an entity (`at: input_datetime.x`, a timestamp sensor, optionally `offset`): every write of the entity re-arms it at the time the new state holds plus the offset. An input_datetime with a date (local midnight without a time) adds the offset to the local wall time and arms when that is now or later; one with only a time fires every day at that time plus the offset, wrapped around midnight; a `device_class: timestamp` sensor arms when its time plus the offset is strictly later than now. A state without a time (unknown, unavailable, a sensor without the device class, a timestamp without a zone) arms nothing.
 - sun: fires at every `sun_events(date)[event] + offset`.
+- calendar: fires at every start (or end) of the calendar's events plus the offset (`Timeline.calendar`: the events given, else those its recorded states name), once per event, so two events starting together fire twice; an event starting after the window still fires inside it with a negative offset. An all-day event starts at local midnight, and the offset adds local wall time (as for a time at an entity).
 - event: fires at every bus event of its type whose data holds each of its `(key, value)` pairs, compared as they are (the event trigger's items comparison).
 - conditions read the state at the fire time; errors (unknown entity, non-numeric value) fail the condition, as a condition error stops the run in Home Assistant.
 
@@ -16,6 +17,7 @@ Where this knowingly differs from Home Assistant (the sandbox is the exact answe
 - Time-change triggers fire exactly on the second; Home Assistant adds a 50-500 ms random offset.
 - Every fire counts as a run. The automation's `mode` only matters while an action runs, and the placeholder action finishes at once; two triggers firing at the same instant count twice.
 - The automation attaches at the window start, after the initial states are seeded (as the sandbox does); fires and `for:` timers due at or after the window end do not count.
+- Calendar: Home Assistant fetches the events of each 15-minute span ahead (the span shifted by the offset in local wall time), so an event whose offset time falls in the repeated or skipped hour of a DST change may fire once more or not at all there; this fires it once.
 - An entity's time due at the instant of its next write does not fire (that write re-arms it); Home Assistant compares an input_datetime's time with now on the local wall clock, which differs in the repeated hour of a fall-back day.
 - Not represented: templates, `value_template`, other entity-valued options (`above: sensor.y`, a time condition's `after: input_datetime.x`, a state condition's `state: input_select.x`), several entities in one trigger.
 - Sun: `sun_events(date)` must return what `homeassistant.helpers.sun.get_astral_event_date(hass, event, date)` does (aware datetimes, None on a polar day); where Home Assistant's sun condition errors on a missing event, this returns False.
@@ -32,6 +34,7 @@ from zoneinfo import ZoneInfo
 from .model import (
     DAY,
     WEEKDAYS,
+    CalendarTrigger,
     Candidate,
     Condition,
     EntityTimeTrigger,
@@ -162,6 +165,8 @@ class Evaluator:
                 fires = self._entity_time_fires(trigger)
             case SunTrigger():
                 fires = self._sun_fires(trigger)
+            case CalendarTrigger():
+                fires = [at for at, _ in self.calendar_fires(trigger)]
             case EventTrigger():
                 fires = self._event_fires(trigger)
             case _:
@@ -286,6 +291,16 @@ class Evaluator:
             if (at := self.sun(day)[index]) is not None and self.start <= at + trigger.offset < self.end:
                 found.add(at + trigger.offset)
         return sorted(found)
+
+    def calendar_fires(self, trigger: CalendarTrigger) -> list[tuple[float, int]]:
+        """`(fire time, event index into the calendar's events)` of a calendar trigger in the window, oldest first."""
+        calendar = self.timeline.calendar(trigger.entity_id)
+        if calendar is None:
+            return []
+        # Home Assistant adds the offset to the aware local datetime: wall-clock arithmetic, so 48 h before midnight across a DST change is 49 or 47 real hours.
+        offset = timedelta(seconds=trigger.offset)
+        found = [((at + offset).timestamp(), n) for at, n in calendar.moments(trigger.event)]
+        return sorted(item for item in found if self.start <= item[0] < self.end)
 
     def _event_fires(self, trigger: EventTrigger) -> list[float]:
         found = self.timeline.bus_events(trigger.event_type)

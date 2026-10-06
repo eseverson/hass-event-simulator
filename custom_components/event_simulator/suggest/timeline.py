@@ -4,6 +4,8 @@ Input is the timeline replay uses (`history.async_get_timeline`, unpacked): `ini
 
 Bus events (`bus_events` `[{at, event_type, data}]`, the scenario's optional list of recorded events such as `zha_event` or `tag_scanned`) are kept per event type as `BusEvents`, time-ordered, inside the window.
 
+Calendars (`calendars` `{entity_id: [{start, end, summary, ...}]}`, the scenario's optional block, see `sandbox/calendars.py`) are kept per calendar as `CalendarEvents`; a calendar entity on the timeline without an entry gets the events its own recorded states name. Both need the time zone (`time_zone`): an all-day event begins at local midnight, and the states name local wall times.
+
 Each entity becomes a `StepFunction`: the entries it held, sorted by when each began, so "state at t" is one binary search. The seeded state begins at the window start (the sandbox seeds it there) but keeps its recorded `last_changed`. Like the sandbox, events outside `[start, end)` are skipped, and a write identical to the previous state and attributes is dropped, since Home Assistant fires no `state_changed` for it.
 """
 
@@ -12,8 +14,11 @@ from __future__ import annotations
 from bisect import bisect_left, bisect_right
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, tzinfo
 from typing import Any
+from zoneinfo import ZoneInfo
+
+from ..sandbox.calendars import Event, events_from_states, parse_calendars
 
 UNAVAILABLE_STATES = frozenset({"unavailable", "unknown"})
 
@@ -173,8 +178,38 @@ class BusEvents:
     data: list[Mapping[str, Any]]
 
 
+@dataclass(frozen=True, slots=True)
+class CalendarEvents:
+    """One calendar's events (`events`, sorted by start) and when each starts and ends, as POSIX seconds (`starts[i]` / `ends[i]` are `events[i]`'s; `end_order` lists the indexes by end, `ends_sorted` their ends) and as aware local datetimes (`local_starts` / `local_ends`), which Home Assistant adds a trigger's offset to."""
+
+    entity_id: str
+    events: list[Event]
+    starts: list[float]
+    ends: list[float]
+    end_order: list[int]
+    ends_sorted: list[float]
+    local_starts: list[datetime]
+    local_ends: list[datetime]
+
+    @classmethod
+    def build(cls, entity_id: str, events: list[Event], tz: tzinfo) -> CalendarEvents:
+        events = sorted(events, key=lambda event: (event.start_local(tz), event.end_local(tz), event.summary))
+        local_starts = [event.start_local(tz) for event in events]
+        local_ends = [event.end_local(tz) for event in events]
+        starts = [at.timestamp() for at in local_starts]
+        ends = [at.timestamp() for at in local_ends]
+        order = sorted(range(len(events)), key=lambda n: (ends[n], n))
+        return cls(entity_id, events, starts, ends, order, [ends[n] for n in order], local_starts, local_ends)
+
+    def moments(self, event: str) -> list[tuple[datetime, int]]:
+        """`(aware local datetime, event index)` of every start (`event` "start") or end, oldest first."""
+        if event == "start":
+            return list(zip(self.local_starts, range(len(self.events)), strict=True))
+        return [(self.local_ends[n], n) for n in self.end_order]
+
+
 class Timeline:
-    """Step functions for every entity in a scenario window `[start, end)`, and the window's bus events by type."""
+    """Step functions for every entity in a scenario window `[start, end)`, the window's bus events by type, and the events of its calendars."""
 
     def __init__(
         self,
@@ -182,6 +217,8 @@ class Timeline:
         end: float,
         entities: dict[str, StepFunction],
         bus_events: dict[str, BusEvents] | None = None,
+        calendars: Mapping[str, list[Event]] | None = None,
+        time_zone: str | tzinfo | None = None,
     ) -> None:
         if end <= start:
             raise ValueError("The window must end after it starts")
@@ -189,6 +226,10 @@ class Timeline:
         self.end = end
         self._entities = entities
         self._bus = bus_events or {}
+        self.tz = ZoneInfo(time_zone) if isinstance(time_zone, str) else time_zone or UTC
+        self._calendars: dict[str, CalendarEvents | None] = {
+            entity_id: CalendarEvents.build(entity_id, events, self.tz) for entity_id, events in (calendars or {}).items()
+        }
 
     @classmethod
     def from_scenario(
@@ -198,6 +239,8 @@ class Timeline:
         start: str | datetime | float,
         end: str | datetime | float,
         bus_events: list[Mapping[str, Any]] | None = None,
+        calendars: Mapping[str, Any] | None = None,
+        time_zone: str | tzinfo | None = None,
     ) -> Timeline:
         start_ts, end_ts = to_ts(start), to_ts(end)
         if end_ts <= start_ts:
@@ -236,7 +279,8 @@ class Timeline:
                 found = bus[event_type] = BusEvents(event_type, [], [])
             found.times.append(at)
             found.data.append(event.get("data") or {})
-        return cls(start_ts, end_ts, entities, bus)
+        tz = ZoneInfo(time_zone) if isinstance(time_zone, str) else time_zone or UTC
+        return cls(start_ts, end_ts, entities, bus, parse_calendars(calendars, tz), tz)
 
     def __getitem__(self, entity_id: str) -> StepFunction:
         return self._entities[entity_id]
@@ -259,3 +303,19 @@ class Timeline:
     def bus_events(self, event_type: str) -> BusEvents:
         """The window's events of one type (none: empty lists)."""
         return self._bus.get(event_type) or BusEvents(event_type, [], [])
+
+    @property
+    def calendar_ids(self) -> list[str]:
+        """Every calendar with events to read: those given, and the calendar entities on the timeline, sorted."""
+        return sorted(set(self._calendars) | {entity_id for entity_id in self._entities if entity_id.startswith("calendar.")})
+
+    def calendar(self, entity_id: str) -> CalendarEvents | None:
+        """A calendar's events: the given ones, else those its recorded states name (computed once); None for a calendar with neither."""
+        if entity_id not in self._calendars:
+            step = self._entities.get(entity_id)
+            found = None
+            if step is not None and entity_id.startswith("calendar."):
+                events = events_from_states(step.attributes, self.tz)
+                found = CalendarEvents.build(entity_id, events, self.tz) if events else None
+            self._calendars[entity_id] = found
+        return self._calendars[entity_id]
