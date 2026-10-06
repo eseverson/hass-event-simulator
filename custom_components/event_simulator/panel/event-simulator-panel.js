@@ -1651,7 +1651,7 @@ export const MAX_SCENARIO_NAME = 100; // store.MAX_NAME_LENGTH
 
 /* The body of event_simulator/scenarios/save for the panel's current state. Times go
  * out as UTC ISO strings with a `Z`, the offset the store insists on. */
-export function scenarioPayload({ name, entityId, automation, start, end, tracks, labels = [], suggestOptions = null }) {
+export function scenarioPayload({ name, entityId, automation, start, end, tracks, labels = [], suggestOptions = null, helpers = [] }) {
   const initial_states = {};
   const events = [];
   const track_shifts = {};
@@ -1681,7 +1681,22 @@ export function scenarioPayload({ name, entityId, automation, start, end, tracks
     // the options, which are only sent from Suggest mode and reopen a scenario in it.
     ...(labels.length ? { labels: labelsPayload(labels) } : {}),
     ...(suggestOptions ? { suggest_options: suggestOptions } : {}),
+    // The Trend / Derivative helpers the replay sets up (a scenario opened from a
+    // suggestion that needs one, #42), so a loaded scenario replays the same.
+    ...(savedHelpers(helpers).length ? { helpers: savedHelpers(helpers) } : {}),
   };
+}
+
+/* Helpers (helperView or raw) as a saved scenario stores them: [{domain, entity_id, title, options}]. */
+function savedHelpers(helpers) {
+  return asList(helpers)
+    .filter((h) => isObject(h) && h.domain && (h.entityId ?? h.entity_id))
+    .map((h) => ({ domain: h.domain, entity_id: h.entityId ?? h.entity_id, ...(h.title ? { title: h.title } : {}), options: h.options || {} }));
+}
+
+/* The helpers a saved scenario replays with, as helper views. */
+export function helpersFromScenario(scenario) {
+  return asList(scenario?.helpers).map(helperView).filter(Boolean);
 }
 
 /* The tracks a saved scenario describes: [{entity_id, initial, events}] in its
@@ -2142,7 +2157,7 @@ export function suggestionView(raw, index = 0) {
   view.variants = (Array.isArray(s.variants) ? s.variants : []).filter(isObject).map((rv, i) => {
     const v = suggestionView({ ...rv, rank: s.rank ?? index, helpers: Array.isArray(rv.helpers) ? rv.helpers : rawHelpers, variants: [] }, index);
     v.variant = i + 1;
-    v.diff = variantDiff(config, v.config);
+    v.diff = variantDiff(config, v.config, rawHelpers, Array.isArray(rv.helpers) ? rv.helpers : rawHelpers);
     return v;
   });
   return view;
@@ -2489,8 +2504,10 @@ function configLeaves(value, path, out) {
 
 /* How a variant's triggers and conditions differ from its card's: [{path, field, label,
  * from, to, kind}] (from/to null where one side lacks it), kind "threshold" (above/below),
- * "duration" (for/offset...) or "other"; thresholds and durations first. */
-export function variantDiff(base, variant) {
+ * "duration" (for/offset...) or "other"; thresholds and durations first. With the helpers
+ * each needs (#42), the helper options that differ too: a variant of a trend card reads the
+ * same helper entity with another gradient or window. */
+export function variantDiff(base, variant, baseHelpers = [], variantHelpers = []) {
   const part = (c) => {
     const x = isObject(c) ? c : {};
     return { triggers: asList(x.triggers ?? x.trigger), conditions: asList(x.conditions ?? x.condition) };
@@ -2510,8 +2527,38 @@ export function variantDiff(base, variant) {
     const label = m ? `${many ? `${m[1] === "triggers" ? "trigger" : "condition"} ${Number(m[2]) + 1} ` : m[1] === "conditions" ? "condition " : ""}${field}` : field;
     out.push({ path, field, label, from, to, kind });
   }
+  out.push(...helperDiff(baseHelpers, variantHelpers));
   const order = { threshold: 0, duration: 1, other: 2 };
   return out.sort((x, y) => order[x.kind] - order[y.kind]);
+}
+
+const HELPER_THRESHOLDS = new Set(["min_gradient"]);
+
+/* A helper option as the variant diff shows it: durations as H:MM:SS, numbers to 4 significant digits. */
+function helperOptionText(key, value) {
+  if (DURATION_FIELDS.has(key) && (typeof value === "number" || isDuration(value))) return durationText(value);
+  if (typeof value === "number") return String(Number(value.toPrecision(4)));
+  return isObject(value) || Array.isArray(value) ? JSON.stringify(value) : String(value);
+}
+
+/* The options that differ between two lists of helpers, matched by entity id. */
+function helperDiff(baseHelpers, variantHelpers) {
+  const byId = (list) => new Map(asList(list).filter((h) => isObject(h) && (h.entity_id ?? h.entityId)).map((h) => [h.entity_id ?? h.entityId, isObject(h.options) ? h.options : {}]));
+  const a = byId(baseHelpers);
+  const b = byId(variantHelpers);
+  const out = [];
+  for (const id of new Set([...a.keys(), ...b.keys()])) {
+    const from = a.get(id) || {};
+    const to = b.get(id) || {};
+    for (const key of new Set([...Object.keys(from), ...Object.keys(to)])) {
+      const x = key in from ? helperOptionText(key, from[key]) : null;
+      const y = key in to ? helperOptionText(key, to[key]) : null;
+      if (x === y) continue;
+      const kind = HELPER_THRESHOLDS.has(key) ? "threshold" : DURATION_FIELDS.has(key) ? "duration" : "other";
+      out.push({ path: `helpers.${id}.${key}`, field: key, label: `helper ${key}`, from: x, to: y, kind });
+    }
+  }
+  return out;
 }
 
 export const HELPER_NAMES = { trend: "Trend", derivative: "Derivative sensor" };
@@ -4129,6 +4176,7 @@ class EventSimulatorPanel extends Base {
       tracks: this._tracks,
       labels: this._labels,
       suggestOptions: this._mode === "suggest" ? suggestOptions(this._tolerance) : null,
+      helpers: this._replayHelpers,
     });
   }
 
@@ -4272,7 +4320,7 @@ class EventSimulatorPanel extends Base {
     const entityId = record.automation_entity_id || "";
     this._entityId = entityId;
     this._automation = null;
-    this._replayHelpers = [];
+    this._replayHelpers = helpersFromScenario(record);
     this._tracks = [];
     this._clearResult();
     this._clearEdits();

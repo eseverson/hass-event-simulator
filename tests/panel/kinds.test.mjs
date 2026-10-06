@@ -143,6 +143,26 @@ test("variant diff names threshold and duration differences first", () => {
   assert.deepEqual(variantDiff(base, base), []);
 });
 
+test("a variant that only changes its helper's options says which (#42)", () => {
+  const trigger = { trigger: "state", entity_id: "binary_sensor.hum_rising", to: "on" };
+  const helper = (minGradient, sampleDuration) => ({
+    domain: "trend",
+    entity_id: "binary_sensor.hum_rising",
+    options: { entity_id: "sensor.hum", invert: false, max_samples: 25, min_gradient: minGradient, min_samples: 2, sample_duration: sampleDuration },
+  });
+  assert.deepEqual(variantDiff({ triggers: [trigger] }, { triggers: [trigger] }, [helper(0.011111111111111112, 900)], [helper(0.022222222222222223, 600)]), [
+    { path: "helpers.binary_sensor.hum_rising.min_gradient", field: "min_gradient", label: "helper min_gradient", from: "0.01111", to: "0.02222", kind: "threshold" },
+    { path: "helpers.binary_sensor.hum_rising.sample_duration", field: "sample_duration", label: "helper sample_duration", from: "0:15:00", to: "0:10:00", kind: "duration" },
+  ]);
+  const derivative = (window) => ({ domain: "derivative", entity_id: "sensor.hum_derivative", options: { source: "sensor.hum", round: 2, time_window: window, unit_time: "min" } });
+  assert.deepEqual(variantDiff({}, {}, [derivative({ minutes: 15 })], [derivative({ minutes: 5 })]).map((d) => [d.label, d.from, d.to, d.kind]), [["helper time_window", "0:15:00", "0:05:00", "duration"]]);
+  assert.deepEqual(variantDiff({}, {}, [helper(0.01, 900)], [helper(0.01, 900)]), []);
+  // Through the views: the variant's own helpers against the card's.
+  const card = suggestionView({ rank: 0, config: { triggers: [trigger] }, helpers: [helper(0.01, 900)], variants: [{ config: { triggers: [trigger] }, helpers: [helper(0.02, 900)], stats: {} }], stats: {} });
+  assert.deepEqual(card.variants[0].diff.map((d) => d.label), ["helper min_gradient"]);
+  assert.equal(card.variants[0].helpers[0].options.min_gradient, 0.02);
+});
+
 test("variants become views with their own stats and a diff against the card", () => {
   const v = suggestionView({
     rank: 1,

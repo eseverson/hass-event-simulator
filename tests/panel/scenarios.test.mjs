@@ -7,6 +7,8 @@ import {
   checkScenarioName,
   describeRunError,
   groupWarnings,
+  helperView,
+  helpersFromScenario,
   insertEvent,
   normalizeResult,
   normalizeWarning,
@@ -213,4 +215,30 @@ test("run failures keep their code, message and the child's last log lines", () 
   const plain = describeRunError(new Error("socket closed"));
   assert.deepEqual([plain.title, plain.message, plain.code, plain.stderr], ["The run failed", "socket closed", null, ""]);
   assert.equal(describeRunError({ code: "brand_new", message: "m" }).title, "The run failed");
+});
+
+// A scenario opened from a suggestion that needs a Trend or Derivative helper (#42) replays
+// with it; saving keeps it, and loading brings it back for the next replay.
+const TREND = {
+  domain: "trend",
+  entity_id: "binary_sensor.bathroom_humidity_rising",
+  title: "Bathroom humidity rising",
+  options: { entity_id: "sensor.bathroom_humidity", invert: false, max_samples: 25, min_gradient: 0.0111, min_samples: 2, sample_duration: 900 },
+};
+
+test("the save payload carries the helpers the replay sets up, and loading brings them back", () => {
+  const base = { name: "Shower", entityId: "", automation: AUTOMATION, ...WIN, tracks: panelTracks() };
+  assert.equal("helpers" in scenarioPayload(base), false);
+  assert.equal("helpers" in scenarioPayload({ ...base, helpers: [] }), false);
+  const p = scenarioPayload({ ...base, helpers: [helperView(TREND)] });
+  assert.deepEqual(p.helpers, [TREND]);
+  assert.notEqual(scenarioFingerprint(p), scenarioFingerprint(scenarioPayload(base)));
+
+  const loaded = helpersFromScenario({ ...p, scenario_id: "x" });
+  assert.equal(loaded.length, 1);
+  assert.equal(loaded[0].entityId, TREND.entity_id);
+  assert.deepEqual(loaded[0].options, TREND.options);
+  assert.deepEqual(scenarioPayload({ ...base, helpers: loaded }).helpers, [TREND]);
+  assert.deepEqual(helpersFromScenario({}), []);
+  assert.deepEqual(helpersFromScenario({ helpers: [{ title: "no domain" }, "junk"] }), []);
 });
