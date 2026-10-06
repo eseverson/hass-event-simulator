@@ -26,7 +26,7 @@ Result
 
 Under `automations`, each run and service call also carries `"automation": index`, per-automation warnings carry it too, and the result adds `"automations": [{"index", "entity_id", "loaded", "error": null | {"code", "message"}, "run_count"}]`. An automation the sandbox refuses (`invalid_automation`, `unsupported_automation`) is reported there with `loaded: false` and the others still replay; the top-level `error` is only for a problem with the scenario itself.
 
-`outcome`: `fired` (the actions ran to the end or a `stop`), `condition_failed` (`stopped_by` = the failing condition's trace path, e.g. `condition/0`), `dropped` (the script mode refused the run; `stopped_by` = `mode_single` / `max_runs` / `recursion`), `aborted` (a condition or `stop: error` inside the actions; `stopped_by` = last action path), `cancelled` (a `restart` re-trigger or shutdown), `error` (an exception; `stopped_by` = last action path, `error` = message), `unfinished` (still running at the overrun bound).
+`outcome`: `fired` (the actions ran to the end or a `stop`), `condition_failed` (`stopped_by` = the failing condition's trace path, e.g. `condition/0`), `dropped` (the script mode refused the run; `stopped_by` = `mode_single` / `max_runs` / `recursion`), `aborted` (a condition or `stop: error` inside the actions; `stopped_by` = last action path), `cancelled` (a `restart` re-trigger or shutdown), `error` (an exception; `stopped_by` = last action path, `error` = message), `unfinished` (still running at the overrun bound), `not_triggered` (HA 2026.9+: a trigger evaluated a change but did not fire, e.g. a non-numeric value for a threshold trigger, and HA recorded why; `stopped_by` = that reason, e.g. `entity_value_not_numeric`; nothing ran). Any other value is a `script_execution` this engine does not know yet, passed through as is.
 """
 
 from __future__ import annotations
@@ -990,6 +990,10 @@ def _run_record(trace: Any, traces: str = DEFAULT_TRACES) -> dict[str, Any]:
     stopped_by: str | None = None
     if short.get("state") == "running":
         outcome = "unfinished"
+    elif execution == "not_triggered":
+        # HA 2026.9+: a trigger evaluated a change but did not fire; its step's result says why.
+        outcome = "not_triggered"
+        stopped_by = _not_triggered_reason(steps)
     elif execution == "failed_conditions":
         outcome = "condition_failed"
         stopped_by = _failed_condition(steps)
@@ -1007,6 +1011,10 @@ def _run_record(trace: Any, traces: str = DEFAULT_TRACES) -> dict[str, Any]:
         stopped_by = last_step
     elif execution == "finished":
         outcome = "fired"
+    elif isinstance(execution, str) and execution:
+        # A value a later release adds: passed through rather than reported as an error.
+        outcome = execution
+        stopped_by = last_step
     else:
         outcome = "error"
         stopped_by = last_step
@@ -1048,14 +1056,22 @@ def _is_trigger_or_condition(path: str) -> bool:
     return path == "trigger" or path.startswith(("trigger/", "condition/"))
 
 
+def _not_triggered_reason(steps: dict[str, list[dict[str, Any]]]) -> str | None:
+    """The reason a not-triggered trace's trigger step gives (`entity_value_not_numeric`, ...)."""
+    for path, elements in steps.items():
+        if (path == "trigger" or path.startswith("trigger/")) and elements:
+            return (elements[0].get("result") or {}).get("reason")
+    return None
+
+
 def _failed_condition(steps: dict[str, list[dict[str, Any]]]) -> str | None:
-    """Trace path of the top-level condition that evaluated false (first one, in evaluation order)."""
+    """Trace path of the top-level condition that evaluated false or raised (HA counts an error as false), first one in evaluation order."""
     fallback = None
     for path, elements in steps.items():
         if not path.startswith("condition/"):
             continue
         for element in elements:
-            if (element.get("result") or {}).get("result") is False:
+            if (element.get("result") or {}).get("result") is False or "error" in element:
                 if path.count("/") == 1:
                     return path
                 fallback = fallback or path

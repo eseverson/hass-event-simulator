@@ -68,7 +68,7 @@ Result:
 {
   "version": 1, "start": "...", "end": "...", "error": null,
   "runs": [{"id": "run id", "started": "...", "finished": "... | null", "trigger": {"idx", "id", "alias", "platform", "description", "entity_id", "from_state", "to_state"},
-            "outcome": "fired|condition_failed|dropped|aborted|cancelled|error|unfinished", "stopped_by": "condition/0 | mode_single | max_runs | recursion | action/N | null",
+            "outcome": "fired|condition_failed|dropped|aborted|cancelled|error|unfinished|not_triggered", "stopped_by": "condition/0 | mode_single | max_runs | recursion | action/N | <not-triggered reason> | null",
             "script_execution": "HA's value", "error": "message | null", "trace": {"...": "as_extended_dict()"}}],
   "service_calls": [{"at", "domain", "service", "data", "target", "run", "context": {"id", "parent_id", "user_id"}}],
   "warnings": [{"code": "event_outside_window|unknown_service|preview_feature_unknown|registry_truncated|run_unfinished|initial_state_after_start|initial_state_ignored|late_attach|log|log_truncated", "message", "at"}]
