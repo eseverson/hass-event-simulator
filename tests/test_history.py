@@ -416,3 +416,27 @@ async def test_referenced_entities_resolve_registry_ids(hass: HomeAssistant):
     result = history.async_get_automation(hass, "automation.registry_ids")
 
     assert result["referenced_entities"] == ["binary_sensor.motion", "binary_sensor.side_door"]
+
+
+async def test_referenced_entities_include_device_trigger_entities(hass: HomeAssistant):
+    """A device trigger's entity is in the referenced entities: Home Assistant 2026.9 leaves a registry id out of `referenced_entities` rather than passing it on, so the panel lost the entity that fires the automation."""
+    entry = MockConfigEntry(domain="test")
+    entry.add_to_hass(hass)
+    device = dr.async_get(hass).async_get_or_create(config_entry_id=entry.entry_id, identifiers={("test", "door")})
+    door = er.async_get(hass).async_get_or_create(
+        "binary_sensor", "test", "door", config_entry=entry, device_id=device.id, suggested_object_id="side_door"
+    )
+    config = {
+        "id": "device_trigger",
+        "alias": "Device trigger",
+        "triggers": [
+            {"trigger": "device", "device_id": device.id, "domain": "binary_sensor", "entity_id": door.id, "type": "opened"},
+        ],
+        "actions": [{"action": "notify.notify", "data": {"message": "open"}}],
+    }
+    assert await async_setup_component(hass, "automation", {"automation": [config]})
+    await hass.async_block_till_done()
+
+    result = history.async_get_automation(hass, "automation.device_trigger")
+
+    assert result["referenced_entities"] == ["binary_sensor.side_door"]

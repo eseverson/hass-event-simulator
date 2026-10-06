@@ -140,6 +140,7 @@ def async_get_automation(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
     referenced = set(entity.referenced_entities)
     referenced |= _template_entities(hass, _template_strings(config))
     referenced |= _entity_valued_options(config)
+    referenced |= _device_automation_entities(config)
     return {"config": config, "referenced_entities": sorted(_entity_ids(hass, referenced))}
 
 
@@ -565,6 +566,25 @@ def _entity_valued_options(node: Any) -> set[str]:
                         found.add(candidate)
             if isinstance(value, (dict, list)):
                 stack.append(value)
+    return found
+
+
+def _device_automation_entities(node: Any) -> set[str]:
+    """The `entity_id` of every device trigger, condition and action (any mapping with a `device_id`), usually a registry id.
+
+    Home Assistant's `referenced_entities` leaves a device trigger's entity out unless validation turned it into an entity id, which it does not, so the entity that fires the automation was missing.
+    """
+    found: set[str] = set()
+    stack = [node]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, list):
+            stack.extend(item)
+        elif isinstance(item, dict):
+            if "device_id" in item:
+                value = item.get("entity_id")
+                found.update(v for v in (value if isinstance(value, list) else [value]) if isinstance(v, str))
+            stack.extend(v for v in item.values() if isinstance(v, (dict, list)))
     return found
 
 
