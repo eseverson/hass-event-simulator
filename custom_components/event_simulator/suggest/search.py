@@ -61,7 +61,7 @@ _MERGE = 60  # outside fires of several suggestions closer than this are one hin
 class SuggestOptions:
     max_conditions: int = 2
     top_k: int = 8
-    max_lag: float = 3600  # how long before an anchor a cause may begin (for `for:` inference)
+    max_lag: float = 3600  # the longest `for:` inferred (a cause may begin up to this plus the tolerance before an anchor)
     min_recall: float = 0.5  # triggers hitting less than this share of the best trigger's anchors are dropped
     beam: int = 12  # triggers that go on to the condition search
     side_beam: int = 4  # per side, for start/end pairs
@@ -738,7 +738,8 @@ class _Search:
                 continue
             lag = anchor.at - began
             state = step.states[i]
-            if before < lag <= max_lag and state not in UNAVAILABLE_STATES and self.recurs(entity_id, state):
+            # A `for:` of at most `max_lag` still matches an anchor up to `before` later than that.
+            if before < lag <= max_lag + before and state not in UNAVAILABLE_STATES and self.recurs(entity_id, state):
                 lagged[state][n] = (lag, step.states[j - 1] if j else None)
         if 2 <= len(tos) <= 3:
             # A toggle: some anchors follow a change one way and some another, so one trigger listing them all hits more than either.
@@ -768,7 +769,7 @@ class _Search:
             for theta, covered, _ in _ranked_thresholds(crossings, direct, 3):
                 if covered >= min_hits:
                     found.add(NumericStateTrigger(entity_id, **{direction: theta}, id=tid))
-            lagged = _gap_scores(crossings, anchors, -max_lag, -before)
+            lagged = _gap_scores(crossings, anchors, -max_lag - before, -before)
             ranked = sorted(
                 (-covered, roundness(theta := crossings.representative(k)), crossings.count(theta), theta)
                 for k, (covered, _) in lagged.items()
@@ -788,7 +789,7 @@ class _Search:
         i = step.index_at(at)
         if i < 0 or not crossings.in_range(theta, values[i]):
             return None
-        floor = at - self.options.max_lag
+        floor = at - self.options.max_lag - self.tolerance.before
         began = None
         j = i
         while j >= 0 and step.times[j] >= floor:

@@ -294,6 +294,27 @@ def test_a_toggle_fires_on_both_directions():
     assert best.stats.recall == 1.0 and len(best.stats.outside_fires) == 6
 
 
+def test_for_as_long_as_the_longest_lag_is_found():
+    """"Turn the espresso machine off after an hour on": the automation fires a moment after the hour, a lag just past `max_lag` (1 h) that a `for: 1 h` still matches."""
+    switch = "switch.espresso_machine"
+    rng = random.Random(14)
+    initial, changes = distractors(rng, 4)
+    initial[switch] = "off"
+    anchors = []
+    for day in range(4):
+        on = day * D + rng.uniform(7 * H, 10 * H)
+        changes += [(on - 3 * H, switch, "on"), (on - 3 * H + 10 * M, switch, "off")]  # a short brew: off by hand
+        changes += [(on, switch, "on"), (on + H + 0.05, switch, "off")]
+        anchors.append(fire(on + H + 0.04))
+    tl = timeline(initial, changes, 4)
+
+    best = top(run(tl, Labels(anchors[:3])))
+
+    assert best.candidate.triggers == (StateTrigger(switch, to=("on",), for_=H),)
+    assert best.stats.recall == 1.0
+    assert [round(t - T0 - H) for t in best.stats.outside_fires] == [round(anchors[3].start - T0 - H)]  # the fourth day, unlabeled
+
+
 def motion_episodes(rng):
     """Hall motion: three occupancy episodes with a short flicker in each; the light is on from motion until 5 minutes after it clears."""
     initial, changes = distractors(rng, 1)
