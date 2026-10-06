@@ -13,7 +13,7 @@ with a Python environment that has the same `homeassistant` release as the live 
 2. Boots a disposable Home Assistant in this process on that copy with only `recorder` (auto purge off), the automations and `event_simulator` (plus their manifest dependencies; `http` on 127.0.0.1 only), mints an admin token and talks to it over the real websocket.
 3. Runs the benchmark, writes the JSON (every run, each suggestion's triggers, conditions and metrics, the real automations' triggers and conditions) and the Markdown summary, stops Home Assistant, and deletes the workdir unless `--keep` (pass `--workdir` of a kept copy to rerun without copying again).
 
-`--only automation.x` limits the automations; `--windows 7 30`, `--labels 1 3 all`, `--distractors 3` and `--jobs 2` change the sweep.
+A kept copy remembers its window end (the disposable instance records into it, so its own latest event moves on). `--only automation.x` limits the automations; `--windows 7 30`, `--labels 1 3 all`, `--distractors 3` and `--jobs 2` change the sweep.
 """
 
 from __future__ import annotations
@@ -80,6 +80,8 @@ def prepare(source: Path, work: Path, port: int) -> Path:
         finally:
             copy.close()
             live.close()
+        # The disposable instance records into the copy, so a rerun on a kept copy would see later events: the default window end is the copy's, taken now.
+        (work / "latest_event").write_text(str(latest_event(db)))
     # Home Assistant 2026.9 moves `http:` from YAML into `.storage/http` on first start and prefers the stored copy after; start from the YAML every time.
     (config / ".storage" / "http").unlink(missing_ok=True)
     for name in STORAGE_FILES:
@@ -383,7 +385,9 @@ async def sweep(args: argparse.Namespace, config: Path, port: int) -> dict[str, 
     import aiohttp
 
     db = config / "home-assistant_v2.db"
-    end = args.end.timestamp() if args.end else latest_event(db) // 3600 * 3600
+    stamp = config.parent / "latest_event"
+    latest = float(stamp.read_text()) if stamp.exists() else latest_event(db)
+    end = args.end.timestamp() if args.end else latest // 3600 * 3600
     hass, run, token = await boot(config)
     port = hass.http.server_port
     results: list[dict[str, Any]] = []
