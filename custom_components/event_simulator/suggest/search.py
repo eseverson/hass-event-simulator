@@ -10,8 +10,8 @@ How it searches (see docs/superpowers/specs/2026-10-05-suggestions-design.md):
    - `numeric_state`: `above` / `below`, the threshold searched over the full window's values. The behavior of a threshold only changes at observed values, so each gap between consecutive distinct values is one candidate, represented by its roundest number; gaps are scored by how many anchors a crossing hits and how often the value crosses elsewhere. `for:` as for state.
    - `time` / `sun`: when the anchors cluster by local clock time, or by sunrise/sunset offset; whichever clusters more anchors with less spread wins. The time is chosen at or just before the cluster and rounded.
    Triggers that hit fewer than `min_recall` of the best trigger's anchors are dropped before any condition search, and only the best `beam` go on.
-3. Conditions, greedily: from each trigger (or trigger pair), add the condition that removes the most bad fires (must-not first, then unlabeled) while keeping every anchor hit and every `while` period held, up to `max_conditions`, branching on the best `branch` choices at each step. Condition values come from the state at the anchor fires (and throughout `while` periods) against the state at the bad fires; numeric thresholds are the roundest number between the good and the bad values.
-4. Every candidate is scored exactly by the evaluator, deduplicated (candidates that fire at the same instants keep only the simplest), ranked by `score.rank_key` (then fewer options, then fires closer to the anchors) and cut to `top_k`.
+3. Conditions, greedily: from each trigger (or trigger pair), add the condition that removes the most bad fires (must-not first, then unlabeled within the labeled stretch, then beyond it) while keeping every anchor hit and every `while` period held, up to `max_conditions`, branching on the best `branch` choices at each step. Condition values come from the state at the anchor fires (and throughout `while` periods) against the state at the bad fires; numeric thresholds are the roundest number between the good and the bad values.
+4. Every candidate is scored exactly by the evaluator, deduplicated (candidates that fire at the same instants keep only the simplest), ranked by `score.rank_key` and `tie_break` (fewer options, fires closer to the anchors, fewer unlabeled fires overall) and cut to `top_k`.
 """
 
 from __future__ import annotations
@@ -616,6 +616,11 @@ def _fit_error(stats: Stats, anchors: Sequence[Anchor], fires: Sequence[Fire]) -
     return round(sum(errors) / len(errors), 1) if errors else 0.0
 
 
+def tie_break(stats: Stats, candidate: Candidate, anchors: Sequence[Anchor], fires: Sequence[Fire]) -> tuple[Any, ...]:
+    """After `score.rank_key`: fewer options, fires closer to the anchors, fewer unlabeled fires overall (beyond the labeled stretch too), then the description, so the order is stable."""
+    return (complexity(candidate), _fit_error(stats, anchors, fires), len(stats.outside_fires), describe(candidate))
+
+
 def dedupe(evaluator: Evaluator, labels: Labels, candidates: Iterable[Candidate]) -> list[Candidate]:
     """One candidate per set of fire instants (and `while` periods held): the simplest, in order of first appearance."""
     groups: dict[tuple[Any, ...], list[Candidate]] = {}
@@ -637,6 +642,8 @@ class _Search:
         self._crossing_cache: dict[tuple[str, str], _Crossings] = {}
         self._while_cache: dict[Condition, bool] = {}
         self._unlabeled = labels.unlabeled_intervals(timeline.start, timeline.end)
+        lo, hi = labels.span or (0.0, 0.0)
+        self._unlabeled_near = [(max(a, lo), min(b, hi)) for a, b in self._unlabeled if a < hi and b > lo]
         self.evaluated = 0
 
     # Entities
@@ -760,24 +767,26 @@ class _Search:
 
     # Screening
 
-    def screen(self, trigger: Trigger, anchors: Sequence[Anchor]) -> tuple[int, int, int, list[float]]:
-        """`(anchors hit, must-not fires, unlabeled fires, fires)` of one trigger, by binary search."""
+    def screen(self, trigger: Trigger, anchors: Sequence[Anchor]) -> tuple[int, int, int, int, list[float]]:
+        """`(anchors hit, must-not fires, unlabeled fires within the labeled stretch, all unlabeled fires, fires)` of one trigger, by binary search."""
         fires = self.ev.trigger_fires(trigger)
         self.evaluated += 1
         before, after = self.tolerance.before, self.tolerance.after
         hits = sum(bisect_right(fires, a.at + after) > bisect_left(fires, a.at - before) for a in anchors)
         must_not = sum(bisect_left(fires, p.end) - bisect_left(fires, p.start) for p in self.labels.no_fire_periods)
         unlabeled = sum(bisect_left(fires, hi) - bisect_left(fires, lo) for lo, hi in self._unlabeled)
-        return hits, must_not, unlabeled, fires
+        near = sum(bisect_right(fires, hi) - bisect_left(fires, lo) for lo, hi in self._unlabeled_near)
+        return hits, must_not, near, unlabeled, fires
 
     def best_triggers(self, anchors: Sequence[Anchor], trigger_id: str | None, beam: int) -> list[Trigger]:
         min_hits = max(1, math.ceil(len(anchors) * self.options.min_recall))
         screened = []
         for trigger in self.triggers(anchors, trigger_id, min_hits):
-            hits, must_not, unlabeled, fires = self.screen(trigger, anchors)
+            hits, must_not, near, unlabeled, fires = self.screen(trigger, anchors)
             if hits:
                 single = Candidate((trigger,))
-                screened.append(((-hits, must_not, unlabeled, simplicity(single), complexity(single), describe(single)), trigger, tuple(fires)))
+                key = (-hits, must_not, near, simplicity(single), complexity(single), unlabeled, describe(single))
+                screened.append((key, trigger, tuple(fires)))
         if not screened:
             return []
         most = -min(key[0] for key, *_ in screened)
@@ -917,6 +926,7 @@ class _Search:
         good = [j for j, k in enumerate(kinds) if k == "anchor"]
         must_not = [j for j, k in enumerate(kinds) if k == "no_fire"]
         unlabeled = [j for j, k in enumerate(kinds) if k == "unlabeled"]
+        near = [j for j in unlabeled if labels.in_span(fires[j].at)]
         results = [self.score(base, fires)]
         if not must_not and not unlabeled:
             return results
@@ -939,7 +949,8 @@ class _Search:
                     m |= 1 << position[j]
             return m
 
-        must_not_mask, unlabeled_mask = mask_of(must_not), mask_of(unlabeled)
+        must_not_mask, near_mask = mask_of(must_not), mask_of(near)
+        far_mask = mask_of(unlabeled) & ~near_mask
         anchor_masks: dict[Anchor, int] = defaultdict(int)
         for j in good:
             for anchor in labels.anchors_matching(fires[j].at, ids[j]):
@@ -961,7 +972,7 @@ class _Search:
         for _ in range(self.options.max_conditions):
             grown = []
             for conditions, m in frontier:
-                bad_nf, bad_un = (m & must_not_mask).bit_count(), (m & unlabeled_mask).bit_count()
+                bad_nf, bad_near, bad_far = ((m & mask).bit_count() for mask in (must_not_mask, near_mask, far_mask))
                 options = []
                 for condition, cm in pool:
                     if condition in conditions:
@@ -970,11 +981,13 @@ class _Search:
                     if not all(nm & r for r in required):
                         continue
                     removed_nf = bad_nf - (nm & must_not_mask).bit_count()
-                    removed_un = bad_un - (nm & unlabeled_mask).bit_count()
-                    if removed_nf + removed_un == 0:
+                    removed_near = bad_near - (nm & near_mask).bit_count()
+                    removed_far = bad_far - (nm & far_mask).bit_count()
+                    if removed_nf + removed_near + removed_far == 0:
                         continue
                     part = Candidate((), (condition,))
-                    options.append(((-removed_nf, -removed_un, simplicity(part)[2], complexity(part)), condition, nm))
+                    key = (-removed_nf, -removed_near, simplicity(part)[2], complexity(part), -removed_far)
+                    options.append((key, condition, nm))
                 options.sort(key=lambda item: item[0])
                 for _, condition, nm in options[: self.options.branch]:
                     chosen_set = frozenset((*conditions, condition))
@@ -995,7 +1008,7 @@ class _Search:
     def score(self, candidate: Candidate, fires: list[Fire]) -> _Scored:
         self.evaluated += 1
         stats = score_candidate(self.ev, candidate, self.labels, fires)
-        key = (*rank_key(stats, candidate), complexity(candidate), _fit_error(stats, self.labels.anchors, fires), describe(candidate))
+        key = (*rank_key(stats, candidate), *tie_break(stats, candidate, self.labels.anchors, fires))
         return _Scored(candidate, stats, fires, key)
 
 

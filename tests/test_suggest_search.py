@@ -209,15 +209,46 @@ def test_recovers_a_numeric_threshold_with_for():
 
 def test_recovers_a_weekday_time_trigger():
     rng = random.Random(3)
-    initial, changes = distractors(rng, 7)
-    tl = timeline(initial, changes, 7)
-    labels = Labels([fire(day * D + 7 * H + rng.uniform(0, 100)) for day in range(5)])  # Mon-Fri, a week
+    initial, changes = distractors(rng, 14)
+    tl = timeline(initial, changes, 14)
+    # Mon-Fri of two weeks: the weekend between them is inside the labeled stretch, so its 07:00 counts against "every day".
+    labels = Labels([fire(day * D + 7 * H + rng.uniform(0, 100)) for day in range(12) if day % 7 < 5])
     result = run(tl, labels, sun=drifting_sun(4))
     best = top(result)
     assert best.candidate.triggers == (TimeTrigger(7 * H),)
     assert best.candidate.conditions == (TimeCondition(weekdays=WEEKDAYS),)
     assert best.stats.recall == 1.0 and not best.stats.outside_fires
     assert "only on Mon–Fri" in best.explanation
+
+
+def test_a_few_labels_generalize_instead_of_fitting_conditions_to_them():
+    """The light follows every door opening; the user labels only the first three. The rest of the window is unlabeled, not
+    negative: conditions that merely exclude the later openings (a weekday, a narrow time window, a noise sensor's state) must
+    not beat the plain trigger, which lists the later openings as outside fires to label."""
+    rng = random.Random(11)
+    initial, changes = distractors(rng, 5)
+    initial[DOOR] = "off"
+    openings = sorted(day * D + rng.uniform(6 * H, 23 * H) for day in range(5) for _ in range(4))
+    for at in openings:
+        changes += [(at, DOOR, "on"), (at + M, DOOR, "off")]
+    tl = timeline(initial, changes, 5)
+    labels = Labels([fire(at) for at in openings[:3]])
+
+    best = top(run(tl, labels, sun=drifting_sun(4)))
+
+    assert best.candidate == Candidate((StateTrigger(DOOR, to=("on",)),))
+    assert len(best.stats.outside_fires) == len(openings) - 3
+
+
+def test_one_label_suggests_the_plain_trigger():
+    rng = random.Random(12)
+    initial, changes = distractors(rng, 3)
+    initial[DOOR] = "off"
+    openings = sorted(day * D + rng.uniform(6 * H, 23 * H) for day in range(3) for _ in range(3))
+    for at in openings:
+        changes += [(at, DOOR, "on"), (at + M, DOOR, "off")]
+    best = top(run(timeline(initial, changes, 3), Labels([fire(openings[4])]), sun=drifting_sun(4)))
+    assert best.candidate == Candidate((StateTrigger(DOOR, to=("on",)),))
 
 
 def motion_episodes(rng):

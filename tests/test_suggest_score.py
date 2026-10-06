@@ -53,7 +53,9 @@ def test_stats_sort_every_fire_into_anchor_violation_inside_or_outside():
     assert [t - T0 for t in stats.no_fire_violations] == [9 * H, 9.5 * H]
     assert [t - T0 for t in stats.inside_fires] == [6 * H]  # the off inside a start-anchored period
     assert [t - T0 for t in stats.outside_fires] == [12 * H, 12.2 * H]
+    assert stats.outside_nearby == 2  # both before the last labeled moment (21:00)
     assert stats.recall == 0.75
+    assert score_candidate(ev, on_off, Labels(labels.labels[:2])).outside_nearby == 0  # past a stretch ending at 07:00
 
 
 def test_trigger_ids_keep_start_fires_off_end_anchors():
@@ -96,21 +98,23 @@ def test_roundness_and_simplicity():
     assert simplicity(Candidate((SunTrigger("sunset", offset=-1800),))) < simplicity(Candidate((SunTrigger("sunset", offset=-1745),)))
 
 
-def stats(hit=4, total=4, violations=0, outside=0, while_held=0, while_total=0):
+def stats(hit=4, total=4, violations=0, outside=0, while_held=0, while_total=0, beyond=0):
+    """`outside` unlabeled fires within the labeled stretch, `beyond` more past it."""
     return Stats(
-        fires=hit + violations + outside,
+        fires=hit + violations + outside + beyond,
         anchors_hit=hit,
         anchors_total=total,
         missed=(),
         no_fire_violations=tuple(range(violations)),
-        outside_fires=tuple(range(outside)),
+        outside_fires=tuple(range(outside + beyond)),
+        outside_nearby=outside,
         inside_fires=(),
         while_held=while_held,
         while_total=while_total,
     )
 
 
-def test_rank_order_is_recall_then_violations_then_outside_then_simplicity():
+def test_rank_order_is_recall_then_violations_then_nearby_outside_then_simplicity():
     simple = Candidate((StateTrigger(DOOR, to=("on",)),))
     complex_ = simple.with_condition(TimeCondition(after=18 * H)).with_condition(TimeCondition(before=23 * H))
     ranked = sorted(
@@ -120,12 +124,14 @@ def test_rank_order_is_recall_then_violations_then_outside_then_simplicity():
             ("all hit, many outside", stats(outside=9), simple),
             ("all hit, clean, complex", stats(), complex_),
             ("all hit, clean, simple", stats(), simple),
+            ("all hit, many beyond the labels, simple", stats(beyond=9), simple),
             ("all hit, one outside", stats(outside=1), simple),
         ],
         key=lambda item: rank_key(item[1], item[2]),
     )
     assert [name for name, _, _ in ranked] == [
         "all hit, clean, simple",
+        "all hit, many beyond the labels, simple",  # unlabeled fires past the labeled stretch only break ties (search.tie_break)
         "all hit, clean, complex",
         "all hit, one outside",
         "all hit, many outside",

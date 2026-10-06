@@ -11,7 +11,7 @@ from typing import Any
 
 from .evaluate import Fire
 from .score import Stats, rank_key, score_fires
-from .search import Suggestion, SuggestResult, _fit_error, _hints, complexity, describe, explain
+from .search import Suggestion, SuggestResult, _hints, explain, tie_break
 from .timeline import to_ts
 
 # Run outcomes that are not a fire: the trigger fired but a condition stopped the run, or (HA 2026.9+) the trigger evaluated a change and did not fire. Every other outcome (fired, dropped by the mode, aborted, ...) passed the conditions.
@@ -109,9 +109,7 @@ def apply_exact(
         key = (
             1 if diverged else 0,
             *rank_key(stats, candidate),
-            complexity(candidate),
-            _fit_error(stats, labels.anchors, fires),
-            describe(candidate),
+            *tie_break(stats, candidate, labels.anchors, fires),
         )
         explanation = explain(candidate, stats, context.anchor_words)
         ranked.append(

@@ -1,6 +1,6 @@
 """How a candidate did on the labels, and the order suggestions are ranked in.
 
-Every fire is sorted into one bucket (see `Labels.classify`): matching an anchor, inside a must-not period (a hard failure), inside a should-fire period away from its anchors (neutral), or in unlabeled time (soft evidence against, and listed so the user can label it). The ranking follows the spec: anchor recall first (all anchors hit beats most), then `while` periods held, then fires inside must-not periods, then fires in unlabeled time, then simplicity (fewer conditions, no `for:`, round thresholds and times).
+Every fire is sorted into one bucket (see `Labels.classify`): matching an anchor, inside a must-not period (a hard failure), inside a should-fire period away from its anchors (neutral), or in unlabeled time (soft evidence against, and listed so the user can label it). The ranking follows the spec: anchor recall first (all anchors hit beats most), then `while` periods held, then fires inside must-not periods, then fires in unlabeled time within the labeled stretch, then simplicity (fewer conditions, no `for:`, round thresholds and times), then unlabeled fires beyond the stretch.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ class Stats:
     while_held: int = 0
     while_total: int = 0
     fire_times: tuple[float, ...] = ()  # every fire, in order (the panel draws them)
+    outside_nearby: int = 0  # outside fires within the labeled stretch (`Labels.span`), the ones that count against the candidate
 
     @property
     def recall(self) -> float:
@@ -105,6 +106,7 @@ def score_fires(evaluator: Evaluator, candidate: Candidate, labels: Labels, fire
         missed=tuple(a for a in labels.anchors if a not in hit),
         no_fire_violations=tuple(violations),
         outside_fires=tuple(outside),
+        outside_nearby=sum(labels.in_span(t) for t in outside),
         inside_fires=tuple(inside),
         while_held=held,
         while_total=len(labels.while_periods),
@@ -156,11 +158,14 @@ def simplicity(candidate: Candidate) -> tuple[int, int, int, int]:
 
 
 def rank_key(stats: Stats, candidate: Candidate) -> tuple[Any, ...]:
-    """Sort key, best first: recall, while periods held, must-not fires, unlabeled fires, simplicity."""
+    """Sort key, best first: recall, while periods held, must-not fires, unlabeled fires within the labeled stretch, simplicity.
+
+    Unlabeled fires beyond the labeled stretch only break ties (`search.tie_break`): a few labels say little about the rest of the window, and a condition that only excludes it fits the labels rather than the rule (the real-data benchmark, docs/benchmarks/). They are still listed as hints to label.
+    """
     return (
         -stats.recall,
         -stats.while_ratio,
         len(stats.no_fire_violations),
-        len(stats.outside_fires),
+        stats.outside_nearby,
         simplicity(candidate),
     )

@@ -1,6 +1,6 @@
 """Labeled periods and the anchors they yield.
 
-A label is `{start, end, kind: "fire" | "no_fire", anchor: "start" | "end" | "both" | "while"}` (times ISO or POSIX seconds). A should-fire label anchored at its start and/or end yields one anchor per edge; a fire *matches* an anchor when it lands within the tolerance around it (default 2 min before to 10 min after, both ends inclusive). A trigger with id `start` or `end` (the on/off pair a `both` label asks for) only matches anchors of its own edge. A `while` label yields no anchor: it marks a period the automation may act in, whose conditions should hold throughout. A must-not label makes any fire inside it a hard failure, even one within an anchor's tolerance.
+A label is `{start, end, kind: "fire" | "no_fire", anchor: "start" | "end" | "both" | "while"}` (times ISO or POSIX seconds). A should-fire label anchored at its start and/or end yields one anchor per edge; a fire *matches* an anchor when it lands within the tolerance around it (default 2 min before to 10 min after, both ends inclusive). A trigger with id `start` or `end` (the on/off pair a `both` label asks for) only matches anchors of its own edge. A `while` label yields no anchor: it marks a period the automation may act in, whose conditions should hold throughout. A must-not label makes any fire inside it a hard failure, even one within an anchor's tolerance. The labels' `span` runs from the first labeled moment to the last: unlabeled time inside it is time the user looked at and left unlabeled, unlabeled time beyond it may simply not have been looked at.
 
 Periods are half-open `[start, end)`.
 """
@@ -92,6 +92,11 @@ class Labels:
         self.fire_periods = [label for label in self.labels if label.kind == "fire"]
         self.no_fire_periods = [label for label in self.labels if label.kind == "no_fire"]
         self.while_periods = [label for label in self.fire_periods if label.anchor == "while"]
+        # The labeled stretch: from the first labeled moment to the last (anchors with their tolerance, and every period).
+        edges = [(label.start, label.end) for label in self.labels] + [
+            (a.at - self.tolerance.before, a.at + self.tolerance.after) for a in self.anchors
+        ]
+        self.span = (min(lo for lo, _ in edges), max(hi for _, hi in edges)) if edges else None
 
     @classmethod
     def from_dicts(cls, labels: Iterable[Mapping[str, Any]], tolerance: Tolerance | None = None) -> Labels:
@@ -122,6 +127,10 @@ class Labels:
         if any(label.contains(t) for label in self.fire_periods):
             return "inside"
         return "unlabeled"
+
+    def in_span(self, t: float) -> bool:
+        """`t` is within the labeled stretch: the user looked here, so an unlabeled fire here is evidence against a candidate. Beyond it, an unlabeled fire is only a hint to label."""
+        return self.span is not None and self.span[0] <= t <= self.span[1]
 
     def is_unlabeled(self, t: float) -> bool:
         """`t` is in no labeled period and outside every anchor's tolerance."""
