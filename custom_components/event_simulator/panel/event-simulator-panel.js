@@ -1755,7 +1755,8 @@ export function triggerYaml(config) {
 /* One suggestion as a card shows it: {rank, explanation, exact, config, hits, total,
  * missed: [{at, edge}], violations, outside, inside (ms, sorted), fires, fireTimes (ms or
  * null when the backend sent none), whileHeld, whileTotal, approx (the miner's stats when
- * the sandbox ones replaced them)}. */
+ * the sandbox ones differ from them), diverged (the sandbox's fires differ a lot from the
+ * estimate's, so it was ranked on the sandbox's)}. */
 export function suggestionView(raw, index = 0) {
   const s = isObject(raw) ? raw : {};
   const stats = isObject(s.stats) ? s.stats : {};
@@ -1769,6 +1770,7 @@ export function suggestionView(raw, index = 0) {
     rank: count(s.rank, index + 1),
     explanation: String(s.explanation || config.description || "").trim(),
     exact: s.exact === true,
+    diverged: s.diverged === true,
     config,
     hits: count(stats.anchors_hit, Math.max(0, total - missed.length)),
     total,
@@ -3832,7 +3834,11 @@ class EventSimulatorPanel extends Base {
       `<li>${v.outside.length ? `${v.outside.length} fire${v.outside.length === 1 ? "" : "s"} in unlabeled time · ${this._jumpLinks(v.outside)}` : `<span class="muted">no fires in unlabeled time</span>`}</li>`,
       v.inside.length ? `<li class="muted">${v.inside.length} more inside should-fire periods, away from their anchors</li>` : "",
       v.whileTotal ? `<li>conditions hold throughout ${v.whileHeld}/${v.whileTotal} “while” period${v.whileTotal === 1 ? "" : "s"}</li>` : "",
-      v.exact && v.approx && Number.isFinite(v.approx.fires) && v.approx.fires !== v.fires ? `<li class="muted small">the estimate said ${v.approx.fires} fires; the sandbox found ${v.fires}</li>` : "",
+      v.diverged
+        ? `<li class="small stale">Home Assistant fired this one quite differently from the estimate${v.approx && Number.isFinite(v.approx.fires) ? ` (${v.approx.fires} estimated, ${v.fires} in the sandbox)` : ""}; the numbers above are the sandbox's</li>`
+        : v.exact && v.approx && Number.isFinite(v.approx.fires) && v.approx.fires !== v.fires
+          ? `<li class="muted small">the estimate said ${v.approx.fires} fires; the sandbox found ${v.fires}</li>`
+          : "",
     ].filter(Boolean).join("");
     const key = `sg-yaml-${v.rank}`;
     return `
@@ -5724,7 +5730,7 @@ class EventSimulatorPanel extends Base {
       .fm.missed { fill: none; stroke: var(--success-color, #43a047); stroke-width: 1.5; stroke-dasharray: 3 2; }
       .suggest-card h2 { margin: 0; font-size: 1.1em; font-weight: 500; }
       .sg-top { display: flex; align-items: baseline; gap: 6px 12px; flex-wrap: wrap; margin-bottom: 10px; }
-      .sg-top .stale { color: var(--warning-color, #ff9800); }
+      .sg-top .stale, .sg-stats .stale { color: var(--warning-color, #ff9800); }
       .sg-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
       .sg { border: 1px solid var(--divider-color); border-left: 4px solid var(--divider-color); border-radius: 8px; padding: 10px 12px; min-width: 0; }
       .sg.sel { border-left-color: var(--primary-color); box-shadow: 0 0 0 1px var(--primary-color) inset; }

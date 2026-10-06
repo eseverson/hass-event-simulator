@@ -81,6 +81,8 @@ test("a suggestion reads as a card: explanation, stats in ms, the exact badge", 
   assert.deepEqual(v.outside, [T0 + 22 * H]);
   assert.equal(v.fireTimes.length, 4);
   assert.deepEqual(v.approx, { fires: 6 });
+  assert.equal(v.diverged, false);
+  assert.equal(suggestionView({ ...RESULT.suggestions[0], diverged: true }).diverged, true);
 });
 
 test("a sparse or malformed suggestion still makes a card", () => {
