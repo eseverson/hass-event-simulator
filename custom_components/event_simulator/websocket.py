@@ -10,6 +10,8 @@ import logging
 import threading
 from typing import Any
 
+import astral
+import astral.sun
 import voluptuous as vol
 import yaml
 
@@ -17,7 +19,6 @@ from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.sun import get_astral_location
 from homeassistant.util import dt as dt_util
 from homeassistant.util.yaml import parse_yaml
 
@@ -425,15 +426,14 @@ async def async_suggest(
 @callback
 def async_sun_events(hass: HomeAssistant) -> Callable[[date], dict[str, datetime | None]]:
     """The miner's `sun_events(date)`: what `homeassistant.helpers.sun.get_astral_event_date` returns for sunrise and sunset at this instance's location (None when the sun does not rise or set that day). The location is looked up here, on the event loop; the returned function is pure astral math, safe in the executor."""
-    location, elevation = get_astral_location(hass)
+    # The observer `homeassistant.helpers.sun.get_astral_observer` builds (2026.9+; earlier releases use `get_astral_location`, which 2026.9 deprecates), with the same astral calls.
+    observer = astral.Observer(hass.config.latitude, hass.config.longitude, hass.config.elevation)
 
     def sun_events(day: date) -> dict[str, datetime | None]:
         events: dict[str, datetime | None] = {}
         for event in ("sunrise", "sunset"):
             try:
-                events[event] = getattr(location, event)(
-                    day, local=False, observer_elevation=elevation
-                )
+                events[event] = getattr(astral.sun, event)(observer, day)
             except ValueError:
                 events[event] = None
         return events

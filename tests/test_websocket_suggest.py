@@ -278,9 +278,17 @@ async def test_a_failed_validation_falls_back_to_the_miner(
     assert final["suggestions"][0]["stats"]["anchors_hit"] == 3
 
 
-async def test_sun_events_come_from_the_instance_location(hass: HomeAssistant, setup):
+async def test_sun_events_come_from_the_instance_location(
+    hass: HomeAssistant, setup, caplog: pytest.LogCaptureFixture
+):
     sun_events = websocket.async_sun_events(hass)
     day = dt_util.now().date()
     events = sun_events(day)
+    assert "deprecated" not in caplog.text  # get_astral_location is, from 2026.9 (removed in 2027.7)
     assert events["sunrise"] == get_astral_event_date(hass, "sunrise", day)
     assert events["sunset"] == get_astral_event_date(hass, "sunset", day)
+    # A polar day (no sunset) is None, as Home Assistant's helper says.
+    hass.config.latitude = 78.2
+    polar = websocket.async_sun_events(hass)(day.replace(month=6, day=21))
+    assert polar["sunset"] is None
+    assert polar["sunset"] == get_astral_event_date(hass, "sunset", day.replace(month=6, day=21))
