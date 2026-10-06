@@ -679,7 +679,7 @@ function stripMarks(item) {
 /* The scenario sent to event_simulator/simulate (see the design spec). Events from all
  * tracks merged into one list ordered by time, as the child replays them. `automation`
  * is always the config as an object, edited or not (see the config editor below). */
-export function buildScenario({ automation, start, end, tracks }) {
+export function buildScenario({ automation, start, end, tracks, busEvents = [] }) {
   const initial_states = {};
   const events = [];
   for (const track of tracks) {
@@ -687,7 +687,7 @@ export function buildScenario({ automation, start, end, tracks }) {
     for (const ev of track.events) events.push(stripMarks(ev));
   }
   events.sort((a, b) => parseTime(a.at) - parseTime(b.at));
-  return {
+  const scenario = {
     version: 1,
     // No `core` block: no websocket command hands the panel the instance's time zone,
     // location and units, so simulate fills it in server side from hass.config
@@ -698,6 +698,66 @@ export function buildScenario({ automation, start, end, tracks }) {
     initial_states,
     events,
   };
+  // Recorded bus events, only those the automation's event triggers listen to (#35).
+  const bus = busEventsFor(busEvents, eventTriggerTypes(automation), start, end);
+  if (bus.length) scenario.bus_events = bus;
+  return scenario;
+}
+
+/* Recorded bus events (#35): zha_event, tag_scanned, ... of the window, from the recorder's
+ * events table (history.async_get_bus_events), Home Assistant's own bookkeeping left out. */
+export function busEventsMessage(start, end) {
+  return {
+    type: "event_simulator/bus_events",
+    start: new Date(start).toISOString(),
+    end: new Date(end).toISOString(),
+  };
+}
+
+/* The event types an automation's event triggers listen to (`trigger: event` or the legacy
+ * `platform: event`, one type or a list), as a Set; null when one is a template, which could
+ * name any type. */
+export function eventTriggerTypes(automation) {
+  const types = new Set();
+  if (!automation || typeof automation !== "object") return types;
+  const raw = automation.triggers ?? automation.trigger ?? [];
+  for (const trigger of Array.isArray(raw) ? raw : [raw]) {
+    if (!trigger || typeof trigger !== "object") continue;
+    if ((trigger.trigger ?? trigger.platform) !== "event") continue;
+    const named = Array.isArray(trigger.event_type) ? trigger.event_type : [trigger.event_type];
+    for (const type of named) {
+      if (typeof type !== "string") continue;
+      if (type.includes("{{") || type.includes("{%")) return null;
+      types.add(type);
+    }
+  }
+  return types;
+}
+
+/* The bus events of `types` (null: every type) inside [start, end). */
+export function busEventsFor(events, types, start, end) {
+  if (types && !types.size) return [];
+  return (events || []).filter((e) => {
+    const t = parseTime(e.at);
+    return t >= start && t < end && (!types || types.has(e.event_type));
+  });
+}
+
+/* What the Events lane draws: each type with its count and a class index (busiest first),
+ * and one mark per event with a title listing its data. */
+export function busEventLane(events, fmt = (ms) => new Date(ms).toISOString()) {
+  const counts = new Map();
+  for (const e of events || []) counts.set(e.event_type, (counts.get(e.event_type) || 0) + 1);
+  const types = [...counts]
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+    .map(([event_type, count], index) => ({ event_type, count, index }));
+  const indexOf = new Map(types.map((t) => [t.event_type, t.index]));
+  const marks = (events || []).map((e) => {
+    const t = parseTime(e.at);
+    const lines = Object.entries(e.data || {}).map(([k, v]) => `${k}: ${v !== null && typeof v === "object" ? JSON.stringify(v) : v}`);
+    return { t, index: indexOf.get(e.event_type), title: [`${e.event_type} ${fmt(t)}`, ...lines].join("\n") };
+  });
+  return { types, marks };
 }
 
 /* Home Assistant's websocket closes the connection on a message over 4 MiB (aiohttp's
@@ -2169,6 +2229,8 @@ const DISCRETE_H = 24;
 const NUMERIC_H = 56;
 const RESULTS_H = 38;
 const HINTS_H = 26;
+const BUS_H = 22;
+const BUS_CLASSES = 6; // event types with their own color; the rest share the last
 const FIRES_H = 26;
 
 /* The Fires row's marker for a fire mark (see fireMarks): shape as well as color. */
@@ -2315,6 +2377,11 @@ class EventSimulatorPanel extends Base {
     // (an old one behind a cached panel) answers unknown_command, which turns this off.
     this._suggestAvail = true;
     this._suggestRun = null; // the suggest/subscribe in flight: {seq, print, done, unsub}
+    // Recorded bus events of the window (#35): the Events lane, and what a replay of an
+    // event-triggered automation fires. `_busKey` is the window they were loaded for.
+    this._busEvents = [];
+    this._busDropped = [];
+    this._busKey = null;
     // {running, text, stage, error, stale, result: {suggestions: [suggestionView], hints:
     // [hintView], evaluated, warnings}}; a result stays shown (dimmed) while the next runs.
     this._suggestState = null;
@@ -2502,6 +2569,7 @@ class EventSimulatorPanel extends Base {
    * replace those tracks' data. A response is dropped if the automation or the window
    * changed while it was in flight (both bump _requestToken and reload everything). */
   async _loadHistory(entityIds = null) {
+    this._loadBusEvents();
     const token = this._requestToken;
     const ids = entityIds || this._tracks.map((t) => t.entity_id);
     this._error = null;
@@ -2536,6 +2604,26 @@ class EventSimulatorPanel extends Base {
     }
     this._loading = null;
     this._render();
+  }
+
+  /* The window's recorded bus events, once per window; a backend without the command (or a
+   * failed read) leaves the lane empty, and replays go without them. */
+  async _loadBusEvents() {
+    const { start, end } = this._window;
+    const key = `${start}-${end}`;
+    if (this._busKey === key) return;
+    this._busKey = key;
+    this._busEvents = [];
+    this._busDropped = [];
+    try {
+      const found = await this._hass.callWS(busEventsMessage(start, end));
+      if (this._busKey !== key) return;
+      this._busEvents = found.bus_events || [];
+      this._busDropped = found.dropped_event_types || [];
+    } catch (e) {
+      if (this._busKey === key) this._busEvents = [];
+    }
+    this._scheduleTimeline();
   }
 
   /* Recorded timelines of `ids` in the current window: Map entity_id -> {initial, events}. */
@@ -3462,7 +3550,7 @@ class EventSimulatorPanel extends Base {
       return null;
     }
     const message = simulateSubscribeMessage(
-      buildScenario({ automation: this._runConfig(), start: this._window.start, end: this._window.end, tracks: this._tracks })
+      buildScenario({ automation: this._runConfig(), start: this._window.start, end: this._window.end, tracks: this._tracks, busEvents: this._busEvents })
     );
     const size = messageBytes(message);
     const tooLarge = messageSizeError(message, size);
@@ -4165,7 +4253,9 @@ class EventSimulatorPanel extends Base {
       edited ? `${edited} edited track${edited === 1 ? "" : "s"}` : "",
       this._cfgDraft ? "the edited automation config" : "",
     ].filter(Boolean);
-    return `Replays ${events} state change${events === 1 ? "" : "s"} on ${this._tracks.length} track${this._tracks.length === 1 ? "" : "s"}${what.length ? `, with ${what.join(" and ")}` : ""}${this._autoRun ? ", after every change" : ""}. Service calls are recorded, never made.`;
+    const bus = this._busLaneEvents().length;
+    const fired = bus ? ` and ${bus} recorded event${bus === 1 ? "" : "s"}` : "";
+    return `Replays ${events} state change${events === 1 ? "" : "s"} on ${this._tracks.length} track${this._tracks.length === 1 ? "" : "s"}${fired}${what.length ? `, with ${what.join(" and ")}` : ""}${this._autoRun ? ", after every change" : ""}. Service calls are recorded, never made.`;
   }
 
   _automationOptions() {
@@ -4421,6 +4511,8 @@ class EventSimulatorPanel extends Base {
       if (this._suggestion(this._suggestSel)) parts.push(this._firesRow(scale));
     }
     if (this._mode === "replay" && (this._result || this._running)) parts.push(this._resultsRow(scale));
+    const bus = this._busLaneEvents();
+    if (bus.length) parts.push(this._busEventsRow(scale, bus));
     for (const track of this._tracks) parts.push(this._trackRow(track, scale));
     tl.innerHTML = parts.join("");
     // The hover line starts under the axis and its scroll bar.
@@ -4429,6 +4521,45 @@ class EventSimulatorPanel extends Base {
     if (axis && cursor) cursor.style.top = `${axis.offsetHeight}px`;
     this._placeLabelPopover(scale);
     this._placeHintPopover(scale);
+  }
+
+  /* The bus events the Events lane shows: all of them in Suggest mode (event triggers are
+   * mined from them), in Replay mode those the automation's event triggers listen to. */
+  _busLaneEvents() {
+    if (!this._busEvents.length) return [];
+    const { start, end } = this._window;
+    if (this._mode === "suggest") return busEventsFor(this._busEvents, null, start, end);
+    let config = null;
+    try {
+      config = this._runConfig();
+    } catch {
+      config = null;
+    }
+    return busEventsFor(this._busEvents, eventTriggerTypes(config), start, end);
+  }
+
+  /* The Events lane (read-only): one tick per recorded bus event, a color per type, its data
+   * in the tooltip. */
+  _busEventsRow(scale, events) {
+    const lane = busEventLane(events, (t) => this._clock.full(t));
+    let out = this._gridLines(scale, BUS_H);
+    for (const m of lane.marks) {
+      if (m.t < scale.t0 || m.t > scale.t1) continue;
+      const x = scale.toX(m.t).toFixed(1);
+      out += `<line x1="${x}" x2="${x}" y1="4" y2="${BUS_H - 4}" class="bus-mark b${Math.min(m.index, BUS_CLASSES - 1)}"><title>${esc(m.title)}</title></line>`;
+    }
+    const shown = lane.types.slice(0, BUS_CLASSES);
+    const rest = lane.types.slice(BUS_CLASSES).reduce((n, t) => n + t.count, 0);
+    const items = shown.map(
+      (t) => `<span class="legend-item"><svg class="legend-mark" width="10" height="12" aria-hidden="true"><line x1="5" x2="5" y1="1" y2="11" class="bus-mark b${t.index}"/></svg>${esc(t.event_type)} ${t.count}</span>`
+    );
+    if (rest) items.push(`${rest} more`);
+    if (this._busDropped.length) items.push(`<span title="${esc(this._busDropped.join(", "))}">${this._busDropped.length} busy type${this._busDropped.length === 1 ? "" : "s"} not loaded</span>`);
+    return `
+      <div class="row bus-row">
+        <div class="track-head"><span class="name">Events</span><span class="meta">${items.join(" · ")}</span></div>
+        <svg class="bus" data-row="bus" width="${scale.width}" height="${BUS_H}">${out}</svg>
+      </div>`;
   }
 
   /* The Hints row: where the top suggestions fire outside the labels (circles) and where the
@@ -5925,7 +6056,14 @@ class EventSimulatorPanel extends Base {
       .pop-group button.primary.small-btn { padding: 4px 12px; }
       .pop-group .nofire-btn { border-color: var(--error-color, #db4437); }
       .pop-group .nofire-btn.primary { background: var(--error-color, #db4437); border-color: var(--error-color, #db4437); }
-      svg.hints, svg.fires { background: var(--secondary-background-color); border-radius: 4px; }
+      svg.hints, svg.fires, svg.bus { background: var(--secondary-background-color); border-radius: 4px; }
+      .bus-mark { stroke-width: 2; stroke-linecap: round; }
+      .bus-mark.b0 { stroke: var(--info-color, #039be5); }
+      .bus-mark.b1 { stroke: var(--warning-color, #ff9800); }
+      .bus-mark.b2 { stroke: var(--success-color, #43a047); }
+      .bus-mark.b3 { stroke: #8e24aa; }
+      .bus-mark.b4 { stroke: #00897b; }
+      .bus-mark.b5 { stroke: var(--secondary-text-color); }
       svg.hints { cursor: pointer; }
       .hint.outside { fill: var(--secondary-text-color); }
       .hint.recur { fill: var(--info-color, #039be5); }

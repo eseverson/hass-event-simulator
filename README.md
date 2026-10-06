@@ -77,7 +77,7 @@ The selected suggestion's fires show on a **Fires** row: green on an anchor, red
 
 Switch the panel to **Suggest** mode to have the simulator analyze your history and propose automation triggers and conditions. See the [Suggest design spec](docs/superpowers/specs/2026-10-05-suggestions-design.md) for details.
 
-**How it works.** Label periods in the history as should-fire or must-not-fire, then the simulator searches for trigger + condition combinations that match your labels. It generates candidates from state transitions, numeric thresholds, time-of-day, and sun events, then adds conditions (greedily) to remove unwanted fires. Top candidates are validated by replaying them in the sandbox so the stats are exact.
+**How it works.** Label periods in the history as should-fire or must-not-fire, then the simulator searches for trigger + condition combinations that match your labels. It generates candidates from state transitions, numeric thresholds, time-of-day, sun events and recorded bus events (a ZHA remote's `zha_event`, a `tag_scanned`, a phone's notification action: the event type plus the `event_data` keys that single out the labeled ones), then adds conditions (greedily) to remove unwanted fires. Top candidates are validated by replaying them in the sandbox so the stats are exact.
 
 **Understanding suggestion stats.** Each suggestion shows:
 
@@ -89,9 +89,9 @@ Click **Open in simulator** to load the suggestion into Replay mode on the same 
 
 **Limits.** Suggest mode is a deterministic search — no ML models, no randomness. Every suggestion is explainable from the stats shown. It works within the following constraints:
 
-- **No actions.** The simulator generates only triggers and conditions; the action is a placeholder (`logbook.log`) that you replace. Template triggers are not supported.
+- **No actions.** The simulator generates only triggers and conditions; the action is a placeholder (`logbook.log`) that you replace. Template triggers are not generated ([#38](https://github.com/eseverson/hass-event-simulator/issues/38)), and neither are calendar triggers with an offset ([#37](https://github.com/eseverson/hass-event-simulator/issues/37)); a calendar event starting or ending at the labeled moment comes back as the calendar entity turning on or off ("an event of calendar.x starts").
 - **No multi-entity "and" triggers.** Each candidate uses a single-entity trigger. Conditions across multiple entities are supported.
-- **Supported trigger platforms:** `state`, `numeric_state`, `time`, `sun`.
+- **Supported trigger platforms:** `state`, `numeric_state`, `time`, `sun`, `event` (event types the recorder stores, except Home Assistant's own bookkeeping such as `automation_triggered`, `call_service` or `*_registry_updated`; the panel shows them on an **Events** row, and up to 20,000 a window are read, the busiest types left out first).
 - **Supported condition platforms:** `state`, `numeric_state`, `time` (after/before, weekday), `sun` (before/after).
 - **Window:** up to 30 days (vs 7 for replay mode), because patterns need repetition.
 - **Entities:** same 50-track limit as replay mode.
@@ -110,7 +110,7 @@ The replay attaches the automation at the window start, writes each timeline cha
 
 **One automation at a time.** The automation under test is the only one in the sandbox, so automations that trigger each other cannot be replayed together.
 
-**Only state changes and time drive a replay.** The timeline holds state changes. Triggers that wait for something else — an `event` trigger, a webhook, a tag scan — have nothing to fire on, and a `homeassistant: start` trigger does not fire because the automation is attached after the sandbox has started.
+**Only state changes, recorded events and time drive a replay.** The timeline holds state changes, and an automation with `event` triggers also gets the recorded events of the types it listens to, fired at their times (shown on the **Events** row; a tag scan is the `tag_scanned` event). Events the recorder does not store (it skips none by default, but `recorder: exclude: event_types` can) and triggers that wait for something else — a webhook, an MQTT message, a calendar — have nothing to fire on, and a `homeassistant: start` trigger does not fire because the automation is attached after the sandbox has started.
 
 **Some trigger and condition platforms cannot run.** Custom integrations are never loaded in the sandbox, so a trigger or condition from one is refused, as are device triggers, conditions and actions specific to an integration such as ZHA, MQTT or Hue (they need that integration's runtime state, not just its code). The error names each one by its place in the config. Device automations of entity domains (`binary_sensor`, `light`, `sensor`, ...) work. Whether custom platforms should ever be loaded is an open question, [#14](https://github.com/eseverson/hass-event-simulator/issues/14).
 
