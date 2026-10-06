@@ -411,7 +411,7 @@ export function describeRunError(err) {
     return {
       title: RUN_ERROR_TITLES.unknown_command,
       message:
-        "This build of the integration cannot run simulations yet: the backend has no event_simulator/simulate command. Update the integration and restart Home Assistant.",
+        "This build of the integration cannot run simulations: the backend has no event_simulator/simulate/subscribe command. Update the integration and restart Home Assistant.",
       code: "unknown_command",
       stderr: "",
     };
@@ -571,6 +571,24 @@ export function simulateMessage(scenario) {
   return { type: "event_simulator/simulate", scenario: { ...scenario, events: packEvents(scenario.events || []) } };
 }
 
+/* The cancellable event_simulator/simulate/subscribe request auto-run sends: acknowledged at
+ * once, answered by one event (see replayOutcome); unsubscribing kills the replay. */
+export function simulateSubscribeMessage(scenario) {
+  return { ...simulateMessage(scenario), type: "event_simulator/simulate/subscribe" };
+}
+
+/* What a simulate/subscribe event (or a rejected subscribe, as {error}) means for the panel:
+ * {kind: "result", result} (raw), {kind: "error", error: describeRunError(...)}, or
+ * {kind: "superseded"} when a newer replay replaced it. */
+export function replayOutcome(event) {
+  const raw = isObject(event?.result) ? event.result : null;
+  const failure = raw ? (raw.error && !Array.isArray(raw.runs) ? raw : null) : event;
+  if (!failure) return { kind: "result", result: raw };
+  const err = isObject(failure.error) ? { ...failure.error, stderr_tail: failure.error.stderr_tail ?? failure.stderr_tail } : failure.error ?? failure;
+  if (err?.code === "superseded") return { kind: "superseded" };
+  return { kind: "error", error: describeRunError(err) };
+}
+
 /* The event_simulator/scenarios/save request for a scenarioPayload, overwriting
  * `scenarioId` when given. Events go packed losslessly, so a save is as large as Run's. */
 export function saveMessage(payload, scenarioId) {
@@ -584,14 +602,170 @@ export function saveMessage(payload, scenarioId) {
 
 /* null when a request fits in one websocket message, else a {code, message} error to show
  * instead of sending it (sending it would drop the whole frontend connection). */
-export function messageSizeError(message) {
-  const bytes = new TextEncoder().encode(JSON.stringify(message)).length;
+export function messageSizeError(message, bytes = messageBytes(message)) {
   if (bytes <= WS_MESSAGE_LIMIT) return null;
   const mb = (n) => (n / (1024 * 1024)).toFixed(1);
   return {
     code: "too_large",
     message: `This request is ${mb(bytes)} MB, and Home Assistant accepts at most 4 MB in one websocket message. Try a shorter window or fewer tracks.`,
   };
+}
+
+/* The size of a websocket request on the wire, in bytes. */
+export function messageBytes(message) {
+  return new TextEncoder().encode(JSON.stringify(message)).length;
+}
+
+// ---- auto-run ---------------------------------------------------------------
+// The panel replays by itself after every change to what a replay depends on: debounced,
+// latest wins. ReplayScheduler decides when to start a replay and which answer counts;
+// the panel supplies `start` (send it) and `cancel` (abandon it, which kills the child).
+
+export const AUTO_RUN_DELAY = 500; // ms after the last change
+export const SLOW_RUN_MS = 3000; // a replay slower than this, of ...
+export const LARGE_SCENARIO_BYTES = 512 * 1024; // ... a request larger than this, backs off
+export const MAX_AUTO_RUN_DELAY = 10e3;
+const AUTO_RUN_KEY = "event_simulator.auto_run";
+
+/* The debounce after a replay that took `last.duration` ms for a `last.size` byte request.
+ * A slow replay of a big scenario (days of a chatty sensor) waits about as long as that
+ * replay took, so a burst of edits does not restart it over and over; a slow small one is
+ * just the sandbox booting, which a longer wait would not help. */
+export function autoRunDelay(last) {
+  if (!last || last.duration <= SLOW_RUN_MS || last.size <= LARGE_SCENARIO_BYTES) return AUTO_RUN_DELAY;
+  return Math.min(MAX_AUTO_RUN_DELAY, Math.max(AUTO_RUN_DELAY, last.duration));
+}
+
+/* The remembered Auto-run toggle (default on). Storage can be missing or throw (private
+ * windows, blocked site data); then it is just on. */
+export function readAutoRunPref(storage = globalThis.localStorage) {
+  try {
+    return storage?.getItem(AUTO_RUN_KEY) !== "off";
+  } catch {
+    return true;
+  }
+}
+
+export function writeAutoRunPref(on, storage = globalThis.localStorage) {
+  try {
+    storage?.setItem(AUTO_RUN_KEY, on ? "on" : "off");
+  } catch {
+    // not remembered; nothing else depends on it
+  }
+}
+
+/* When to replay, and which answer is current.
+ *
+ * `change()` after an edit (re)arms the debounce while auto-run is on; otherwise it only
+ * marks the inputs dirty. A replay starts only while `setReady(true)` (an automation is
+ * loaded, no history load is pending, the config parses); one due meanwhile waits for it.
+ * Starting a replay cancels the one in flight, and `finish(seq)` says whether an answer is
+ * still the current one. `start(seq, {forced})` returns `{size}` (request bytes) when it
+ * sent something, or null when it ran nothing (inputs unchanged, request too large). */
+export class ReplayScheduler {
+  constructor({ start, cancel, enabled = true, now = () => Date.now(), setTimer = (fn, ms) => setTimeout(fn, ms), clearTimer = (id) => clearTimeout(id) }) {
+    Object.assign(this, { _start: start, _cancel: cancel, _now: now, _setTimer: setTimer, _clearTimer: clearTimer });
+    this.enabled = enabled;
+    this.ready = false;
+    this.dirty = false; // inputs changed since the last replay started
+    this._forced = false; // Run now pressed, waiting to be ready
+    this._timer = null;
+    this._seq = 0;
+    this._inflight = null; // {seq, startedAt, size}
+    this._last = null; // {duration, size} of the last replay that finished
+  }
+
+  get running() {
+    return this._inflight !== null;
+  }
+
+  get scheduled() {
+    return this._timer !== null;
+  }
+
+  get delay() {
+    return autoRunDelay(this._last);
+  }
+
+  change() {
+    this.dirty = true;
+    if (this.enabled) this._arm();
+  }
+
+  setEnabled(on) {
+    this.enabled = !!on;
+    if (!this.enabled) this._disarm();
+    else if (this.dirty) this._arm();
+  }
+
+  setReady(ready) {
+    const was = this.ready;
+    this.ready = !!ready;
+    if (!this.ready || was) return;
+    if (this._forced) this._launch();
+    else if (this.dirty && this.enabled && this._timer === null) this._arm();
+  }
+
+  runNow() {
+    this._disarm();
+    this._forced = true;
+    if (this.ready) this._launch();
+  }
+
+  /* The answer for `seq` arrived: true when it is the current one (and so ends it). */
+  finish(seq) {
+    if (this._inflight?.seq !== seq) return false;
+    this._last = { duration: this._now() - this._inflight.startedAt, size: this._inflight.size };
+    this._inflight = null;
+    return true;
+  }
+
+  /* What a replay would answer no longer applies (another automation, window or
+   * scenario): drop the one in flight and anything pending. */
+  invalidate() {
+    this._disarm();
+    this.dirty = false;
+    this._forced = false;
+    this._seq++;
+    this._abandon();
+  }
+
+  dispose() {
+    this.invalidate();
+  }
+
+  _arm() {
+    this._disarm();
+    this._timer = this._setTimer(() => {
+      this._timer = null;
+      if (this.ready) this._launch();
+    }, this.delay);
+  }
+
+  _disarm() {
+    if (this._timer !== null) this._clearTimer(this._timer);
+    this._timer = null;
+  }
+
+  _abandon() {
+    const prev = this._inflight;
+    this._inflight = null;
+    if (prev) this._cancel(prev.seq);
+  }
+
+  _launch() {
+    const forced = this._forced;
+    this._forced = false;
+    this.dirty = false;
+    const seq = ++this._seq;
+    this._abandon();
+    // In flight from before `start`, which may redraw and ask `running`.
+    const inflight = (this._inflight = { seq, startedAt: this._now(), size: 0 });
+    const sent = this._start(seq, { forced });
+    if (this._inflight !== inflight) return; // start answered or replaced it already
+    if (sent) inflight.size = sent.size ?? 0;
+    else this._inflight = null;
+  }
 }
 
 /* `YYYY-MM-DDTHH:MM` in local time, the value format of <input type="datetime-local">. */
@@ -1033,7 +1207,6 @@ class EventSimulatorPanel extends Base {
     this._loading = null; // text while automations/automation/history load
     this._error = null; // load error shown above the timeline
     this._notice = null;
-    this._running = false;
     this._result = null; // normalizeResult() of the last run
     this._resultStale = false;
     this._runError = null; // {message, code, stderr}
@@ -1070,6 +1243,21 @@ class EventSimulatorPanel extends Base {
     this._printCache = null;
     this._focusName = false; // focus the name prompt on the next render
     this._open = {}; // open state of <details data-key>, kept across redraws
+    // Auto-run: replay after every change (debounced, latest wins); see ReplayScheduler.
+    this._autoRun = readAutoRunPref();
+    this._replay = null; // the replay in flight: {seq, print, unsub, done}
+    this._resultPrint = null; // _fingerprint() of the inputs the shown result came from
+    this._renderDeferred = false; // a render held back until a drag ends
+    this._resumeReplay = false;
+    this._scheduler = new ReplayScheduler({
+      enabled: this._autoRun,
+      start: (seq, opts) => this._startReplay(seq, opts),
+      cancel: (seq) => this._cancelReplay(seq),
+    });
+  }
+
+  get _running() {
+    return this._scheduler.running;
   }
 
   set hass(hass) {
@@ -1096,10 +1284,18 @@ class EventSimulatorPanel extends Base {
   connectedCallback() {
     if (this._rendered && this._resizeObserver) this._observeWidth();
     window.addEventListener("keydown", this._onShortcut);
+    if (this._resumeReplay) {
+      this._resumeReplay = false;
+      this._scheduler.change();
+      this._render();
+    }
   }
 
   disconnectedCallback() {
     window.removeEventListener("keydown", this._onShortcut);
+    // Off screen nothing shows a replay, so none runs; one owed is made up on return.
+    this._resumeReplay = this._scheduler.running || this._scheduler.dirty;
+    this._scheduler.invalidate();
     this._resizeObserver?.disconnect();
     cancelAnimationFrame(this._frame);
   }
@@ -1107,6 +1303,10 @@ class EventSimulatorPanel extends Base {
   // ---- data ---------------------------------------------------------------
 
   async _connect() {
+    // A reconnect drops the replay subscription without an answer; ask again.
+    this._hass.connection?.addEventListener?.("ready", () => {
+      if (this._scheduler.running) this._scheduler.change();
+    });
     this._loading = "Loading automations…";
     this._render();
     loadYamlEditor().then((ok) => {
@@ -1463,6 +1663,7 @@ class EventSimulatorPanel extends Base {
     this._updateDirty();
     // Run's enabled state and hint live in the main area; redraw it only on a change of state.
     if (before[0] !== (this._cfgDraft !== null) || before[1] !== !!this._cfgError) this._render();
+    else this._syncReady();
   }
 
   _revertConfig() {
@@ -1558,47 +1759,125 @@ class EventSimulatorPanel extends Base {
         : "Run uses the automation as saved in Home Assistant.";
   }
 
+  /* The result no longer applies (another automation, window or scenario): drop it and
+   * anything in flight, and replay afresh once the new inputs have loaded. */
   _clearResult() {
     this._result = null;
     this._runError = null;
     this._selectedRun = null;
     this._resultStale = false;
+    this._resultPrint = null;
+    this._scheduler.invalidate();
+    this._scheduler.change();
   }
 
+  /* Something a replay depends on changed: the shown result is out of date, and auto-run
+   * replays once the changes pause. */
   _markStale() {
     if (this._result) this._resultStale = true;
+    this._scheduler.change();
   }
 
-  async _run() {
-    if (!this._automation || this._running || this._cfgError) return;
-    const scenario = buildScenario({
-      automation: this._runConfig(),
-      start: this._window.start,
-      end: this._window.end,
-      tracks: this._tracks,
-    });
-    const message = simulateMessage(scenario);
-    const tooLarge = messageSizeError(message);
+  /* Whether a replay can start now: an automation, no load pending, a config that parses. */
+  _syncReady() {
+    this._scheduler.setReady(!!this._automation && !this._loading && !this._cfgError);
+  }
+
+  _run() {
+    this._scheduler.runNow();
+  }
+
+  _setAutoRun(on) {
+    this._autoRun = !!on;
+    writeAutoRunPref(this._autoRun);
+    this._scheduler.setEnabled(this._autoRun);
+    this._render();
+  }
+
+  /* ReplayScheduler's `start`: send replay `seq`, or skip it when nothing changed since the
+   * shown result (unless forced by Run now) or the request is too large to send. */
+  _startReplay(seq, { forced }) {
+    const print = this._fingerprint();
+    if (!forced && this._result && !this._runError && print === this._resultPrint) {
+      this._resultStale = false;
+      this._renderSoon();
+      return null;
+    }
+    const message = simulateSubscribeMessage(
+      buildScenario({ automation: this._runConfig(), start: this._window.start, end: this._window.end, tracks: this._tracks })
+    );
+    const size = messageBytes(message);
+    const tooLarge = messageSizeError(message, size);
     if (tooLarge) {
       this._runError = describeRunError(tooLarge);
-      return this._render();
+      this._renderSoon();
+      return null;
     }
-    this._running = true;
-    this._runError = null;
+    const replay = { seq, print, unsub: null, done: false };
+    this._replay = replay;
+    this._hass.connection
+      .subscribeMessage((event) => this._onReplayEvent(replay, event), message, { resubscribe: false })
+      .then((unsub) => {
+        replay.unsub = unsub;
+        if (replay.done) this._unsubscribe(replay);
+      })
+      .catch((err) => this._onReplayEvent(replay, { error: err }));
+    this._renderSoon();
+    return { size };
+  }
+
+  /* ReplayScheduler's `cancel`: abandon replay `seq`; unsubscribing kills its child. */
+  _cancelReplay(seq) {
+    const replay = this._replay;
+    if (!replay || replay.seq !== seq) return;
+    replay.done = true;
+    this._replay = null;
+    this._unsubscribe(replay);
+  }
+
+  _unsubscribe(replay) {
+    const unsub = replay.unsub;
+    replay.unsub = null;
+    // Rejects when the connection dropped meanwhile, which ended the replay anyway.
+    if (unsub) Promise.resolve().then(unsub).catch(() => {});
+  }
+
+  _onReplayEvent(replay, event) {
+    if (replay.done) return;
+    replay.done = true;
+    this._unsubscribe(replay);
+    if (this._replay === replay) this._replay = null;
+    if (!this._scheduler.finish(replay.seq)) return; // a newer replay replaced it
+    const outcome = replayOutcome(event);
+    if (outcome.kind === "error") {
+      this._runError = outcome.error;
+      if (this._result) this._resultStale = true;
+    } else if (outcome.kind === "result") {
+      const selected = this._selectedRun;
+      this._result = normalizeResult(outcome.result);
+      this._runError = null;
+      this._resultPrint = replay.print;
+      this._resultStale = this._scheduler.dirty || this._fingerprint() !== replay.print;
+      // Keep the run being inspected across replays when it is still there.
+      const runs = this._result.runs;
+      this._selectedRun = runs.some((r) => r.index === selected) ? selected : (runs[0]?.index ?? null);
+    }
+    this._renderSoon();
+  }
+
+  /* Render now, or once the drag in progress ends: a redraw replaces the timeline the
+   * pointer is captured by. */
+  _renderSoon() {
+    if (this._evDrag || this._drag) {
+      this._renderDeferred = true;
+      return;
+    }
     this._render();
-    try {
-      const raw = await this._hass.callWS(message);
-      if (raw && raw.error && !Array.isArray(raw.runs)) {
-        this._runError = describeRunError({ ...(isObject(raw.error) ? raw.error : { message: String(raw.error) }), stderr_tail: raw.stderr_tail });
-      } else {
-        this._result = normalizeResult(raw);
-        this._resultStale = false;
-        this._selectedRun = this._result.runs[0]?.index ?? null;
-      }
-    } catch (e) {
-      this._runError = describeRunError(e);
-    }
-    this._running = false;
+  }
+
+  _flushRender() {
+    if (!this._renderDeferred || this._evDrag || this._drag) return;
+    this._renderDeferred = false;
     this._render();
   }
 
@@ -1848,6 +2127,9 @@ class EventSimulatorPanel extends Base {
     const timelineFocused = this.shadowRoot.activeElement?.id === "tl-wrap";
     const nameInput = this.shadowRoot.activeElement?.id === "sc-name" ? this.shadowRoot.activeElement : null;
     const caret = nameInput ? [nameInput.selectionStart, nameInput.selectionEnd] : null;
+    // Replays finish whenever they finish, so a redraw can land while a field is typed in:
+    // keep that field's focus, unsent text and caret.
+    const typing = this._focusedField();
     root.innerHTML = this._html();
     this.shadowRoot.getElementById("detail").innerHTML = this._detailCard();
     const add = root.querySelector("#add-track");
@@ -1872,7 +2154,33 @@ class EventSimulatorPanel extends Base {
       });
     }
     this._focusName = false;
+    if (typing) this._restoreField(typing);
     this._updateDirty();
+    this._syncReady();
+  }
+
+  _focusedField() {
+    const el = this.shadowRoot.activeElement;
+    if (!el?.id || el.id === "sc-name" || !/^(INPUT|TEXTAREA)$/.test(el.tagName) || el.type === "checkbox") return null;
+    let sel = null;
+    try {
+      sel = el.selectionStart == null ? null : [el.selectionStart, el.selectionEnd];
+    } catch {
+      // datetime-local has no text selection
+    }
+    return { id: el.id, value: el.value, sel };
+  }
+
+  _restoreField({ id, value, sel }) {
+    const el = this.shadowRoot.getElementById(id);
+    if (!el) return;
+    if (el.value !== value) el.value = value;
+    el.focus({ preventScroll: true });
+    try {
+      if (sel) el.setSelectionRange(...sel);
+    } catch {
+      // not a text field
+    }
   }
 
   /* `open` for a <details data-key>, remembered across redraws. */
@@ -1921,9 +2229,13 @@ class EventSimulatorPanel extends Base {
             <div class="segmented">${presets}</div>
           </div>
           <div class="run-row">
-            <button class="primary" data-action="run" ${!this._automation || this._running || this._loading || this._cfgError ? "disabled" : ""}>
-              ${this._running ? "Running…" : "Run"}
+            <label class="auto-run" title="Replay automatically after each change">
+              <input type="checkbox" id="auto-run" ${this._autoRun ? "checked" : ""}> Auto-run
+            </label>
+            <button class="${this._autoRun ? "" : "primary"}" data-action="run" ${!this._automation || this._loading || this._cfgError ? "disabled" : ""} title="Replay now, even when nothing changed">
+              Run now
             </button>
+            ${this._running ? `<span class="spinner" aria-label="Replaying"></span>` : ""}
             <span class="muted small">${esc(this._runHint())}</span>
           </div>
           ${this._scenarioHtml()}
@@ -2013,6 +2325,10 @@ class EventSimulatorPanel extends Base {
 
   _runHint() {
     if (this._running) return "Replaying the window in the sandbox…";
+    if (!this._autoRun && this._automation && (this._resultStale || !this._result)) {
+      if (this._cfgError) return "The edited automation config does not parse; fix it or revert it below.";
+      return "Auto-run is off: Run now replays the window with the changes so far.";
+    }
     if (!this._entityId && !this._automation) return "Pick an automation to load its entities.";
     if (!this._automation) return "";
     if (this._cfgError) return "The edited automation config does not parse; fix it or revert it below.";
@@ -2022,7 +2338,7 @@ class EventSimulatorPanel extends Base {
       edited ? `${edited} edited track${edited === 1 ? "" : "s"}` : "",
       this._cfgDraft ? "the edited automation config" : "",
     ].filter(Boolean);
-    return `Replays ${events} state change${events === 1 ? "" : "s"} on ${this._tracks.length} track${this._tracks.length === 1 ? "" : "s"}${what.length ? `, with ${what.join(" and ")}` : ""}. Service calls are recorded, never made.`;
+    return `Replays ${events} state change${events === 1 ? "" : "s"} on ${this._tracks.length} track${this._tracks.length === 1 ? "" : "s"}${what.length ? `, with ${what.join(" and ")}` : ""}${this._autoRun ? ", after every change" : ""}. Service calls are recorded, never made.`;
   }
 
   _automationOptions() {
@@ -2118,7 +2434,7 @@ class EventSimulatorPanel extends Base {
             ${e.stderr ? `<pre class="stderr">${esc(e.stderr)}</pre>` : `<div class="small muted">The sandbox logged nothing before it stopped.</div>`}
           </details>`
         : "";
-    return `<div class="alert error run-error"><div class="alert-body"><strong>${esc(e.title)}</strong><div class="msg">${esc(e.message)}</div>${details}</div></div>`;
+    return `<div class="alert error run-error${this._running ? " updating" : ""}"><div class="alert-body"><strong>${esc(e.title)}</strong><div class="msg">${esc(e.message)}</div>${details}</div></div>`;
   }
 
   /* Result warnings, grouped by code, each with the virtual time it happened at. */
@@ -2384,7 +2700,11 @@ class EventSimulatorPanel extends Base {
           .map((g) => `<span class="legend-item"><svg class="legend-mark" width="14" height="14" aria-hidden="true">${outcomeMarker(g.outcome, 7, 7)}</svg>${g.count} ${esc(g.text)}</span>`)
           .join(" · ")
       : "no runs";
-    const stale = this._resultStale ? ` <span class="stale">inputs changed since this run</span>` : "";
+    const stale = this._running
+      ? ` <span class="updating-note"><span class="spinner small"></span>updating…</span>`
+      : this._resultStale
+        ? ` <span class="stale">inputs changed since this run</span>`
+        : "";
     let marks = "";
     for (const run of runs) {
       if (run.finished < scale.t0 || run.started > scale.t1) continue;
@@ -2401,7 +2721,7 @@ class EventSimulatorPanel extends Base {
       marks += `<line x1="${x}" x2="${x}" y1="25" y2="${RESULTS_H - 2}" class="call-tick"/>`;
     }
     return `
-      <div class="row results-row">
+      <div class="row results-row${this._running ? " updating" : ""}">
         <div class="track-head"><span class="name">Runs</span><span class="meta">${summary} · ${calls.length} service call${calls.length === 1 ? "" : "s"}${stale}</span></div>
         <svg class="results" data-row="results" width="${scale.width}" height="${RESULTS_H}">
           ${this._gridLines(scale, RESULTS_H)}${marks}
@@ -2412,6 +2732,10 @@ class EventSimulatorPanel extends Base {
   _detailCard() {
     const result = this._result;
     if (!result) return "";
+    return `<div class="detail${this._running ? " updating" : ""}">${this._detailHtml(result)}</div>`;
+  }
+
+  _detailHtml(result) {
     const warnings = this._warningsHtml(result.warnings);
     const run = result.runs.find((r) => r.index === this._selectedRun);
     if (!run) {
@@ -2487,13 +2811,17 @@ class EventSimulatorPanel extends Base {
     wrap.addEventListener("wheel", (ev) => this._onWheel(ev), { passive: false });
     wrap.addEventListener("pointerdown", (ev) => this._onPointerDown(ev));
     wrap.addEventListener("pointermove", (ev) => this._onPointerMove(ev));
-    wrap.addEventListener("pointerup", (ev) => this._onPointerUp(ev));
+    wrap.addEventListener("pointerup", (ev) => {
+      this._onPointerUp(ev);
+      this._flushRender();
+    });
     wrap.addEventListener("pointercancel", () => {
       this._drag = null;
       if (this._evDrag) {
         this._evDrag = null;
         this._scheduleTimeline();
       }
+      this._flushRender();
     });
     wrap.addEventListener("pointerleave", () => {
       if (!this._evDrag?.moved) this._hideHover();
@@ -2834,6 +3162,7 @@ class EventSimulatorPanel extends Base {
   _onChange(ev) {
     const id = ev.target.id;
     if (id === "automation") this._selectAutomation(ev.target.value);
+    else if (id === "auto-run") this._setAutoRun(ev.target.checked);
     else if (id === "win-start" || id === "win-end") {
       const start = fromLocalInput(this.shadowRoot.getElementById("win-start").value);
       const end = fromLocalInput(this.shadowRoot.getElementById("win-end").value);
@@ -2946,6 +3275,10 @@ class EventSimulatorPanel extends Base {
       .segmented button { border: 0; border-radius: 0; font-size: 0.85em; padding: 3px 10px; color: var(--secondary-text-color); }
       .segmented button.on { background: var(--primary-color); color: var(--text-primary-color, #fff); }
       .run-row { display: flex; align-items: center; gap: 12px; flex: 1 1 100%; flex-wrap: wrap; }
+      .auto-run { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+      .updating { opacity: .55; transition: opacity .2s; }
+      .updating-note { display: inline-flex; align-items: center; gap: 4px; }
+      .spinner.small { width: 10px; height: 10px; border-width: 2px; }
       .alert { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 0.92em; }
       .alert.error { background: rgba(219, 68, 55, .15); color: var(--error-color, #db4437); }
       .alert.warning { background: rgba(255, 152, 0, .15); color: var(--primary-text-color); border: 1px solid rgba(255,152,0,.4); }

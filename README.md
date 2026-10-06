@@ -44,13 +44,15 @@ The **Event Simulator** panel appears in the sidebar for admin users. It needs H
 
 **Edit the automation config** in the YAML editor under the timeline to try a different trigger, condition or action. The edit only changes what the simulator runs. It is never saved to Home Assistant, and **Revert to saved automation** puts the real config back. `!include`, `!secret` and other custom YAML tags are refused.
 
-**Run** replays the window. Runs land on a results row under the shared time axis, each with its own marker shape and color: fired, stopped by a condition, aborted inside the actions, cancelled (by a `restart` re-trigger), dropped by the automation's `mode` (the legend says which: `single`, `max_runs`, or recursive), still running after the overrun, or errored. The legend above the row counts each. Selecting a run shows when it started and how long it took, the trigger, each condition's result, the step that stopped it, any error, and the service calls it recorded. Warnings from the replay (an event outside the window, a call to a service your instance does not have, a run still going when the replay ended) are listed with the results.
+**Results follow your edits.** With **Auto-run** on (the default), the panel replays the window by itself whenever what it depends on changes: picking an automation, changing the window, adding or removing a track, any timeline edit (on drop for a drag), undo and reset, an automation config edit once it parses, loading a scenario. It waits for half a second of quiet first, so a burst of edits replays once, and for any history still loading; the last results stay on screen, dimmed, until the new ones arrive, and a newer replay abandons (and stops) the one in flight. After a replay of a large timeline took more than 3 seconds, it waits about that long instead. Turn Auto-run off (the choice is remembered in this browser) to replay only on **Run now**, which also re-runs on demand when nothing changed.
+
+Runs land on a results row under the shared time axis, each with its own marker shape and color: fired, stopped by a condition, aborted inside the actions, cancelled (by a `restart` re-trigger), dropped by the automation's `mode` (the legend says which: `single`, `max_runs`, or recursive), still running after the overrun, or errored. The legend above the row counts each. Selecting a run shows when it started and how long it took, the trigger, each condition's result, the step that stopped it, any error, and the service calls it recorded. Warnings from the replay (an event outside the window, a call to a service your instance does not have, a run still going when the replay ended) are listed with the results.
 
 **Save** the setup as a named scenario to come back to it: the automation config (edited or not) and the automation it came from, the window, the tracked entities and the timeline, edits included. Scenarios are kept in `.storage/event_simulator.scenarios`, up to 100 of them. Loading one puts it back on screen as saved; it does not re-read the recorder, so a scenario still replays after the history behind it has been purged.
 
 ## How it works
 
-Each Run starts a child process with the same Python interpreter Home Assistant runs on, importing the same `homeassistant` package, so triggers, conditions, templates and script steps behave as they do live, version for version. The child boots a throwaway Home Assistant in a temporary config directory with no recorder, HTTP server, frontend or network-facing integrations, sets up only the automation under test, and deletes the directory when it is done. It gets a minimal environment, so tokens and credentials in the live process's environment do not reach it. It copies the live instance's time zone, location, elevation and unit system, any Labs preview features you have turned on, and a slice of the entity, device, area, floor and label registries — the entries the automation and its tracks can see — so `area_entities()`, `device_attr()` and similar templates, and device triggers of entity-domain integrations such as `binary_sensor` and `light`, resolve as they do live.
+Each replay starts a child process with the same Python interpreter Home Assistant runs on, importing the same `homeassistant` package, so triggers, conditions, templates and script steps behave as they do live, version for version. The child boots a throwaway Home Assistant in a temporary config directory with no recorder, HTTP server, frontend or network-facing integrations, sets up only the automation under test, and deletes the directory when it is done. It gets a minimal environment, so tokens and credentials in the live process's environment do not reach it. It copies the live instance's time zone, location, elevation and unit system, any Labs preview features you have turned on, and a slice of the entity, device, area, floor and label registries — the entries the automation and its tracks can see — so `area_entities()`, `device_attr()` and similar templates, and device triggers of entity-domain integrations such as `binary_sensor` and `light`, resolve as they do live.
 
 Time in the child is virtual. Its event loop never sleeps: when nothing is ready to run it jumps straight to the next timer or timeline change, so a `for:` of an hour, a `delay`, a `time` trigger and a `sun` condition all see the time they would have seen, and a day replays in seconds. The initial states keep their recorded `last_changed`, so a `for:` early in the window counts from when the state really changed.
 
@@ -77,12 +79,12 @@ The replay attaches the automation at the window start, writes each timeline cha
 | Window | 7 days |
 | Tracked entities | 50 |
 | Timeline changes | 50,000 |
-| One request to Home Assistant (Run and Save send the timeline packed, so a week of a sensor reporting every 15 s fits) | 4 MB |
+| One request to Home Assistant (replays and saves send the timeline packed, so a week of a sensor reporting every 15 s fits) | 4 MB |
 | Registry slice sent to the sandbox | 500 entities, 250 devices (the rest is dropped with a warning) |
 | Edited automation YAML | 256 KiB, 100,000 nodes |
 | Overrun after the window for runs in progress | 1 hour |
 | Wall-clock time for one replay | 300 seconds |
-| Replays at once | 2 (more wait their turn) |
+| Replays at once | 2 (more wait their turn); one per panel, a newer replay stops the one in flight |
 | Saved scenarios | 100, names up to 100 characters, 500,000 timeline changes in all |
 
 ## Development
