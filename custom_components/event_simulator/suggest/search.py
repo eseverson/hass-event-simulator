@@ -7,7 +7,7 @@ How it searches (see docs/superpowers/specs/2026-10-05-suggestions-design.md):
 1. Sides. A label anchored at `both` asks for an on/off pair, so the start and end anchors are searched independently (trigger ids `start` / `end`) and combined. Otherwise one side covers every anchor and triggers carry no id. Labels that are only `while` periods also anchor at each period's start: the automation should act when the period begins, with conditions that hold throughout it.
 2. Trigger candidates around the anchors, each evaluated over the whole window:
    - `state`: every state change near an anchor (to, and from + to), attribute changes when the state is static, and `for:` when a state consistently began a similar lag before the anchors (quantized to friendly durations). Anchors that follow changes in two or three directions also get one trigger listing them all (a toggle). A free-form entity (`FREE_FORM` or more values in the window, most seen once: a timestamp, a counter, free text) only offers values it took more than once, and a trigger on any change of its state (`to: null`).
-   - `numeric_state`: `above` / `below`, the threshold searched over the full window's values. The behavior of a threshold only changes at observed values, so each gap between consecutive distinct values is one candidate, represented by its roundest number; gaps are scored by how many anchors a crossing hits and how often the value crosses elsewhere. `for:` as for state.
+   - `numeric_state`: `above` / `below`, the threshold searched over the full window's values. The behavior of a threshold only changes at observed values, so each gap between consecutive distinct values is one candidate, represented by its roundest number; gaps are scored by how many anchors a crossing hits and how often the value crosses elsewhere. `for:` as for state. And a state trigger with no from/to (every report, as blueprint controllers re-evaluate), with `to: null` too when some reports change attributes only, when the anchors line up with its writes (within `ALIGN` seconds, more often than chance: any chatty sensor has some write within the tolerance of every anchor). A numeric attribute that changes while the state stays put gets the same trigger on the attribute. Conditions at fire time (`numeric_state` above/below) then narrow it, the template-free form of "every report while it is warm".
    - `time` / `sun`: when the anchors cluster by local clock time, or by sunrise/sunset offset; whichever clusters more anchors with less spread wins. The time is chosen at or just before the cluster and rounded.
    Triggers that hit fewer than `min_recall` of the best trigger's anchors are dropped before any condition search, and only the best `beam` go on.
    When no single trigger hits every anchor of a side, ORs of up to `max_triggers` triggers (possibly on different entities or of different kinds) join them: greedy set cover from each of the best `union_seeds` triggers, each step adding the trigger, searched again around the anchors still missed, that hits the most of them with the fewest bad fires. A trigger joins only as evidence, not chance: it hits the missed anchors more often than its fires would at random (binomial tail at `union_alpha`), and one fitted to a single moment (a clock time, a threshold, a `for:`) never joins for one anchor. The parts of an OR keep their side's trigger id, so a start/end pair stays a pair; each extra part costs as much simplicity as a condition.
@@ -56,6 +56,8 @@ _INF = math.inf
 FREE_FORM = 4  # an entity (or attribute) with at least this many values in the window, most of them seen once, is free-form: a timestamp, a counter, free text
 MAX_SUN_OFFSET = 3 * 3600  # a sun trigger or condition further from the event reads as a clock time
 _MERGE = 60  # outside fires of several suggestions closer than this are one hint
+ALIGN = 5.0  # an any-change trigger is offered when anchors fall this close (seconds) to the entity's writes ...
+ALIGN_ALPHA = 0.05  # ... more often than chance would, at this level
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,6 +271,8 @@ def describe_trigger(trigger: Trigger) -> str:
                 text = f"{target} changes from {_values_text(trigger.from_)}"
             elif trigger.not_to is not None:
                 text = f"{target} changes to anything but {_values_text(trigger.not_to)}"
+            elif trigger.changes_only:
+                text = f"{target} changes state"
             else:
                 text = f"{target} changes"
             if trigger.not_from is not None:
@@ -657,6 +661,8 @@ class _Part:
     nearest: dict[int, int]  # each hit anchor's nearest fire (index into the trigger's fires)
     chance: float  # share of the window within reach of its fires: the chance it hits an anchor placed at random
     rank: tuple[Any, ...]  # bad fires, simplicity, then how close its fires are to the anchors
+    aligned: frozenset[int] | None = None  # an any-change trigger: the anchors within `ALIGN` of its fires ...
+    align_chance: float = 0.0  # ... and the chance of that at random
 
 
 def _binomial_tail(n: int, k: int, p: float) -> float:
@@ -748,6 +754,7 @@ class _Search:
         free_form = self.free_form(entity_id)
         tos: set[str] = set()
         froms: set[str] = set()
+        changed_attributes: set[str] = set()
         for n, anchor in enumerate(anchors):
             for tr in step.transitions(anchor.at - before, anchor.at + after + 1e-6):
                 if tr.old_state != tr.state:
@@ -767,7 +774,10 @@ class _Search:
                     for key, value in tr.attributes.items():
                         if value is None or not isinstance(value, (str, int, float, bool)):
                             continue
-                        if tr.old_attributes.get(key) != value and self.recurs(entity_id, value, key):
+                        if tr.old_attributes.get(key) == value:
+                            continue
+                        changed_attributes.add(key)
+                        if self.recurs(entity_id, value, key):
                             support[StateTrigger(entity_id, attribute=key, to=(value,), id=tid)].add(n)
             # The state at the anchor began a while before it: a `for:` candidate.
             i = step.index_at(anchor.at)
@@ -791,6 +801,11 @@ class _Search:
                 if froms:
                     support[StateTrigger(entity_id, from_=tuple(sorted(froms)), to=tuple(sorted(tos)), id=tid)] = either
         found = {trigger for trigger, hits in support.items() if len(hits) >= min_hits}
+        for key in changed_attributes:
+            # Every change of the attribute (a thermostat's current_temperature), when the anchors follow its changes.
+            changes = [step.times[i] for i in step.write_range() if i and step.attributes[i].get(key) != step.attributes[i - 1].get(key)]
+            if self.lines_up(changes, anchors, min_hits):
+                found.add(StateTrigger(entity_id, attribute=key, id=tid))
         for state, per_anchor in lagged.items():
             if len(per_anchor) < min_hits:
                 continue
@@ -798,10 +813,27 @@ class _Search:
                 found.add(StateTrigger(entity_id, to=(state,), for_=duration, id=tid))
         return found
 
+    def lines_up(self, times: Sequence[float], anchors: Sequence[Anchor], min_hits: int) -> bool:
+        """Whether at least `min_hits` anchors fall within `ALIGN` seconds of `times` (an entity's writes), more often than chance would. A trigger on every write of a chatty entity has some write within the tolerance of any anchor, so only this tighter fit says the anchors follow its writes."""
+        if not times:
+            return False
+        aligned = sum(bisect_right(times, a.at + ALIGN) > bisect_left(times, a.at - ALIGN) for a in anchors)
+        if aligned < min_hits:
+            return False
+        chance = min(1.0, len(times) * 2 * ALIGN / max(self.timeline.end - self.timeline.start, 1.0))
+        return _binomial_tail(len(anchors), aligned, chance) <= ALIGN_ALPHA
+
     def _numeric_triggers(self, entity_id: str, anchors: Sequence[Anchor], tid: str | None, min_hits: int) -> set[Trigger]:
         step = self.timeline[entity_id]
         before, after, max_lag = self.tolerance.before, self.tolerance.after, self.options.max_lag
         found: set[Trigger] = set()
+        # Every report (the blueprint controller's `trigger: state` with no from/to), and every state change (`to: null`) when some reports change attributes only.
+        writes = [step.times[i] for i in step.write_range()]
+        if self.lines_up(writes, anchors, min_hits):
+            found.add(StateTrigger(entity_id, id=tid))
+            changes = [step.times[i] for i in step.write_range() if i and step.states[i] != step.states[i - 1]]
+            if len(changes) < len(writes) and self.lines_up(changes, anchors, min_hits):
+                found.add(StateTrigger(entity_id, changes_only=True, id=tid))
         for direction in ("above", "below"):
             crossings = self.crossings(entity_id, direction)
             if not crossings.times or len(crossings.values) < 2:
@@ -918,15 +950,23 @@ class _Search:
         single = Candidate((trigger,))
         fit = round(distance / len(nearest), 1) if nearest else 0.0
         rank = (must_not, near, simplicity(single), complexity(single), fit, unlabeled, describe(single))
-        return _Part(frozenset(nearest), nearest, covered / span, rank)
+        if not (isinstance(trigger, StateTrigger) and trigger.to is trigger.not_to is trigger.from_ is trigger.not_from is None):
+            return _Part(frozenset(nearest), nearest, covered / span, rank)
+        # A chatty sensor has a report within the tolerance of any anchor, so its evidence is the anchors that land on its reports.
+        aligned = frozenset(n for n, a in enumerate(anchors) if bisect_right(fires, a.at + ALIGN) > bisect_left(fires, a.at - ALIGN))
+        return _Part(frozenset(nearest), nearest, covered / span, rank, aligned, min(1.0, len(fires) * 2 * ALIGN / span))
 
     def _evidence(self, trigger: Trigger, part: _Part, new: Iterable[int], missed: int) -> bool:
-        """Whether a trigger hitting the `new` anchors (of `missed` ones) is evidence, not chance. What counts is the moments it fires at (one fire near a burst of labels is one moment): one fitted to a single moment (a clock time, a threshold, a `for:`) never is evidence, and anything else must fire near more of them than its fires would at random (binomial tail at `union_alpha`)."""
+        """Whether a trigger hitting the `new` anchors (of `missed` ones) is evidence, not chance. What counts is the moments it fires at (one fire near a burst of labels is one moment): one fitted to a single moment (a clock time, a threshold, a `for:`) never is evidence, and anything else must fire near more of them than its fires would at random (binomial tail at `union_alpha`). An any-change trigger on a chatty sensor fires near every anchor, so for it the anchors landing on its reports (within `ALIGN`) count instead."""
         moments = len({part.nearest[n] for n in new})
         fitted = isinstance(trigger, (TimeTrigger, SunTrigger, NumericStateTrigger)) or bool(getattr(trigger, "for_", 0))
         if fitted and moments < 2:
             return False
-        return _binomial_tail(missed, moments, part.chance) <= self.options.union_alpha
+        alpha = self.options.union_alpha
+        # Landing on the reports of an any-change trigger is the stronger claim (a sensor polled on the minute meets labels drawn on the minute), so it needs a tenth of the level.
+        if part.aligned is not None and _binomial_tail(missed, len(part.aligned.intersection(new)), part.align_chance) <= alpha / 10:
+            return True
+        return _binomial_tail(missed, moments, part.chance) <= alpha
 
     def unions(self, anchors: Sequence[Anchor], trigger_id: str | None, singles: Sequence[Trigger]) -> list[tuple[Trigger, ...]]:
         """ORs of up to `max_triggers` triggers, when no single trigger hits every anchor: greedy set cover from each of the best `union_seeds` triggers, each step adding the trigger (searched again around the anchors still missed) that hits the most of them, fewest bad fires first. A trigger joins only when it hits the missed anchors more often than chance would."""

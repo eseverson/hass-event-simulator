@@ -67,6 +67,9 @@ CANDIDATES = {
             StateTrigger(DOOR, attribute="battery"),
         )
     ),
+    # Every write (the 07:02 attribute-only one too) or every state change only, as an any-change trigger fires (#34).
+    "any_change": Candidate((StateTrigger(HUM), StateTrigger(DOOR)), (NumericStateCondition(HUM, above=70),)),
+    "state_change": Candidate((StateTrigger(DOOR, changes_only=True),)),
     "numeric": Candidate(
         (NumericStateTrigger(HUM, above=70, for_=180), NumericStateTrigger(HUM, below=70)),
         (StateCondition(PERSON, ("home",)),),

@@ -434,6 +434,118 @@ def test_a_single_trigger_covering_every_anchor_needs_no_union():
         assert len(suggestion.candidate.triggers) == 1
 
 
+# Any change of a numeric sensor (#34)
+
+INDOOR = "sensor.indoor_temperature"
+OUTDOOR = "sensor.porch_temperature"
+
+
+def wandering(rng, entity_id, days, gaps=(3 * M, 15 * M), value=70.0):
+    """A temperature reporting at irregular intervals, half a degree up or down each time."""
+    changes = []
+    at = rng.uniform(*gaps)
+    while at < days * D:
+        value += rng.choice((-0.5, 0.5))
+        changes.append((at, entity_id, value))
+        at += rng.uniform(*gaps)
+    return changes
+
+
+def test_every_change_of_a_numeric_sensor():
+    """A blueprint controller re-evaluates on every report of a temperature: a state trigger with no from/to."""
+    rng = random.Random(31)
+    initial, changes = distractors(rng, 2)
+    initial[INDOOR] = "70"
+    reports = wandering(rng, INDOOR, 2)
+    tl = timeline(initial, [*changes, *reports], 2)
+    labels = Labels([fire(at) for at, *_ in reports if at < D])
+
+    best = top(run(tl, labels))
+
+    assert best.candidate == Candidate((StateTrigger(INDOOR),))
+    assert best.config["triggers"] == [{"trigger": "state", "entity_id": INDOOR}]
+    assert best.stats.recall == 1.0
+    assert len(best.stats.outside_fires) == sum(at >= D for at, *_ in reports)  # the second day, unlabeled
+    assert best.explanation.startswith(f"Fires when {INDOOR} changes;")
+
+
+def test_every_change_while_above_a_threshold_takes_a_numeric_condition():
+    """The template-free form of "turn the fan on when it is warm": every report while the temperature is above 72."""
+    rng = random.Random(32)
+    initial, changes = distractors(rng, 3)
+    initial[INDOOR] = "70"
+    reports = wandering(rng, INDOOR, 3, gaps=(10 * M, 20 * M), value=72.0)
+    tl = timeline(initial, [*changes, *reports], 3)
+    warm = [at for at, _, value in reports if value > 72]
+    assert len(warm) > 20
+    labels = Labels([fire(at) for at in warm if at < 2 * D])
+
+    best = top(run(tl, labels))
+
+    assert best.candidate.triggers == (StateTrigger(INDOOR),)
+    (condition,) = best.candidate.conditions
+    assert condition.entity_id == INDOOR and 72 <= condition.above < 72.5 and condition.below is None
+    assert best.stats.recall == 1.0
+    assert best.stats.outside_nearby == 0
+
+
+def test_every_change_of_either_of_two_sensors():
+    """The fan blueprint watches an indoor and an outdoor temperature: an OR of two any-change triggers."""
+    rng = random.Random(33)
+    initial, changes = distractors(rng, 3)
+    initial.update({INDOOR: "70", OUTDOOR: "60"})
+    reports = wandering(rng, INDOOR, 3, gaps=(20 * M, 60 * M)) + wandering(rng, OUTDOOR, 3, gaps=(20 * M, 60 * M), value=60.0)
+    tl = timeline(initial, [*changes, *reports], 3)
+    labels = Labels([fire(at) for at, *_ in sorted(reports) if at < 2 * D])
+
+    best = top(run(tl, labels))
+
+    assert set(best.candidate.triggers) == {StateTrigger(INDOOR), StateTrigger(OUTDOOR)}
+    assert best.stats.recall == 1.0 and best.stats.outside_nearby == 0
+
+
+def test_every_change_of_either_of_two_chatty_sensors():
+    """Both temperatures report every few minutes, so either one has a report within the tolerance of almost every fire; only the hours one of them goes quiet tell them apart, and there the other one's reports line up with the fires."""
+    rng = random.Random(35)
+    initial, changes = distractors(rng, 3)
+    initial.update({INDOOR: "70", OUTDOOR: "60"})
+    reports = [
+        *((at, e, v) for at, e, v in wandering(rng, INDOOR, 3, gaps=(2 * M, 6 * M)) if not 2 * H <= at % D < 3 * H),
+        *((at, e, v) for at, e, v in wandering(rng, OUTDOOR, 3, gaps=(2 * M, 6 * M), value=60.0) if not 14 * H <= at % D < 15 * H),
+    ]
+    tl = timeline(initial, [*changes, *reports], 3)
+    labels = Labels([fire(at) for at, *_ in sorted(reports) if at < 2 * D])
+
+    best = top(run(tl, labels))
+
+    assert set(best.candidate.triggers) == {StateTrigger(INDOOR), StateTrigger(OUTDOOR)}
+    assert best.stats.recall == 1.0
+
+
+def test_every_change_of_a_numeric_attribute():
+    """A thermostat's state stays `heat` while its current_temperature attribute reports: a state trigger on the attribute, with no from/to."""
+    rng = random.Random(34)
+    climate = "climate.living_room"
+    initial, changes = distractors(rng, 2)
+    initial[climate] = "heat"
+    reports = [(at, climate, "heat", {"current_temperature": value}) for at, _, value in wandering(rng, climate, 2)]
+    tl = timeline(initial, [*changes, *reports], 2)
+    labels = Labels([fire(at) for at, *_ in reports[1:] if at < D])
+
+    best = top(run(tl, labels))
+
+    assert best.candidate == Candidate((StateTrigger(climate, attribute="current_temperature"),))
+    assert best.stats.recall == 1.0
+    assert best.explanation.startswith(f"Fires when {climate}'s current_temperature changes;")
+
+
+def test_labels_that_do_not_line_up_with_reports_get_no_any_change_trigger():
+    """Hand-drawn labels near a chatty sensor's reports: being within the tolerance of some report is no evidence."""
+    tl, labels = humidity_episodes(random.Random(2))
+    for suggestion in run(tl, labels).suggestions:
+        assert not any(isinstance(t, StateTrigger) and t.entity_id == HUM for t in suggestion.candidate.triggers)
+
+
 def test_a_must_not_period_forces_a_condition_that_excludes_it():
     rng = random.Random(5)
     initial, changes = distractors(rng, 1, count=0)
@@ -543,6 +655,13 @@ async def test_every_suggestion_passes_home_assistant_validation(hass: HomeAssis
     configs += [s.config for s in run(tl, labels).suggestions]
     tl, labels = motion_episodes(random.Random(4))
     configs += [s.config for s in run(tl, labels).suggestions]
+    initial, changes, anchors = door_or_motion(random.Random(21))  # ORs of triggers
+    configs += [s.config for s in run(timeline(initial, changes, 4), Labels([fire(at) for at in anchors])).suggestions]
+    rng = random.Random(34)  # any change of a numeric attribute
+    reports = [(at, "climate.x", "heat", {"current_temperature": value}) for at, _, value in wandering(rng, "climate.x", 1)]
+    configs += [s.config for s in run(timeline({"climate.x": "heat"}, reports, 1), Labels([fire(at) for at, *_ in reports[1:10]])).suggestions]
+    assert any(len(c["triggers"]) > 1 for c in configs)
+    assert any(c["triggers"][0].get("attribute") and "to" not in c["triggers"][0] for c in configs)
     assert len(configs) > 10
     for n, config in enumerate(configs):
         validated = await async_validate_config_item(hass, f"suggested_{n}", config)
@@ -674,6 +793,10 @@ def test_describe_reads_like_a_sentence():
     )
     assert describe(candidate) == f"Fires when {HUM} rises above 70 and stays there for 5 min, only between 17:00 and 22:00, only when person.me is home"
     assert describe(Candidate((SunTrigger("sunset", offset=-30 * M),))) == "Fires 30 min before sunset"
+    # Every write (attribute-only ones too) against `to: null`, state changes only.
+    assert describe(Candidate((StateTrigger(HUM),))) == f"Fires when {HUM} changes"
+    assert describe(Candidate((StateTrigger(HUM, changes_only=True),))) == f"Fires when {HUM} changes state"
+    assert describe(Candidate((SunTrigger("sunset"), StateTrigger(DOOR, to=("on",)), StateTrigger(HUM)))) == f"Fires at sunset or when {DOOR} changes to on or {HUM} changes"
     assert describe(Candidate((TimeTrigger(7 * H),), (SunCondition(after="sunset", before="sunrise"),))) == "Fires at 07:00, only after sunset or before sunrise"
     assert describe(Candidate((TimeTrigger(7 * H),), (SunCondition(before="sunset", before_offset=H),))) == "Fires at 07:00, only before sunset + 1 h"
     assert describe(Candidate((TimeTrigger(7 * H),), (SunCondition(after="sunrise", after_offset=-30 * M, before="sunset"),))) == "Fires at 07:00, only between sunrise − 30 min and sunset"
