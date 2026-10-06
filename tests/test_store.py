@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+import voluptuous as vol
 
 from homeassistant.core import HomeAssistant
 
@@ -13,8 +14,10 @@ from custom_components.event_simulator.history import SimulatorError
 from custom_components.event_simulator.packed import pack_events, unpack_events
 from custom_components.event_simulator.store import (
     MAX_EVENTS,
+    MAX_LABELS,
     MAX_SCENARIOS,
     MAX_STORED_EVENTS,
+    SCENARIO_FIELDS,
     STORAGE_KEY,
     STORAGE_VERSION,
     ScenarioStore,
@@ -246,3 +249,88 @@ async def test_save_refuses_once_the_store_holds_too_many_events(store: Scenario
 
 def test_the_stored_event_cap_leaves_room_for_several_full_scenarios():
     assert MAX_STORED_EVENTS >= 4 * MAX_EVENTS
+
+
+# ---- Suggest mode: labels and options --------------------------------------------
+
+LABELS = [
+    {"start": "2026-10-04T07:00:00+00:00", "end": "2026-10-04T07:30:00+00:00", "kind": "fire", "anchor": "both"},
+    {"start": "2026-10-04T12:00:00+00:00", "end": "2026-10-04T13:00:00+00:00", "kind": "no_fire"},
+]
+OPTIONS = {"tolerance_before": 120.0, "tolerance_after": 600.0}
+
+_FIELDS = vol.Schema(SCENARIO_FIELDS)
+
+
+async def test_labels_and_suggest_options_round_trip(store: ScenarioStore, hass: HomeAssistant):
+    body = _FIELDS({**SCENARIO, "labels": LABELS, "suggest_options": OPTIONS})
+    saved = await store.async_save_scenario(body)
+
+    scenario = store.get(saved["scenario_id"])
+    assert scenario["labels"] == LABELS
+    assert scenario["suggest_options"] == OPTIONS
+
+    reopened = ScenarioStore(hass)
+    await reopened.async_load()
+    assert reopened.get(saved["scenario_id"])["labels"] == LABELS
+
+
+async def test_a_scenario_without_labels_stores_neither_key(store: ScenarioStore):
+    """Back-compatible: a replay scenario saves exactly as before."""
+    saved = await store.async_save_scenario(_FIELDS({**SCENARIO, "labels": []}))
+
+    scenario = store.get(saved["scenario_id"])
+    assert "labels" not in scenario
+    assert "suggest_options" not in scenario
+
+
+def test_label_times_are_normalized_and_must_have_an_offset():
+    body = _FIELDS({**SCENARIO, "labels": [{**LABELS[0], "start": "2026-10-04T07:00:00Z"}]})
+    assert body["labels"][0]["start"] == "2026-10-04T07:00:00+00:00"
+
+    with pytest.raises(vol.Invalid):
+        _FIELDS({**SCENARIO, "labels": [{**LABELS[0], "start": "2026-10-04T07:00:00"}]})
+
+
+def test_a_should_fire_label_is_anchored_at_its_start_by_default_and_a_must_not_one_never():
+    body = _FIELDS(
+        {
+            **SCENARIO,
+            "labels": [
+                {k: v for k, v in LABELS[0].items() if k != "anchor"},
+                {**LABELS[1], "anchor": "end"},
+            ],
+        }
+    )
+    assert body["labels"][0]["anchor"] == "start"
+    assert "anchor" not in body["labels"][1]
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        {**LABELS[0], "end": LABELS[0]["start"]},
+        {**LABELS[0], "start": "2026-10-04T08:00:00+00:00"},
+        {**LABELS[0], "kind": "maybe"},
+        {**LABELS[0], "anchor": "middle"},
+        {k: v for k, v in LABELS[0].items() if k != "kind"},
+        {**LABELS[0], "extra": 1},
+    ],
+)
+def test_save_refuses_a_malformed_label(label: dict[str, Any]):
+    with pytest.raises(vol.Invalid):
+        _FIELDS({**SCENARIO, "labels": [label]})
+
+
+def test_save_refuses_too_many_labels():
+    with pytest.raises(vol.Invalid):
+        _FIELDS({**SCENARIO, "labels": [LABELS[0]] * (MAX_LABELS + 1)})
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{"tolerance_before": -1}, {"tolerance_after": 10 * 86400}, {"tolerance_before": "soon"}, {"max_conditions": 2}],
+)
+def test_save_refuses_malformed_suggest_options(options: dict[str, Any]):
+    with pytest.raises(vol.Invalid):
+        _FIELDS({**SCENARIO, "suggest_options": options})

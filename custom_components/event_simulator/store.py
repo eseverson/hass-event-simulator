@@ -5,7 +5,9 @@ automation config (and the entity it came from, if any), the window, the entitie
 being tracked, and the editable `initial_states` / `events` timeline in the same
 shape `history.async_get_timeline` produces. The events are kept, and sent back by
 `get`, packed (see packed.py): the websocket refuses a message over 4 MiB, and a week of
-a chatty sensor is several times that as a plain list.
+a chatty sensor is several times that as a plain list. A scenario saved in Suggest mode
+also keeps its labeled periods and options (`labels`, `suggest_options`); both are
+optional and stored only when present, so older scenarios load unchanged.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from homeassistant.util.ulid import ulid_now
 from .const import DOMAIN
 from .history import MAX_ENTITIES, MAX_EVENTS, SimulatorError, check_window
 from .packed import event_count, pack_events, unpack_events
+from .suggest.labels import ANCHORS, KINDS
 
 STORAGE_KEY = f"{DOMAIN}.scenarios"
 # 2: events packed (version 1 kept them as a plain list).
@@ -37,10 +40,15 @@ MAX_NAME_LENGTH = 100
 # bounds that file (about 25 MB packed) rather than letting 100 week-long scenarios of a
 # chatty sensor make it hundreds of megabytes.
 MAX_STORED_EVENTS = 500_000
+# Labeled periods in one scenario (Suggest mode).
+MAX_LABELS = 500
+# The longest match tolerance either side of an anchor, in seconds.
+MAX_TOLERANCE = 24 * 3600
 
 __all__ = [
     "DATA_STORE",
     "MAX_EVENTS",
+    "MAX_LABELS",
     "MAX_SCENARIOS",
     "MAX_STORED_EVENTS",
     "SCENARIO_FIELDS",
@@ -74,6 +82,38 @@ _TRACK_SHIFT = vol.Schema(
     }
 )
 
+def _check_label(label: dict[str, Any]) -> dict[str, Any]:
+    """A period that ends after it starts; a should-fire one anchored (at its start by default), a must-not one not."""
+    if _parse(label["end"]) <= _parse(label["start"]):
+        raise vol.Invalid("a label must end after it starts")
+    if label["kind"] == "fire":
+        return {**label, "anchor": label.get("anchor") or "start"}
+    return {key: value for key, value in label.items() if key != "anchor"}
+
+
+# A labeled period for Suggest mode, in the shape `suggest/subscribe` takes (suggest/labels.py).
+_LABEL = vol.All(
+    vol.Schema(
+        {
+            vol.Required("start"): _aware_iso,
+            vol.Required("end"): _aware_iso,
+            vol.Required("kind"): vol.In(KINDS),
+            vol.Optional("anchor"): vol.Any(None, vol.In(ANCHORS)),
+        }
+    ),
+    _check_label,
+)
+
+_TOLERANCE = vol.All(vol.Coerce(float), vol.Range(min=0, max=MAX_TOLERANCE))
+
+# Suggest mode's options: how far (seconds) a fire may land before / after an anchor and still match it.
+_SUGGEST_OPTIONS = vol.Schema(
+    {
+        vol.Optional("tolerance_before"): _TOLERANCE,
+        vol.Optional("tolerance_after"): _TOLERANCE,
+    }
+)
+
 # The body of a scenario, shared with the websocket `save` command's schema.
 SCENARIO_FIELDS: dict[vol.Marker, Any] = {
     vol.Required("name"): vol.All(cv.string, vol.Strip, vol.Length(min=1, max=MAX_NAME_LENGTH)),
@@ -87,9 +127,12 @@ SCENARIO_FIELDS: dict[vol.Marker, Any] = {
     vol.Optional("events", default=list): vol.All(vol.Any(list, unpack_events), [_EVENT]),
     # Only sent when a track is shifted, and only stored then.
     vol.Optional("track_shifts"): {cv.entity_id: _TRACK_SHIFT},
+    # Suggest mode: the labeled periods and the options, stored only when sent non-empty.
+    vol.Optional("labels"): vol.All([_LABEL], vol.Length(max=MAX_LABELS)),
+    vol.Optional("suggest_options"): _SUGGEST_OPTIONS,
 }
 
-_OPTIONAL_KEYS = ("track_shifts",)
+_OPTIONAL_KEYS = ("track_shifts", "labels", "suggest_options")
 _BODY_KEYS = tuple(
     marker.schema for marker in SCENARIO_FIELDS if marker.schema not in _OPTIONAL_KEYS
 )
