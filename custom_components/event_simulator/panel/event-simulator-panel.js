@@ -1752,7 +1752,7 @@ export function triggerYaml(config) {
   return toYaml(part);
 }
 
-/* One suggestion as a card shows it: {rank, explanation, exact, config, hits, total,
+/* One suggestion as a card shows it: {rank (from 1), explanation, exact, config, hits, total,
  * missed: [{at, edge}], violations, outside, inside (ms, sorted), fires, fireTimes (ms or
  * null when the backend sent none), whileHeld, whileTotal, approx (the miner's stats when
  * the sandbox ones differ from them), diverged (the sandbox's fires differ a lot from the
@@ -1767,7 +1767,8 @@ export function suggestionView(raw, index = 0) {
     .sort((a, b) => a.at - b.at);
   const total = count(stats.anchors_total);
   const view = {
-    rank: count(s.rank, index + 1),
+    // The wire ranks the best one 0; cards (and hints' references) count from #1.
+    rank: count(s.rank, index) + 1,
     explanation: String(s.explanation || config.description || "").trim(),
     exact: s.exact === true,
     diverged: s.diverged === true,
@@ -1841,7 +1842,7 @@ export function hintView(raw, index = 0) {
     kind: h.kind === "recurrence" ? "recurrence" : "outside_fire",
     at,
     similarity: Number.isFinite(sim) ? Math.min(1, Math.max(0, sim)) : 0.5,
-    suggestions: Array.isArray(h.suggestions) ? h.suggestions.filter((n) => Number.isFinite(n)) : [],
+    suggestions: Array.isArray(h.suggestions) ? h.suggestions.filter((n) => Number.isFinite(n)).map((n) => n + 1) : [],
     description: String(h.description || "").trim(),
     entityId: h.entity_id ?? null,
     from: h.from ?? null,

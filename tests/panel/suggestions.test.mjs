@@ -42,7 +42,7 @@ const CONFIG = {
 const RESULT = {
   suggestions: [
     {
-      rank: 1,
+      rank: 0,
       config: CONFIG,
       explanation: "Fires when binary_sensor.door changes to on, only after sunset; hits 2/3 marked starts, fires 2 other times",
       exact: true,
@@ -60,10 +60,10 @@ const RESULT = {
       },
       approx_stats: { fires: 6 },
     },
-    { rank: 2, config: { triggers: [{ trigger: "time", at: "07:00:00" }] }, stats: { anchors_hit: 1, anchors_total: 3, missed: [{ at: iso(19 * H), edge: "start" }, { at: iso(20 * H), edge: "end" }] } },
+    { rank: 1, config: { triggers: [{ trigger: "time", at: "07:00:00" }] }, stats: { anchors_hit: 1, anchors_total: 3, missed: [{ at: iso(19 * H), edge: "start" }, { at: iso(20 * H), edge: "end" }] } },
   ],
   hints: [
-    { kind: "outside_fire", at: iso(22 * H), similarity: 0.8, suggestions: [1], description: "Fires at 22:00 on Oct 4" },
+    { kind: "outside_fire", at: iso(22 * H), similarity: 0.8, suggestions: [0], description: "Fires at 22:00 on Oct 4" },
     { kind: "recurrence", at: iso(3 * H), similarity: 1.7, suggestions: [], description: "binary_sensor.door went off → on", entity_id: "binary_sensor.door", from: "off", to: "on" },
     { kind: "outside_fire", at: "not a time", similarity: 0.5 },
   ],
@@ -244,4 +244,12 @@ test("YAML reads like a hand-written automation", () => {
 test("a card's short YAML is its triggers and conditions", () => {
   assert.equal(triggerYaml(CONFIG), ["triggers:", "- trigger: state", "  entity_id: binary_sensor.door", '  to: "on"', "conditions:", "- condition: sun", "  after: sunset"].join("\n"));
   assert.equal(triggerYaml({ trigger: [{ platform: "time", at: "07:00:00" }], condition: [] }), ["triggers:", "- platform: time", '  at: "07:00:00"'].join("\n"));
+});
+
+test("ranks count from 0 on the wire and from #1 on the cards, hints' references with them", () => {
+  // suggest/subscribe ranks the best suggestion 0 (and its hint descriptions say "Suggestion 1").
+  assert.deepEqual(RESULT.suggestions.map((s, i) => suggestionView(s, i).rank), [1, 2]);
+  assert.equal(suggestionView({ rank: 0 }, 3).rank, 1, "the sent rank wins over the position");
+  assert.deepEqual(hintView(RESULT.hints[0]).suggestions, [1]);
+  assert.deepEqual(hintView({ at: iso(H), suggestions: [2, 0, "x"] }).suggestions, [3, 1]);
 });
