@@ -8,7 +8,7 @@ Timeline of a replay (all virtual time, see `vclock.py`)
 --------------------------------------------------------
 1. `start - BOOT_LEAD`: a `HomeAssistant` boots on the virtual loop with a temporary config dir (deleted afterwards). The scenario's `registry` snapshot is written into that dir's `.storage` first, so the entity/device/area/floor/label registries load it through their own load path (config entries as disabled stubs, never set up); registered entities with no initial state get HA's own `unavailable` placeholder at start, as live HA gives entities whose integration did not load. It loads the base registries, sets up only the `homeassistant` and `labs` integrations (turning on the scenario's `core.preview_features`, so Labs-gated triggers and conditions validate as they do live), then runs `async_start`; the automation integration and whatever it pulls in (`trace`, `blueprint`, trigger/condition platforms) come later. No recorder, http, frontend or network-facing integrations, and `skip_pip` is on, so nothing is installed or fetched. `BOOT_LEAD` absorbs any timers boot waits on, so the window starts with everything settled.
 2. `start`: initial states are seeded with their recorded `last_changed` / `last_updated` (`StateMachine.async_set(..., timestamp=...)`; an attribute-only update is reproduced by a second write at `last_updated`); states without them are stamped `start`, the same clamp the recorder applies. The automation's own entity is the exception: its recorded state is not seeded but stored as its last state before boot, so it loads enabled or disabled (and with its `last_triggered`) as live HA restores it. Then the automation is checked for platforms the sandbox cannot run (custom integrations' triggers/conditions, integration-specific device automations -> `unsupported_automation`, naming each by config path), validated with HA's own automation schema (invalid -> structured `invalid_automation` error) and set up. It attaches after `async_start`, so a `homeassistant: start` trigger does not fire, and at `start` exactly, so a time trigger at the window start does.
-3. `[start, end)`: timeline events are written with `async_set` at their `at`; events at the same instant are written in list order. A recorded on/off of a replayed automation's own entity turns that automation on/off instead (`automation.turn_on` / `turn_off` semantics), so the entity's state, and every template reading it, is the sandbox's own. Every service call is intercepted at the `ServiceRegistry` (see `RecordingServiceRegistry`): recorded, answered with success (an empty response when one is asked for), and never executed, so recorded calls change no state.
+3. `[start, end)`: timeline events are written with `async_set` at their `at`; events at the same instant are written in list order. The optional `bus_events` (`[{at, event_type, data}]`, recorded events such as `zha_event` or `tag_scanned`) are fired on the bus at their `at` (`time_fired` set to it), after the state writes of the same instant, so event triggers replay and a condition reads the states of that instant. Home Assistant's own lifecycle and bookkeeping events (`state_changed`, `call_service`, `homeassistant_start`, ...) are refused: the sandbox's Home Assistant fires those itself. A recorded on/off of a replayed automation's own entity turns that automation on/off instead (`automation.turn_on` / `turn_off` semantics), so the entity's state, and every template reading it, is the sandbox's own. Every service call is intercepted at the `ServiceRegistry` (see `RecordingServiceRegistry`): recorded, answered with success (an empty response when one is asked for), and never executed, so recorded calls change no state.
 4. `end`: the automation's triggers are detached (`async_turn_off(stop_actions=False)`), so nothing new starts; the window is half-open and a run triggered at `end` itself is discarded. Runs already in flight (a `delay`, a `wait_for_trigger`, a queue) keep going for up to `overrun_seconds` of virtual time (default `DEFAULT_OVERRUN`, at most `MAX_OVERRUN`); a run still going at that bound is reported with outcome `unfinished` and a warning. Then HA is stopped.
 
 Runs that never let time move on
@@ -60,6 +60,18 @@ from homeassistant.const import (
     ATTR_SERVICE,
     ATTR_SERVICE_DATA,
     EVENT_CALL_SERVICE,
+    EVENT_COMPONENT_LOADED,
+    EVENT_CORE_CONFIG_UPDATE,
+    EVENT_HOMEASSISTANT_CLOSE,
+    EVENT_HOMEASSISTANT_FINAL_WRITE,
+    EVENT_HOMEASSISTANT_START,
+    EVENT_HOMEASSISTANT_STARTED,
+    EVENT_HOMEASSISTANT_STOP,
+    EVENT_SERVICE_REGISTERED,
+    EVENT_SERVICE_REMOVED,
+    EVENT_STATE_CHANGED,
+    EVENT_STATE_REPORTED,
+    MAX_LENGTH_EVENT_EVENT_TYPE,
     MAX_LENGTH_STATE_STATE,
     STATE_OFF,
     STATE_ON,
@@ -147,6 +159,23 @@ _INSTANT_DOMAINS = frozenset(
     {"input_boolean", "input_button", "input_datetime", "input_number", "input_select", "input_text", "counter", "timer", "group", "persistent_notification", "logbook", "system_log"}
 )
 _INSTANT_SERVICES = frozenset({"automation.turn_on", "automation.turn_off", "automation.toggle", "automation.trigger", "script.turn_on", "notify.persistent_notification"})
+# Bus events a scenario may not fire: the sandbox's Home Assistant fires these itself, and a replayed one would act on it (a state machine write, a restart, a service call).
+_RESERVED_EVENT_TYPES = frozenset(
+    {
+        EVENT_STATE_CHANGED,
+        EVENT_STATE_REPORTED,
+        EVENT_CALL_SERVICE,
+        EVENT_SERVICE_REGISTERED,
+        EVENT_SERVICE_REMOVED,
+        EVENT_COMPONENT_LOADED,
+        EVENT_CORE_CONFIG_UPDATE,
+        EVENT_HOMEASSISTANT_START,
+        EVENT_HOMEASSISTANT_STARTED,
+        EVENT_HOMEASSISTANT_STOP,
+        EVENT_HOMEASSISTANT_FINAL_WRITE,
+        EVENT_HOMEASSISTANT_CLOSE,
+    }
+)
 # Config keys never searched for triggers/conditions: service-call payloads and variables.
 _PAYLOAD_KEYS = frozenset({"data", "data_template", "target", "variables", "event_data", "event_data_template", "response_variable", "metadata", "for_each"})
 
@@ -173,6 +202,13 @@ class _Event:
     entity_id: str
     state: str
     attributes: dict[str, Any]
+
+
+@dataclass
+class _BusEvent:
+    at: datetime
+    event_type: str
+    data: dict[str, Any]
 
 
 @dataclass
@@ -215,6 +251,7 @@ class _Scenario:
     multi: bool = False
     traces: str = DEFAULT_TRACES
     time_limit: float = DEFAULT_TIME_LIMIT
+    bus_events: list[_BusEvent] = field(default_factory=list)
 
 
 def error_result(code: str, message: str, warnings: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -375,6 +412,7 @@ def _parse_scenario(raw: dict[str, Any]) -> _Scenario:
         events.append(event)
     # Stable: same-instant events keep their list order.
     events.sort(key=lambda event: event.at)
+    bus_events = _parse_bus_events(raw.get("bus_events"), start, end, warnings)
 
     services_raw = raw.get("services")
     services: dict[str, set[str]] | None = None
@@ -410,7 +448,35 @@ def _parse_scenario(raw: dict[str, Any]) -> _Scenario:
     for automation in automations:
         automation.own_initial = initial_states.pop(automation.entity_id, None)
 
-    return _Scenario(core, start, end, automations, initial_states, events, services, overrun, seed, preview_features, registry, warnings, multi, traces, time_limit)
+    return _Scenario(core, start, end, automations, initial_states, events, services, overrun, seed, preview_features, registry, warnings, multi, traces, time_limit, bus_events)
+
+
+def _parse_bus_events(value: Any, start: datetime, end: datetime, warnings: list[dict[str, Any]]) -> list[_BusEvent]:
+    """The scenario's `bus_events`, time-ordered (same-instant ones in list order); those outside the window are skipped with a warning."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ScenarioError("invalid_scenario", "bus_events must be a list")
+    found: list[_BusEvent] = []
+    for index, item in enumerate(value):
+        what = f"bus_events[{index}]"
+        if not isinstance(item, dict):
+            raise ScenarioError("invalid_scenario", f"{what} must be an object")
+        event_type = item.get("event_type")
+        if not isinstance(event_type, str) or not event_type or len(event_type) > MAX_LENGTH_EVENT_EVENT_TYPE:
+            raise ScenarioError("invalid_scenario", f"{what}.event_type must be a non-empty string of at most {MAX_LENGTH_EVENT_EVENT_TYPE} characters")
+        if event_type in _RESERVED_EVENT_TYPES:
+            raise ScenarioError("invalid_scenario", f"{what}: {event_type} is fired by Home Assistant itself and cannot be replayed")
+        data = item.get("data") or {}
+        if not isinstance(data, dict):
+            raise ScenarioError("invalid_scenario", f"{what}.data must be an object")
+        event = _BusEvent(_parse_time(item.get("at"), f"{what}.at"), event_type, data)
+        if not start <= event.at < end:
+            warnings.append(_warning("event_outside_window", f"{what} ({event_type} at {event.at.isoformat()}) is outside the window and was not fired", event.at))
+            continue
+        found.append(event)
+    found.sort(key=lambda event: event.at)
+    return found
 
 
 def _automations(items: list[Any], multi: bool, registry: dict[str, Any], warnings: list[dict[str, Any]]) -> list[_Automation]:
@@ -1007,14 +1073,21 @@ class _Replay:
         self.warnings.append({**_warning(code, f"automations[{automation.index}]: {message}", at), "automation": automation.index})
 
     def _schedule_events(self) -> None:
-        by_instant: dict[datetime, list[_Event]] = {}
+        by_instant: dict[datetime, tuple[list[_Event], list[_BusEvent]]] = {}
         for event in self.scenario.events:
-            by_instant.setdefault(event.at, []).append(event)
-        for at, events in by_instant.items():
+            by_instant.setdefault(event.at, ([], []))[0].append(event)
+        for bus_event in self.scenario.bus_events:
+            by_instant.setdefault(bus_event.at, ([], []))[1].append(bus_event)
+        for at, (events, bus_events) in sorted(by_instant.items()):
             # One callback per instant: same-instant timers have no guaranteed order, list order does.
-            self._event_handles.append(self.clock.call_at_datetime(at, self._play, events))
+            self._event_handles.append(self.clock.call_at_datetime(at, self._play, events, bus_events))
 
-    def _play(self, events: list[_Event]) -> None:
+    def _play(self, events: list[_Event], bus_events: list[_BusEvent]) -> None:
+        self._write_states(events)
+        for bus_event in bus_events:
+            self.hass.bus.async_fire(bus_event.event_type, dict(bus_event.data), time_fired=bus_event.at.timestamp())
+
+    def _write_states(self, events: list[_Event]) -> None:
         for event in events:
             if (automation := self._by_entity_id.get(event.entity_id)) is not None:
                 if not automation.runaway:
