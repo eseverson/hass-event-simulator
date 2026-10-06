@@ -251,6 +251,49 @@ def test_one_label_suggests_the_plain_trigger():
     assert best.candidate == Candidate((StateTrigger(DOOR, to=("on",)),))
 
 
+def test_values_seen_once_are_not_trigger_or_condition_values():
+    """A timestamp-like state (an input_datetime, a scene, a button) takes a new value every time: a trigger or condition on
+    one of those values can never fire again. Such an entity triggers on any change instead."""
+    stamp = "input_datetime.last_arrival"
+    initial = {stamp: "2026-10-01 08:00:00", DOOR: "off"}
+    changes = []
+    arrivals = [day * D + (17 + day) * H for day in range(4)]
+    for at in arrivals:
+        changes.append((at, stamp, datetime.fromtimestamp(T0 + at, UTC).strftime("%Y-%m-%d %H:%M:%S")))
+    for day in range(4):
+        changes += [(day * D + 9 * H, DOOR, "on"), (day * D + 9 * H + M, DOOR, "off")]
+    tl = timeline(initial, changes, 4)
+
+    best = top(run(tl, Labels([fire(at) for at in arrivals[:3]])))
+    assert best.candidate.triggers == (StateTrigger(stamp, changes_only=True),)
+    assert best.stats.recall == 1.0
+
+    for result in (run(tl, Labels([fire(arrivals[1])])), run(tl, Labels([fire(at) for at in arrivals[:3]]))):
+        for suggestion in result.suggestions:
+            text = repr(suggestion.config)
+            assert not any(value in text for value in ("2026-10-0", "08:00:00")), suggestion.config
+
+
+def test_a_toggle_fires_on_both_directions():
+    switch = "light.kitchen_switch"
+    rng = random.Random(13)
+    initial, changes = distractors(rng, 2)
+    initial[switch] = "off"
+    state = "off"
+    toggles = sorted(rng.uniform(0, 2 * D) for _ in range(12))
+    for at in toggles:
+        state = "on" if state == "off" else "off"
+        changes.append((at, switch, state))
+    tl = timeline(initial, changes, 2)
+
+    best = top(run(tl, Labels([fire(at) for at in toggles[:6]])))
+
+    (trigger,) = best.candidate.triggers
+    assert (trigger.entity_id, trigger.to, trigger.from_) == (switch, ("off", "on"), None)
+    assert best.candidate.conditions == ()
+    assert best.stats.recall == 1.0 and len(best.stats.outside_fires) == 6
+
+
 def motion_episodes(rng):
     """Hall motion: three occupancy episodes with a short flicker in each; the light is on from motion until 5 minutes after it clears."""
     initial, changes = distractors(rng, 1)

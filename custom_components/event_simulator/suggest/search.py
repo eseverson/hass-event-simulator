@@ -6,7 +6,7 @@ How it searches (see docs/superpowers/specs/2026-10-05-suggestions-design.md):
 
 1. Sides. A label anchored at `both` asks for an on/off pair, so the start and end anchors are searched independently (trigger ids `start` / `end`) and combined. Otherwise one side covers every anchor and triggers carry no id. Labels that are only `while` periods also anchor at each period's start: the automation should act when the period begins, with conditions that hold throughout it.
 2. Trigger candidates around the anchors, each evaluated over the whole window:
-   - `state`: every state change near an anchor (to, and from + to), attribute changes when the state is static, and `for:` when a state consistently began a similar lag before the anchors (quantized to friendly durations).
+   - `state`: every state change near an anchor (to, and from + to), attribute changes when the state is static, and `for:` when a state consistently began a similar lag before the anchors (quantized to friendly durations). Anchors that follow changes in two or three directions also get one trigger listing them all (a toggle). A free-form entity (`FREE_FORM` or more values in the window, most seen once: a timestamp, a counter, free text) only offers values it took more than once, and a trigger on any change of its state (`to: null`).
    - `numeric_state`: `above` / `below`, the threshold searched over the full window's values. The behavior of a threshold only changes at observed values, so each gap between consecutive distinct values is one candidate, represented by its roundest number; gaps are scored by how many anchors a crossing hits and how often the value crosses elsewhere. `for:` as for state.
    - `time` / `sun`: when the anchors cluster by local clock time, or by sunrise/sunset offset; whichever clusters more anchors with less spread wins. The time is chosen at or just before the cluster and rounded.
    Triggers that hit fewer than `min_recall` of the best trigger's anchors are dropped before any condition search, and only the best `beam` go on.
@@ -52,6 +52,7 @@ CLOCK_STEPS = (3600, 900, 300, 60, 10, 1)
 WORKDAYS = WEEKDAYS[:5]
 WEEKEND = WEEKDAYS[5:]
 _INF = math.inf
+FREE_FORM = 4  # an entity (or attribute) with at least this many values in the window, most of them seen once, is free-form: a timestamp, a counter, free text
 MAX_SUN_OFFSET = 3 * 3600  # a sun trigger or condition further from the event reads as a clock time
 _MERGE = 60  # outside fires of several suggestions closer than this are one hint
 
@@ -641,6 +642,7 @@ class _Search:
         self._numeric: dict[str, bool] = {}
         self._crossing_cache: dict[tuple[str, str], _Crossings] = {}
         self._while_cache: dict[Condition, bool] = {}
+        self._entries: dict[tuple[str, str | None], Counter[Any]] = {}
         self._unlabeled = labels.unlabeled_intervals(timeline.start, timeline.end)
         lo, hi = labels.span or (0.0, 0.0)
         self._unlabeled_near = [(max(a, lo), min(b, hi)) for a, b in self._unlabeled if a < hi and b > lo]
@@ -656,6 +658,28 @@ class _Search:
         present = sum(v is not None for v in values)
         result = self._numeric[entity_id] = bool(present) and len(numbers) >= 0.8 * present and len(set(numbers)) > 3
         return result
+
+    def entries(self, entity_id: str, attribute: str | None = None) -> Counter[Any]:
+        """How many times the state (or attribute) took each value in the window: a change into it, or the first entry."""
+        key = (entity_id, attribute)
+        if (found := self._entries.get(key)) is None:
+            found = self._entries[key] = Counter()
+            step = self.timeline[entity_id]
+            previous: Any = object()
+            for i in range(len(step)):
+                value = step.states[i] if attribute is None else step.attributes[i].get(attribute)
+                if value != previous and isinstance(value, (str, int, float, bool)):
+                    found[value] += 1
+                previous = value
+        return found
+
+    def free_form(self, entity_id: str, attribute: str | None = None) -> bool:
+        entries = self.entries(entity_id, attribute)
+        return len(entries) >= FREE_FORM and 2 * sum(n == 1 for n in entries.values()) > len(entries)
+
+    def recurs(self, entity_id: str, value: Any, attribute: str | None = None) -> bool:
+        """Whether `value` can be a trigger's `to` / `from` or a condition's state: any value of an entity with few values, but of a free-form one only a value it took more than once. A value seen once (a timestamp, a "9 days ago") can never match again."""
+        return not self.free_form(entity_id, attribute) or self.entries(entity_id, attribute)[value] > 1
 
     def crossings(self, entity_id: str, direction: str) -> _Crossings:
         key = (entity_id, direction)
@@ -680,19 +704,29 @@ class _Search:
         before, after, max_lag = self.tolerance.before, self.tolerance.after, self.options.max_lag
         support: dict[Trigger, set[int]] = defaultdict(set)
         lagged: dict[Any, dict[int, tuple[float, Any]]] = defaultdict(dict)
+        free_form = self.free_form(entity_id)
+        tos: set[str] = set()
+        froms: set[str] = set()
         for n, anchor in enumerate(anchors):
             for tr in step.transitions(anchor.at - before, anchor.at + after + 1e-6):
                 if tr.old_state != tr.state:
                     if tr.state in UNAVAILABLE_STATES:
                         continue
+                    if free_form:
+                        support[StateTrigger(entity_id, changes_only=True, id=tid)].add(n)
+                    if not self.recurs(entity_id, tr.state):
+                        continue
+                    tos.add(tr.state)
                     support[StateTrigger(entity_id, to=(tr.state,), id=tid)].add(n)
-                    if tr.old_state is not None:
+                    if tr.old_state is not None and self.recurs(entity_id, tr.old_state):
                         support[StateTrigger(entity_id, from_=(tr.old_state,), to=(tr.state,), id=tid)].add(n)
+                        if tr.old_state not in UNAVAILABLE_STATES:
+                            froms.add(tr.old_state)
                 elif tr.old_attributes is not None:
                     for key, value in tr.attributes.items():
                         if value is None or not isinstance(value, (str, int, float, bool)):
                             continue
-                        if tr.old_attributes.get(key) != value:
+                        if tr.old_attributes.get(key) != value and self.recurs(entity_id, value, key):
                             support[StateTrigger(entity_id, attribute=key, to=(value,), id=tid)].add(n)
             # The state at the anchor began a while before it: a `for:` candidate.
             i = step.index_at(anchor.at)
@@ -704,8 +738,16 @@ class _Search:
                 continue
             lag = anchor.at - began
             state = step.states[i]
-            if before < lag <= max_lag and state not in UNAVAILABLE_STATES:
+            if before < lag <= max_lag and state not in UNAVAILABLE_STATES and self.recurs(entity_id, state):
                 lagged[state][n] = (lag, step.states[j - 1] if j else None)
+        if 2 <= len(tos) <= 3:
+            # A toggle: some anchors follow a change one way and some another, so one trigger listing them all hits more than either.
+            single = [support[StateTrigger(entity_id, to=(state,), id=tid)] for state in tos]
+            either = set().union(*single)
+            if len(either) > max(len(hits) for hits in single):
+                support[StateTrigger(entity_id, to=tuple(sorted(tos)), id=tid)] = either
+                if froms:
+                    support[StateTrigger(entity_id, from_=tuple(sorted(froms)), to=tuple(sorted(tos)), id=tid)] = either
         found = {trigger for trigger, hits in support.items() if len(hits) >= min_hits}
         for state, per_anchor in lagged.items():
             if len(per_anchor) < min_hits:
@@ -830,6 +872,8 @@ class _Search:
                 states.add(step.state_at(period.start))
                 states.update(step.states[i] for i in step.write_range(period.start, period.end))
             if None in states or len(states) > 3 or states & UNAVAILABLE_STATES:
+                continue
+            if not all(self.recurs(entity_id, state) for state in states):
                 continue
             if any(step.state_at(t) not in states for t in bad):
                 pool.add(StateCondition(entity_id, tuple(sorted(states))))
