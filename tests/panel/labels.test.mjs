@@ -22,7 +22,6 @@ import {
   resizeLabel,
   scenarioFingerprint,
   scenarioPayload,
-  suggestAvailable,
   suggestMessage,
   suggestOptions,
   suggestOutcome,
@@ -222,11 +221,6 @@ test("the default kind for a new period is remembered, and survives broken stora
   writeLabelDefault({ kind: "fire", anchor: "both" }, broken);
 });
 
-test("suggest availability comes from how the backend refuses an empty request", () => {
-  assert.equal(suggestAvailable({ code: "unknown_command" }), false);
-  assert.equal(suggestAvailable({ code: "invalid_format" }), true);
-  assert.equal(suggestAvailable(undefined), true);
-});
 
 test("suggest events read as progress, a result, unavailable, or an error", () => {
   assert.deepEqual(suggestOutcome({ error: { code: "unknown_command", message: "Unknown command." } }), { kind: "unavailable" });

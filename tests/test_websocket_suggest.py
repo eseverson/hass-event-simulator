@@ -103,7 +103,7 @@ async def until_final(client, msg_id) -> tuple[list[dict[str, Any]], dict[str, A
 
 
 async def test_a_request_without_fields_is_refused_as_malformed(hass: HomeAssistant, setup, hass_ws_client):
-    """The panel probes for the command with an empty request: it must fail validation, not be unknown."""
+    """A request without its fields fails validation (invalid_format), not as an unknown command."""
     client = await hass_ws_client(hass)
     await client.send_json_auto_id({"type": SUGGEST})
     msg = await client.receive_json()

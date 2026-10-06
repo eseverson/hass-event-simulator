@@ -1649,12 +1649,6 @@ export function suggestMessage({ entityIds, start, end, labels, tolerance }) {
   };
 }
 
-/* Whether the backend has suggest/subscribe, from how it answered a request with no fields:
- * an unknown command is not there; any other refusal (invalid_format) means it is. */
-export function suggestAvailable(err) {
-  return err?.code !== "unknown_command";
-}
-
 /* What each suggest stage is doing, in words. */
 export const SUGGEST_STAGES = {
   loading: "Loading history",
@@ -2115,7 +2109,9 @@ class EventSimulatorPanel extends Base {
     this._labelDefault = readLabelDefault();
     this._tolerance = { ...DEFAULT_TOLERANCE };
     this._tolError = null;
-    this._suggestAvail = null; // null until probed, then true / false
+    // The panel ships with its backend, so suggest/subscribe is there; a backend without it
+    // (an old one behind a cached panel) answers unknown_command, which turns this off.
+    this._suggestAvail = true;
     this._suggestRun = null; // the suggest/subscribe in flight: {seq, print, done, unsub}
     // {running, text, stage, error, stale, result: {suggestions: [suggestionView], hints:
     // [hintView], evaluated, warnings}}; a result stays shown (dimmed) while the next runs.
@@ -2192,7 +2188,6 @@ class EventSimulatorPanel extends Base {
       this._renderConfig();
     });
     this._listScenarios();
-    this._probeSuggest();
     try {
       this._automations = await this._hass.callWS({ type: "event_simulator/automations" });
       this._loading = null;
@@ -2738,18 +2733,6 @@ class EventSimulatorPanel extends Base {
   }
 
   // ---- suggest ------------------------------------------------------------------
-
-  /* Ask the backend whether it has suggest/subscribe: a request with no fields is refused
-   * as unknown when it does not, and as malformed when it does. */
-  async _probeSuggest() {
-    try {
-      await this._hass.callWS({ type: "event_simulator/suggest/subscribe" });
-      this._suggestAvail = true;
-    } catch (e) {
-      this._suggestAvail = suggestAvailable(e);
-    }
-    if (this._mode === "suggest") this._render();
-  }
 
   _canSuggest() {
     return (

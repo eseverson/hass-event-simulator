@@ -353,7 +353,7 @@ def ws_suggest_subscribe(
 
     Acknowledged at once; then progress events `{stage: "loading" | "mining" | "validating", ...counts}`, and one final event: the result `{suggestions, hints, evaluated[, warning]}` or `{error: {code, message}}`. Newest wins per connection, as with `simulate/subscribe`: a newer suggest supersedes the one in flight (`superseded` error event), and unsubscribing or closing the connection stops the miner at its next check and kills the validation child.
 
-    Every field but `options` is required, so a request with none is refused as `invalid_format`: the panel probes for the command that way.
+    Every field but `options` is required. The panel does not probe for the command (an empty request is logged as an error on every panel load); a backend without it answers `unknown_command` to the first real request.
     """
     msg_id = msg["id"]
     connection.send_result(msg_id)
