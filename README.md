@@ -40,7 +40,14 @@ The **Event Simulator** panel appears in the sidebar for admin users. It needs H
 
 **Choose a window.** The default is the last 24 hours; presets and the start/end fields set any window up to 7 days. Each track is filled from the recorder: the state at the window start, then every recorded change inside it. Numeric entities draw as a line, everything else as state segments; `unavailable` and `unknown` are hatched, and replayed as the real states they are.
 
-**Edit the timeline** for a what-if. Drag a change mark to move it in time (it snaps, and never passes its neighbors), click one to edit the state and attributes in effect there, add changes, or delete them. Add a track for any other entity by its id, or remove one. Edited tracks are marked; **Undo**, **Reset** per track and **Reset all** take you back to the recorded history.
+**Pan and zoom.** Every track shares one time axis. Pan with the scroll bar under the axis (drag its thumb, or click beside it to page), the horizontal wheel or Shift + wheel; zoom with the − / + / **Fit** buttons, Ctrl/⌘ + wheel, or the wheel over the axis. Dragging on the timeline itself never pans.
+
+**Edit the timeline** for a what-if. Two drags, told apart by where they start:
+
+- **Drag a track** (anywhere on it but a change mark) to shift that entity's whole history in time, so its changes line up differently against the other tracks'. The offset shows while you drag (`+3 min 20 s`) and stays on the track as a chip afterwards, with **Unshift** to put it back. The state in effect at the window start moves with it: shifted earlier, the last change pushed before the start becomes the initial state. Changes shifted outside the window are left out of the replay but kept, and come back when you shift the track back. Hold Shift to shift the track even when the drag starts on a mark.
+- **Drag a change mark** to move just that change (it snaps, and never passes its neighbors). On a touch screen only the selected change has a handle: tap a change, then drag its handle; a swipe anywhere else on the track shifts the whole track.
+
+Click a mark (or anywhere on a track) to edit the state and attributes in effect there, add changes, or delete them. Add a track for any other entity by its id, or remove one. Every edit, a track shift included, is marked, undoable and saved with a scenario; **Undo**, **Reset** per track and **Reset all** take you back to the recorded history.
 
 **Edit the automation config** in the YAML editor under the timeline to try a different trigger, condition or action. The edit only changes what the simulator runs. It is never saved to Home Assistant, and **Revert to saved automation** puts the real config back. `!include`, `!secret` and other custom YAML tags are refused.
 

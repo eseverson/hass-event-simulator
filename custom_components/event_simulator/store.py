@@ -64,6 +64,16 @@ _STATE = vol.Schema(
 
 _EVENT = _STATE.extend({vol.Required("at"): _aware_iso, vol.Required("entity_id"): cv.entity_id})
 
+# A track the panel shifted in time: its offset in ms and the state in effect before all
+# of its events (None when there was none). Its events, wherever they landed, are in
+# `events`; the panel parks the ones outside the window again on load.
+_TRACK_SHIFT = vol.Schema(
+    {
+        vol.Required("offset"): vol.Coerce(int),
+        vol.Optional("base", default=None): vol.Any(None, _STATE),
+    }
+)
+
 # The body of a scenario, shared with the websocket `save` command's schema.
 SCENARIO_FIELDS: dict[vol.Marker, Any] = {
     vol.Required("name"): vol.All(cv.string, vol.Strip, vol.Length(min=1, max=MAX_NAME_LENGTH)),
@@ -75,9 +85,14 @@ SCENARIO_FIELDS: dict[vol.Marker, Any] = {
     vol.Optional("initial_states", default=dict): {cv.entity_id: _STATE},
     # A plain list, or packed as the panel sends it.
     vol.Optional("events", default=list): vol.All(vol.Any(list, unpack_events), [_EVENT]),
+    # Only sent when a track is shifted, and only stored then.
+    vol.Optional("track_shifts"): {cv.entity_id: _TRACK_SHIFT},
 }
 
-_BODY_KEYS = tuple(marker.schema for marker in SCENARIO_FIELDS)
+_OPTIONAL_KEYS = ("track_shifts",)
+_BODY_KEYS = tuple(
+    marker.schema for marker in SCENARIO_FIELDS if marker.schema not in _OPTIONAL_KEYS
+)
 
 
 class _ScenarioFile(Store[dict[str, Any]]):
@@ -155,6 +170,7 @@ class ScenarioStore:
         scenario = {
             "scenario_id": scenario_id,
             **{key: body.get(key) for key in _BODY_KEYS},
+            **{key: body[key] for key in _OPTIONAL_KEYS if body.get(key)},
             "events": pack_events(body.get("events") or []),
             "created": created,
             "updated": now,

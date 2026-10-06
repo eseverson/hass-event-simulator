@@ -6,6 +6,9 @@
  * entities the automation references -> Run sends the scenario to the sandbox and the
  * runs it reports land on a results row under the shared time axis.
  *
+ * Panning is the scroll bar under the shared axis (every track pans together); a drag on
+ * a track shifts that track's whole history in time (shiftTrack).
+ *
  * Editing: change marks on a track drag in time (snapped, never past a neighbor), a
  * click opens an inline editor for the state and attributes in effect there (or the
  * initial state), and changes can be added and deleted. Edits are undoable, marked as
@@ -194,6 +197,35 @@ export function zoomView([t0, t1], anchor, factor, [lo, hi]) {
 /* Shift the view by dt milliseconds. clampView keeps the span, so a pan never zooms. */
 export function panView([t0, t1], dt, [lo, hi]) {
   return clampView(t0 + dt, t1 + dt, lo, hi);
+}
+
+/* The scroll bar that pans the shared time axis: where its thumb sits for `view` inside
+ * [lo, hi] on a bar `width` px wide, as {left, width} in px. The thumb is as wide as the
+ * visible share of the window, but never thinner than `minThumb`, so it stays grabbable
+ * when zoomed far in; positions map over the bar's free room, so the ends still line up. */
+export function scrollThumb([t0, t1], [lo, hi], width, minThumb = 24) {
+  const full = hi - lo;
+  if (!(full > 0) || !(width > 0)) return { left: 0, width: Math.max(0, width) };
+  const span = t1 - t0;
+  const w = Math.min(width, Math.max(Math.min(minThumb, width), (span / full) * width));
+  const room = full - span;
+  const left = room > 0 ? ((t0 - lo) / room) * (width - w) : 0;
+  return { left: Math.min(width - w, Math.max(0, left)), width: w };
+}
+
+/* The view a thumb `thumbWidth` px wide shows when dragged to `left` px: the span stays,
+ * the start follows the thumb (the inverse of scrollThumb). */
+export function viewFromThumb(left, [t0, t1], [lo, hi], width, thumbWidth) {
+  const span = t1 - t0;
+  const free = width - thumbWidth;
+  const room = hi - lo - span;
+  const start = free > 0 && room > 0 ? lo + (Math.min(free, Math.max(0, left)) / free) * room : lo;
+  return clampView(start, start + span, lo, hi);
+}
+
+/* A click on the bar beside the thumb pages the view toward the click by most of a span. */
+export function pageView([t0, t1], direction, bounds) {
+  return panView([t0, t1], Math.sign(direction) * (t1 - t0) * 0.9, bounds);
 }
 
 /* The item whose x is nearest to `x`, within `maxPx`; items are {x, ...}. */
@@ -953,6 +985,137 @@ export function setInitial(timeline, { state, attributes }, start) {
   return { ...timeline, initial: next };
 }
 
+// ---- track shift (pure) -----------------------------------------------------
+//
+// Dragging a track moves its whole history in time, so events of different entities can
+// be realigned against each other. A shifted timeline keeps the window invariant of the
+// others (`events` are inside [start, end), `initial` is the state at the window start)
+// and adds `shift: {offset, base, before, after}`: the total offset in ms, the state in
+// effect before every event (its timestamps shifted too), and the events pushed out of
+// the window on either side. Those are kept, not dropped, so shifting back restores them;
+// only the replay leaves them out (buildScenario reads `events` and `initial` alone).
+// While events are parked before the start, the last of them is the initial state.
+
+/* Each shifted copy remembers the item it came from and the net offset, so shifting
+ * back to where it started hands back the very same object: the identity checks of
+ * timelineEdited then see it as recorded again. Not serialized; a WeakMap lets go. */
+const SHIFT_ORIGIN = new WeakMap();
+
+function shiftItem(item, dt, retime) {
+  const origin = SHIFT_ORIGIN.get(item) ?? { src: item, net: 0 };
+  const net = origin.net + dt;
+  if (net === 0) return origin.src;
+  const out = retime(origin.src, net);
+  SHIFT_ORIGIN.set(out, { src: origin.src, net });
+  return out;
+}
+
+const retimeEvent = (ev, net) => editedEvent(ev, { at: isoAt(parseTime(ev.at) + net) });
+
+function retimeState(state, net) {
+  const out = { ...state, edited: true };
+  for (const key of ["last_changed", "last_updated"]) if (state[key]) out[key] = isoAt(parseTime(state[key]) + net);
+  return out;
+}
+
+/* A state whose timestamps are past the window start is clamped to it: whatever is in
+ * effect at the start cannot have begun after it. */
+function clampToStart(state, start) {
+  const late = (key) => state[key] && parseTime(state[key]) > start;
+  if (!late("last_changed") && !late("last_updated")) return state;
+  const out = { ...state };
+  for (const key of ["last_changed", "last_updated"]) if (late(key)) out[key] = isoAt(start);
+  return out;
+}
+
+/* The state at the window start of a shifted track: the last event parked before it
+ * (changed when its run of equal states began), or else the base state. */
+function shiftedInitial(before, base, start) {
+  if (!before.length) return base ? clampToStart(base, start) : null;
+  const last = before[before.length - 1];
+  let since = parseTime(last.at);
+  for (let i = before.length - 2; i >= 0 && String(before[i].state) === String(last.state); i--) since = parseTime(before[i].at);
+  return { state: last.state, attributes: last.attributes || {}, last_changed: isoAt(since), last_updated: isoAt(parseTime(last.at)), edited: true };
+}
+
+const sameValue = (a, b) => !!a === !!b && (!a || (String(a.state) === String(b.state) && stableStringify(a.attributes || {}) === stableStringify(b.attributes || {})));
+
+/* The track's offset in ms (0 when it was never shifted or is back in place). */
+export function trackOffset(timeline) {
+  return timeline?.shift?.offset ?? 0;
+}
+
+/* How many of the track's events are shifted out of the window, [before, after]. */
+export function parkedCounts(timeline) {
+  return [timeline?.shift?.before?.length ?? 0, timeline?.shift?.after?.length ?? 0];
+}
+
+/* Shift every event of a timeline by dt ms (and the base state's timestamps with them).
+ * Events that leave [start, end) are parked on `shift`, and come back when a later shift
+ * brings them inside again. Shifted events are marked edited; a track shifted back to
+ * offset 0 with nothing parked drops `shift` and gets its own items back. Returns the
+ * input itself for dt = 0. */
+export function shiftTrack(timeline, dt, { start, end }) {
+  const delta = Math.round(dt);
+  if (!delta) return timeline;
+  const sh = timeline.shift;
+  let before = sh?.before ?? [];
+  let base = sh ? sh.base : timeline.initial;
+  // The initial state edited since the last shift: keep the edit rather than re-deriving over it.
+  if (sh && !sameValue(timeline.initial, shiftedInitial(before, base, start))) {
+    if (before.length && timeline.initial) {
+      const last = before[before.length - 1];
+      before = [...before.slice(0, -1), editedEvent(last, { state: String(timeline.initial.state), attributes: timeline.initial.attributes || {} })];
+    } else if (!before.length) {
+      base = timeline.initial;
+    }
+  }
+  const all = [...before, ...timeline.events, ...(sh?.after ?? [])].map((ev) => shiftItem(ev, delta, retimeEvent));
+  const nextBase = base ? shiftItem(base, delta, retimeState) : null;
+  const lo = countAtOrBefore(all, start - 1);
+  const hi = countAtOrBefore(all, end - 1);
+  const parkedBefore = all.slice(0, lo);
+  const parkedAfter = all.slice(hi);
+  const offset = (sh?.offset ?? 0) + delta;
+  const { shift, ...rest } = timeline;
+  const next = { ...rest, initial: shiftedInitial(parkedBefore, nextBase, start), events: all.slice(lo, hi) };
+  if (offset !== 0 || parkedBefore.length || parkedAfter.length) {
+    next.shift = { offset, base: nextBase, before: parkedBefore, after: parkedAfter };
+  }
+  return next;
+}
+
+/* A loaded timeline whose events may lie outside the window (a saved shifted track):
+ * parked again as shiftTrack left them, with the saved offset and base state. */
+export function restoreShift(timeline, saved, { start, end }) {
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return timeline;
+  const lo = countAtOrBefore(timeline.events, start - 1);
+  const hi = countAtOrBefore(timeline.events, end - 1);
+  const offset = Number(saved?.offset) || 0;
+  if (!offset && lo === 0 && hi === timeline.events.length) return timeline;
+  return {
+    ...timeline,
+    events: timeline.events.slice(lo, hi),
+    shift: {
+      offset,
+      base: isObject(saved) && "base" in saved ? saved.base : timeline.initial,
+      before: timeline.events.slice(0, lo),
+      after: timeline.events.slice(hi),
+    },
+  };
+}
+
+/* An offset as `+3 min 20 s` or `−1 h`. */
+export function formatOffset(ms) {
+  if (!ms) return "0 s";
+  return `${ms > 0 ? "+" : "−"}${formatDuration(Math.abs(ms))}`;
+}
+
+/* A drag distance in ms rounded to whole snap steps (an offset, so not to the clock). */
+export function snapDelta(dt, step) {
+  return step ? Math.round(dt / step) * step : Math.round(dt);
+}
+
 /* JSON with object keys sorted, so equal data compares equal whatever its key order. */
 export function stableStringify(value) {
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
@@ -968,6 +1131,7 @@ export function stableStringify(value) {
 /* Whether a timeline differs from what was recorded. */
 export function timelineEdited(timeline, recorded) {
   if (!recorded) return false;
+  if (timeline.shift) return true;
   if (timeline.initial !== recorded.initial || timeline.events.length !== recorded.events.length) return true;
   return timeline.events.some((ev, i) => ev !== recorded.events[i]);
 }
@@ -1030,9 +1194,17 @@ export const MAX_SCENARIO_NAME = 100; // store.MAX_NAME_LENGTH
 export function scenarioPayload({ name, entityId, automation, start, end, tracks }) {
   const initial_states = {};
   const events = [];
+  const track_shifts = {};
   for (const track of tracks) {
     if (track.initial) initial_states[track.entity_id] = track.initial;
     for (const ev of track.events) events.push(ev);
+    // A shifted track saves the events it parked outside the window too (restoreShift
+    // parks them again on load), and its offset and base state.
+    const sh = track.shift;
+    if (sh) {
+      for (const ev of [...sh.before, ...sh.after]) events.push(ev);
+      track_shifts[track.entity_id] = { offset: sh.offset, base: sh.base ?? null };
+    }
   }
   events.sort((a, b) => parseTime(a.at) - parseTime(b.at));
   return {
@@ -1044,6 +1216,7 @@ export function scenarioPayload({ name, entityId, automation, start, end, tracks
     entity_ids: tracks.map((t) => t.entity_id),
     initial_states,
     events,
+    ...(Object.keys(track_shifts).length ? { track_shifts } : {}),
   };
 }
 
@@ -1054,12 +1227,20 @@ export function tracksFromScenario(scenario) {
   const ids = [...(Array.isArray(scenario?.entity_ids) ? scenario.entity_ids : [])];
   const initials = isObject(scenario?.initial_states) ? scenario.initial_states : {};
   const events = unpackEvents(scenario?.events).filter((ev) => isObject(ev) && ev.entity_id);
+  const shifts = isObject(scenario?.track_shifts) ? scenario.track_shifts : {};
+  const window = { start: parseTime(scenario?.start), end: parseTime(scenario?.end) };
   for (const id of [...Object.keys(initials), ...events.map((ev) => ev.entity_id)]) if (!ids.includes(id)) ids.push(id);
-  return ids.map((entity_id) => ({
-    entity_id,
-    initial: initials[entity_id] || null,
-    events: events.filter((ev) => ev.entity_id === entity_id).sort((a, b) => parseTime(a.at) - parseTime(b.at)),
-  }));
+  return ids.map((entity_id) =>
+    restoreShift(
+      {
+        entity_id,
+        initial: initials[entity_id] || null,
+        events: events.filter((ev) => ev.entity_id === entity_id).sort((a, b) => parseTime(a.at) - parseTime(b.at)),
+      },
+      shifts[entity_id],
+      window
+    )
+  );
 }
 
 /* A comparable key for a state write, whatever format its time strings arrived in. */
@@ -1083,7 +1264,7 @@ export function adoptRecorded(loaded, recorded) {
     loaded.initial && recorded.initial && !loaded.initial.edited && stableStringify(loaded.initial) === stableStringify(recorded.initial)
       ? recorded.initial
       : loaded.initial;
-  return { initial, events };
+  return { initial, events, ...(loaded.shift ? { shift: loaded.shift } : {}) };
 }
 
 /* What "unsaved changes" compares: everything a save would write except the name. */
@@ -1142,6 +1323,7 @@ const PRESETS = [
   { id: "yesterday", label: "Yesterday" },
 ];
 const AXIS_H = 24;
+const SCROLL_MIN_THUMB = 28; // px
 const DISCRETE_H = 24;
 const NUMERIC_H = 56;
 const RESULTS_H = 38;
@@ -1213,7 +1395,8 @@ class EventSimulatorPanel extends Base {
     this._selectedRun = null; // run index
     this._requestToken = 0; // drops responses to requests a newer one superseded
     this._width = 600;
-    this._drag = null; // pan (or click) in progress
+    this._drag = null; // click, or whole-track shift, in progress: {entity_id, dt, preview, ...}
+    this._thumbDrag = null; // scroll bar thumb drag in progress
     this._evDrag = null; // event drag in progress: {entity_id, index, preview, ...}
     this._frame = 0;
     this._rendered = false;
@@ -1381,6 +1564,7 @@ class EventSimulatorPanel extends Base {
         if (!recorded) continue;
         track.initial = recorded.initial;
         track.events = recorded.events;
+        delete track.shift;
         track.recorded = recorded;
         this._prepareTrack(track);
       }
@@ -1492,6 +1676,7 @@ class EventSimulatorPanel extends Base {
     this._edDraft = null;
     this._edError = null;
     this._evDrag = null;
+    this._drag = null;
   }
 
   _track(entityId) {
@@ -1514,11 +1699,9 @@ class EventSimulatorPanel extends Base {
     const snapshots = [];
     for (const { entity_id, timeline } of changes) {
       const track = this._track(entity_id);
-      if (!track || (timeline.initial === track.initial && timeline.events === track.events)) continue;
-      snapshots.push({ entity_id, timeline: { initial: track.initial, events: track.events } });
-      track.initial = timeline.initial;
-      track.events = timeline.events;
-      this._prepareTrack(track);
+      if (!track || (timeline.initial === track.initial && timeline.events === track.events && timeline.shift === track.shift)) continue;
+      snapshots.push({ entity_id, timeline: { initial: track.initial, events: track.events, shift: track.shift } });
+      this._setTimeline(track, timeline);
     }
     if (!snapshots.length) return false;
     this._undo.push({ label, snapshots });
@@ -1530,15 +1713,21 @@ class EventSimulatorPanel extends Base {
     return true;
   }
 
+  /* A track's timeline replaced: its state at the start, its events, and its shift. */
+  _setTimeline(track, timeline) {
+    track.initial = timeline.initial;
+    track.events = timeline.events;
+    if (timeline.shift) track.shift = timeline.shift;
+    else delete track.shift;
+    this._prepareTrack(track);
+  }
+
   _undoEdit() {
     const entry = this._undo.pop();
     if (!entry) return;
     for (const { entity_id, timeline } of entry.snapshots) {
       const track = this._track(entity_id);
-      if (!track) continue;
-      track.initial = timeline.initial;
-      track.events = timeline.events;
-      this._prepareTrack(track);
+      if (track) this._setTimeline(track, timeline);
     }
     // Indexes may point elsewhere now; keep the selection only if it still exists.
     const sel = this._sel && this._track(this._sel.entity_id);
@@ -1868,7 +2057,7 @@ class EventSimulatorPanel extends Base {
   /* Render now, or once the drag in progress ends: a redraw replaces the timeline the
    * pointer is captured by. */
   _renderSoon() {
-    if (this._evDrag || this._drag) {
+    if (this._evDrag || this._drag || this._thumbDrag) {
       this._renderDeferred = true;
       return;
     }
@@ -1876,7 +2065,7 @@ class EventSimulatorPanel extends Base {
   }
 
   _flushRender() {
-    if (!this._renderDeferred || this._evDrag || this._drag) return;
+    if (!this._renderDeferred || this._evDrag || this._drag || this._thumbDrag) return;
     this._renderDeferred = false;
     this._render();
   }
@@ -1898,7 +2087,7 @@ class EventSimulatorPanel extends Base {
   /* scenarioFingerprint of the current state. Timelines are immutable and replaced on
    * every edit, so the costly part is cached on their identity. */
   _fingerprint() {
-    const parts = [this._entityId, this._window.start, this._window.end, ...this._tracks.flatMap((t) => [t.entity_id, t.initial, t.events])];
+    const parts = [this._entityId, this._window.start, this._window.end, ...this._tracks.flatMap((t) => [t.entity_id, t.initial, t.events, t.shift])];
     const c = this._printCache;
     if (!c || c.parts.length !== parts.length || c.parts.some((x, i) => x !== parts[i]) || c.config !== this._runConfig()) {
       this._printCache = { parts, config: this._runConfig(), print: scenarioFingerprint(this._payload()) };
@@ -2395,7 +2584,9 @@ class EventSimulatorPanel extends Base {
               <button data-action="add-track">Add</button>
             </div>
           </div>
-          <div class="muted small hint">Drag to pan; Ctrl/⌘ + wheel or wheel over the axis zooms. Drag a change mark to move it in time. Click (tap) a state to edit it or add a change there; double-click (double-tap) adds one directly.</div>
+          <div class="muted small hint">${this._narrow
+            ? "Pan with the scroll bar under the axis. Drag a track to shift its whole history; to move one change, tap it, then drag its handle. Tap a state to edit it or add a change there; double-tap adds one directly."
+            : "Pan with the scroll bar under the axis (or the horizontal wheel); Ctrl/⌘ + wheel or wheel over the axis zooms. Drag a track to shift its whole history in time; drag a change mark to move just that change (Shift + drag shifts the track even from a mark). Click a state to edit it or add a change there; double-click adds one directly."}</div>
           <div id="tl-wrap" tabindex="0">
             <div id="tl"></div>
             <div id="cursor" hidden></div>
@@ -2536,6 +2727,10 @@ class EventSimulatorPanel extends Base {
     if (this._result || this._running) parts.push(this._resultsRow(scale));
     for (const track of this._tracks) parts.push(this._trackRow(track, scale));
     tl.innerHTML = parts.join("");
+    // The hover line starts under the axis and its scroll bar.
+    const axis = tl.querySelector(".axis-row");
+    const cursor = this.shadowRoot.getElementById("cursor");
+    if (axis && cursor) cursor.style.top = `${axis.offsetHeight}px`;
   }
 
   _axisSvg(scale) {
@@ -2550,7 +2745,17 @@ class EventSimulatorPanel extends Base {
       })
       .join("");
     return `<div class="row axis-row"><svg class="axis" data-row="axis" width="${scale.width}" height="${AXIS_H}">${marks}
-      <line x1="0" x2="${scale.width}" y1="${AXIS_H - 0.5}" y2="${AXIS_H - 0.5}" class="baseline"/></svg></div>`;
+      <line x1="0" x2="${scale.width}" y1="${AXIS_H - 0.5}" y2="${AXIS_H - 0.5}" class="baseline"/></svg>${this._scrollbarHtml(scale)}</div>`;
+  }
+
+  /* The scroll bar that pans every track together (one shared time axis); the zoom
+   * buttons and Ctrl/⌘ + wheel set how much of the window it shows. */
+  _scrollbarHtml(scale) {
+    const thumb = scrollThumb(this._view, this._bounds(), scale.width, SCROLL_MIN_THUMB);
+    const all = thumb.width >= scale.width - 0.5;
+    const pct = (v) => `${((v / scale.width) * 100).toFixed(3)}%`;
+    return `<div class="scrollbar${all ? " all" : ""}" data-part="scrollbar" title="${all ? "The whole window is visible; zoom in to pan" : "Drag to pan; click beside the thumb to page"}">
+      <div class="thumb${this._thumbDrag ? " dragging" : ""}" data-part="thumb" style="left:${pct(thumb.left)};width:${pct(thumb.width)}"></div></div>`;
   }
 
   _tickLabel(t, step) {
@@ -2576,9 +2781,15 @@ class EventSimulatorPanel extends Base {
     // The automation's own track sets whether it is enabled in the replay, not a raw state.
     const name = track.entity_id === this._entityId ? "This automation (enabled state)" : this._friendlyName(track.entity_id);
     const unit = this._unit(track);
-    // While a change mark is dragged, the track draws the would-be timeline.
-    const preview = this._evDrag?.entity_id === track.entity_id ? this._evDrag.preview : null;
-    const view = preview?.timeline && track.segments ? { ...track, ...preview.timeline, ...this._derive(preview.timeline) } : track;
+    // While a change mark or the whole track is dragged, the track draws the would-be timeline.
+    const preview =
+      this._evDrag?.entity_id === track.entity_id
+        ? this._evDrag.preview?.timeline
+        : this._drag?.entity_id === track.entity_id && this._drag.moved
+          ? this._drag.preview
+          : null;
+    const view = preview && track.segments ? { ...track, ...preview, ...this._derive(preview) } : track;
+    const shifting = !!preview && this._drag?.entity_id === track.entity_id;
     let meta = "";
     if (!track.segments) meta = "loading…";
     else if (!track.segments.length) meta = "no history in this window";
@@ -2596,15 +2807,28 @@ class EventSimulatorPanel extends Base {
           ${name ? `<span class="eid mono">${esc(track.entity_id)}</span>` : ""}
           ${track.edited ? `<span class="chip edited" title="${editedCount} edited item${editedCount === 1 ? "" : "s"}; deleted changes are not counted">edited</span>
             <button class="link" data-action="reset-track" data-entity="${esc(track.entity_id)}" title="Put this track back to its recorded history">Reset</button>` : ""}
+          ${this._shiftChip(shifting ? view : track, shifting)}
           <span class="meta">${meta}</span>
           <button class="icon" data-action="remove-track" data-entity="${esc(track.entity_id)}" title="Remove track" aria-label="Remove ${esc(track.entity_id)}">×</button>
         </div>
-        <svg class="track${track.edited ? " is-edited" : ""}" data-row="track" data-entity="${esc(track.entity_id)}" width="${scale.width}" height="${height}">
+        <svg class="track${track.edited ? " is-edited" : ""}${shifting ? " shifting" : ""}" data-row="track" data-entity="${esc(track.entity_id)}" width="${scale.width}" height="${height}">
           ${this._hatch(`h-${hashString(track.entity_id)}`)}
           ${this._gridLines(scale, height)}
           ${body}
         </svg>
       </div>`;
+  }
+
+  /* The offset of a shifted track and how many of its changes it pushed out of the
+   * window, with a reset; drawn live while the track is dragged. */
+  _shiftChip(timeline, live) {
+    const offset = trackOffset(timeline);
+    const [before, after] = parkedCounts(timeline);
+    if (!offset && !before && !after && !live) return "";
+    const parked = before + after;
+    const title = `Every change on this track moved by ${formatOffset(offset)}${parked ? `; ${parked} now outside the window, left out of the replay but kept (shift back to bring them in)` : ""}`;
+    return `<span class="chip shift${live ? " live" : ""}" title="${esc(title)}">shifted ${esc(formatOffset(offset))}${parked ? ` · ${parked} outside` : ""}</span>
+      ${live || !offset ? "" : `<button class="link" data-action="reset-shift" data-entity="${esc(timeline.entity_id)}" title="Shift the track back by ${esc(formatOffset(-offset))}">Unshift</button>`}`;
   }
 
   /* Change marks: a tick per state write (the drag handles), edited ones in the accent
@@ -2639,6 +2863,7 @@ class EventSimulatorPanel extends Base {
       lastX = x;
       out += `<line x1="${x}" x2="${x}" y1="0" y2="${height}" class="ev${ev.edited ? " edited" : ""}${selected ? " sel" : ""}"/>`;
       if (ev.edited) out += `<path d="M${x - 4},0L${x + 4},0L${x},6Z" class="ev-flag"/>`;
+      if (selected) out += `<rect x="${x - 4}" y="${height / 2 - 6}" width="8" height="12" rx="3" class="ev-knob"/>`;
     }
     return out;
   }
@@ -2816,11 +3041,13 @@ class EventSimulatorPanel extends Base {
       this._flushRender();
     });
     wrap.addEventListener("pointercancel", () => {
+      // A cancelled gesture (the browser took it for a page scroll, say) changes nothing.
+      const redraw = this._evDrag || this._drag?.moved || this._thumbDrag;
       this._drag = null;
-      if (this._evDrag) {
-        this._evDrag = null;
-        this._scheduleTimeline();
-      }
+      this._evDrag = null;
+      this._thumbDrag = null;
+      this._hideHover();
+      if (redraw) this._scheduleTimeline();
       this._flushRender();
     });
     wrap.addEventListener("pointerleave", () => {
@@ -2866,9 +3093,11 @@ class EventSimulatorPanel extends Base {
       const anchor = scale.toT(this._localX(ev).x);
       const factor = Math.exp(Math.max(-1, Math.min(1, ev.deltaY / 300)));
       this._setView(zoomView(this._view, anchor, factor, this._bounds()));
-    } else if (Math.abs(ev.deltaX) > Math.abs(ev.deltaY)) {
+    } else if (Math.abs(ev.deltaX) > Math.abs(ev.deltaY) || (ev.shiftKey && ev.deltaY)) {
+      // A horizontal wheel (or Shift + wheel) pans, as the scroll bar does.
       ev.preventDefault();
-      this._setView(panView(this._view, (ev.deltaX / this._width) * (this._view[1] - this._view[0]), this._bounds()));
+      const delta = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+      this._setView(panView(this._view, (delta / this._width) * (this._view[1] - this._view[0]), this._bounds()));
     }
   }
 
@@ -2896,38 +3125,72 @@ class EventSimulatorPanel extends Base {
     return { svg, track, x, t: this._scale().toT(x) };
   }
 
-  /* The change mark within reach of the pointer on that track, as an event index. */
-  _markHit(hit, ev) {
+  /* The change mark within reach of the pointer on that track, as an event index: the
+   * handle that moves one change instead of shifting the whole track. With a finger only
+   * the selected change has a handle (tap a change first), so a swipe on a busy track
+   * still shifts the track rather than whichever mark it happened to start on.
+   * `anyMark` finds any mark in reach, for a tap that selects one. */
+  _markHit(hit, ev, anyMark = false) {
     const scale = this._scale();
     const { track, x, t } = hit;
-    const reach = ev.pointerType === "touch" ? 14 : 6;
+    const touch = ev.pointerType === "touch";
+    const reach = touch ? 14 : 6;
     const crowded = countAtOrBefore(track.events, scale.t1) - countAtOrBefore(track.events, scale.t0 - 1) > scale.width / 6;
+    const selected = (j) => this._sel?.entity_id === track.entity_id && this._sel.index === j;
     const i = eventIndexAt(track.events, t);
     const candidates = [i, i + 1]
       .filter((j) => j >= 0 && j < track.events.length)
-      .filter((j) => !crowded || track.events[j].edited || (this._sel?.entity_id === track.entity_id && this._sel.index === j))
+      .filter((j) => (touch && !anyMark ? selected(j) : !crowded || track.events[j].edited || selected(j)))
       .map((j) => ({ x: scale.toX(parseTime(track.events[j].at)), index: j }));
     return findNearest(candidates, x, reach)?.index ?? null;
   }
 
   _onPointerDown(ev) {
-    if (ev.button !== 0 || !ev.target.closest?.("svg")) return;
+    if (ev.button !== 0) return;
+    const bar = ev.target.closest?.("[data-part=scrollbar]");
+    if (bar) return this._onScrollbarDown(ev, bar);
+    if (!ev.target.closest?.("svg")) return;
     const hit = ev.target.closest("svg[data-row=track]") ? this._trackAt(ev) : null;
-    const index = hit ? this._markHit(hit, ev) : null;
+    // A mark is a handle for that one change; Shift + drag shifts the track from anywhere.
+    const index = hit && !ev.shiftKey ? this._markHit(hit, ev) : null;
     if (index !== null) {
       const at = parseTime(hit.track.events[index].at);
-      this._evDrag = { id: ev.pointerId, entity_id: hit.track.entity_id, index, x: ev.clientX, from: at, moved: false, preview: null };
+      this._evDrag = { id: ev.pointerId, entity_id: hit.track.entity_id, index, x: ev.clientX, from: at, moved: false, preview: null, touch: ev.pointerType === "touch" };
     } else {
-      this._drag = { x: ev.clientX, view: this._view, moved: false, id: ev.pointerId };
+      // On a track: a click, or a drag that shifts the whole track. On the axis or the
+      // runs row: a click only (the axis drag is left free for labeling periods).
+      this._drag = { id: ev.pointerId, x: ev.clientX, moved: false, entity_id: hit ? hit.track.entity_id : null, dt: 0, preview: null, touch: ev.pointerType === "touch" };
     }
     ev.currentTarget.setPointerCapture?.(ev.pointerId);
   }
 
+  /* Press on the scroll bar: drag the thumb, or page toward a press beside it. */
+  _onScrollbarDown(ev, bar) {
+    ev.preventDefault();
+    const rect = bar.getBoundingClientRect();
+    const thumb = scrollThumb(this._view, this._bounds(), rect.width, SCROLL_MIN_THUMB);
+    const x = ev.clientX - rect.left;
+    if (x < thumb.left || x > thumb.left + thumb.width) {
+      this._setView(pageView(this._view, x < thumb.left ? -1 : 1, this._bounds()));
+      return;
+    }
+    this._thumbDrag = { id: ev.pointerId, x: ev.clientX, left: thumb.left, thumb: thumb.width, bar: rect.width, view: this._view };
+    ev.currentTarget.setPointerCapture?.(ev.pointerId);
+    this._hideHover();
+    this._scheduleTimeline();
+  }
+
   _onPointerMove(ev) {
+    const thumb = this._thumbDrag;
+    if (thumb && thumb.id === ev.pointerId) {
+      const left = thumb.left + ev.clientX - thumb.x;
+      this._setView(viewFromThumb(left, thumb.view, this._bounds(), thumb.bar, thumb.thumb));
+      return;
+    }
     const moving = this._evDrag;
     if (moving && moving.id === ev.pointerId) {
       const dx = ev.clientX - moving.x;
-      if (Math.abs(dx) > 3) moving.moved = true;
+      if (Math.abs(dx) > (moving.touch ? 6 : 3)) moving.moved = true;
       if (moving.moved) {
         const track = this._track(moving.entity_id);
         if (!track) return;
@@ -2941,19 +3204,30 @@ class EventSimulatorPanel extends Base {
     const drag = this._drag;
     if (drag && drag.id === ev.pointerId) {
       const dx = ev.clientX - drag.x;
-      if (Math.abs(dx) > 3) drag.moved = true;
-      if (drag.moved) {
-        this._hideHover();
-        const span = drag.view[1] - drag.view[0];
-        this._setView(panView(drag.view, (-dx / this._width) * span, this._bounds()));
-        return;
+      if (Math.abs(dx) > (drag.touch ? 6 : 3)) drag.moved = true;
+      if (!drag.moved) return this._showHover(ev);
+      const track = drag.entity_id && this._track(drag.entity_id);
+      if (!track?.segments) return this._hideHover();
+      const msPerPx = (this._view[1] - this._view[0]) / this._width;
+      const dt = snapDelta(dx * msPerPx, snapStep(msPerPx));
+      if (dt !== drag.dt || !drag.preview) {
+        drag.dt = dt;
+        drag.preview = shiftTrack(track, dt, this._editOpts());
+        this._scheduleTimeline();
       }
+      this._showShiftTip(ev, drag, track);
+      return;
     }
     this._showHover(ev);
   }
 
   _onPointerUp(ev) {
     ev.currentTarget.releasePointerCapture?.(ev.pointerId);
+    const thumb = this._thumbDrag;
+    if (thumb && thumb.id === ev.pointerId) {
+      this._thumbDrag = null;
+      return this._scheduleTimeline();
+    }
     const moving = this._evDrag;
     if (moving && moving.id === ev.pointerId) {
       this._evDrag = null;
@@ -2973,7 +3247,12 @@ class EventSimulatorPanel extends Base {
     }
     const drag = this._drag;
     this._drag = null;
-    if (!drag || drag.moved) return;
+    if (!drag) return;
+    if (drag.moved) {
+      this._hideHover();
+      if (drag.entity_id && drag.preview && drag.dt) return this._shiftTrackBy(drag.entity_id, drag.dt, drag.preview);
+      return this._scheduleTimeline();
+    }
     const hit = this._resultsHit(ev);
     if (hit?.run) {
       this._selectedRun = hit.run.index;
@@ -2995,10 +3274,29 @@ class EventSimulatorPanel extends Base {
         this._selT = t;
         return this._addChange(at.track.entity_id, t);
       }
-      this._select({ entity_id: at.track.entity_id, index: eventIndexAt(at.track.events, at.t) }, t);
+      // A tap on a mark selects that change (with a finger no mark is a drag handle until selected).
+      const mark = ev.pointerType === "touch" ? this._markHit(at, ev, true) : null;
+      const index = mark ?? eventIndexAt(at.track.events, at.t);
+      this._select({ entity_id: at.track.entity_id, index }, mark !== null ? parseTime(at.track.events[mark].at) : t);
       this._render();
       this.shadowRoot.getElementById("tl-wrap")?.focus({ preventScroll: true });
     }
+  }
+
+  /* Shift a whole track by dt ms as one undoable edit (`timeline` when already worked
+   * out by the drag preview). A selection on that track follows its change. */
+  _shiftTrackBy(entityId, dt, timeline = null) {
+    const track = this._track(entityId);
+    if (!track?.segments || !dt) return this._scheduleTimeline();
+    const next = timeline ?? shiftTrack(track, dt, this._editOpts());
+    let select;
+    if (this._sel?.entity_id === entityId && this._sel.index >= 0) {
+      const index = this._sel.index - (parkedCounts(next)[0] - parkedCounts(track)[0]);
+      select = index >= 0 && index < next.events.length ? { entity_id: entityId, index } : null;
+      if (Number.isFinite(this._selT)) this._selT += dt;
+    }
+    const label = trackOffset(next) === 0 ? "unshift track" : "shift track";
+    this._commit(label, [{ entity_id: entityId, timeline: next }], select);
   }
 
   /* The time a dragged change would land on, next to the pointer. */
@@ -3015,6 +3313,26 @@ class EventSimulatorPanel extends Base {
     tip.innerHTML = `<div class="mono"><strong>${esc(this._fullTime(at))}</strong></div>
       <div class="muted small">${delta === 0 ? "unchanged" : `${delta > 0 ? "+" : "−"}${esc(formatDuration(Math.abs(delta)))} from ${esc(this._clockTime(moving.from))}`}</div>`;
     const { y } = this._localX(ev);
+    const wrapWidth = this.shadowRoot.getElementById("tl-wrap").clientWidth;
+    const tipWidth = tip.offsetWidth;
+    tip.style.left = `${x + 12 + tipWidth > wrapWidth ? Math.max(0, x - 12 - tipWidth) : x + 12}px`;
+    tip.style.top = `${y + 14}px`;
+  }
+
+  /* The offset a dragged track would get, next to the pointer. */
+  _showShiftTip(ev, drag, track) {
+    const tip = this.shadowRoot.getElementById("tip");
+    const cursor = this.shadowRoot.getElementById("cursor");
+    if (!tip || !cursor) return;
+    cursor.hidden = true;
+    const total = trackOffset(drag.preview);
+    const [before, after] = parkedCounts(drag.preview);
+    const parked = before + after;
+    tip.hidden = false;
+    tip.innerHTML = `<div class="mono"><strong>${esc(formatOffset(drag.dt))}</strong></div>
+      <div class="muted small">${esc(this._friendlyName(track.entity_id) || track.entity_id)}: whole track${total !== drag.dt ? `, ${esc(formatOffset(total))} in all` : ""}</div>
+      ${parked ? `<div class="muted small">${parked} change${parked === 1 ? "" : "s"} outside the window (left out of the replay, kept)</div>` : ""}`;
+    const { x, y } = this._localX(ev);
     const wrapWidth = this.shadowRoot.getElementById("tl-wrap").clientWidth;
     const tipWidth = tip.offsetWidth;
     tip.style.left = `${x + 12 + tipWidth > wrapWidth ? Math.max(0, x - 12 - tipWidth) : x + 12}px`;
@@ -3055,11 +3373,12 @@ class EventSimulatorPanel extends Base {
         const change = track.events[mark];
         html = `<div class="mono small">${esc(this._fullTime(parseTime(change.at)))}</div>
           <div>→ <strong>${esc(change.state)}</strong> <span class="muted small">${change.edited ? "edited" : "recorded"}</span></div>
-          <div class="muted small">drag to move · click to edit</div>`;
+          <div class="muted small">drag to move this change · click to edit</div>`;
       } else {
         html = `<div class="mono small">${esc(this._fullTime(t))}</div>
           <div><strong>${seg ? esc(seg.state) : "no data"}</strong>${seg && track.numeric && !isMissing(seg.state) && unit ? ` ${esc(unit)}` : ""}</div>
-          ${seg ? `<div class="muted small">since ${esc(this._fullTime(seg.from))}</div>` : ""}`;
+          ${seg ? `<div class="muted small">since ${esc(this._fullTime(seg.from))}</div>` : ""}
+          ${track?.segments ? `<div class="muted small">drag to shift the whole track</div>` : ""}`;
       }
     } else if (svg.dataset.row === "results") {
       const hit = this._resultsHit(ev);
@@ -3114,6 +3433,7 @@ class EventSimulatorPanel extends Base {
     else if (action === "undo") this._undoEdit();
     else if (action === "reset-all") this._resetTracks(this._tracks.map((t) => t.entity_id));
     else if (action === "reset-track") this._resetTracks([el.dataset.entity]);
+    else if (action === "reset-shift") this._shiftTrackBy(el.dataset.entity, -trackOffset(this._track(el.dataset.entity)));
     else if (action === "ed-apply") this._applyEditor();
     else if (action === "ed-delete") this._deleteSelected();
     else if (action === "ed-add" && this._sel) this._addChange(this._sel.entity_id, Number(el.dataset.t));
@@ -3328,8 +3648,21 @@ class EventSimulatorPanel extends Base {
       #cfg-editor ha-yaml-editor { display: block; }
       #cfg-error { margin-top: 6px; white-space: pre-wrap; }
       .cfg-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 10px; }
-      #tl svg { display: block; touch-action: pan-y; cursor: grab; overflow: hidden; }
-      #tl svg:active { cursor: grabbing; }
+      #tl svg { display: block; touch-action: pan-y; overflow: hidden; }
+      #tl svg.track { cursor: grab; }
+      #tl svg.track:active, #tl svg.track.shifting { cursor: grabbing; }
+      svg.results { cursor: pointer; }
+      .scrollbar { position: relative; height: 12px; margin: 3px 0 2px; border-radius: 6px; background: var(--secondary-background-color); touch-action: none; cursor: pointer; }
+      .scrollbar .thumb { position: absolute; top: 1px; bottom: 1px; border-radius: 5px; background: var(--secondary-text-color); opacity: .45; cursor: grab; min-width: ${SCROLL_MIN_THUMB}px; box-sizing: border-box; }
+      .scrollbar .thumb:hover, .scrollbar .thumb.dragging { opacity: .7; }
+      .scrollbar .thumb.dragging { cursor: grabbing; }
+      .scrollbar.all { cursor: default; }
+      .scrollbar.all .thumb { opacity: .18; cursor: default; }
+      @media (pointer: coarse) { .scrollbar { height: 22px; border-radius: 11px; } .scrollbar .thumb { border-radius: 10px; } }
+      .chip.shift { background: rgba(3,155,229,.15); color: var(--info-color, #039be5); }
+      .chip.shift.live { box-shadow: inset 0 0 0 1px var(--info-color, #039be5); }
+      svg.track.shifting { outline: 1px dashed var(--info-color, #039be5); outline-offset: -1px; }
+      .ev-knob { fill: var(--card-background-color, #fff); stroke: var(--primary-text-color); stroke-width: 1.5; }
       .row { margin-top: 6px; }
       .axis-row { position: sticky; top: 0; z-index: 2; background: var(--card-background-color, var(--primary-background-color)); margin-top: 0; }
       .track-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 8px; font-size: 0.85em; padding: 2px 0; min-width: 0; }

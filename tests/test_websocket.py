@@ -729,3 +729,53 @@ async def test_non_admin_is_refused(
 
     assert not msg["success"]
     assert msg["error"]["code"] == "unauthorized"
+
+
+async def test_scenario_round_trip_keeps_track_shifts(hass: HomeAssistant, setup, hass_ws_client):
+    client = await hass_ws_client(hass)
+    shifts = {
+        "binary_sensor.door": {
+            "offset": -9000000,
+            "base": {"state": "off", "attributes": {}, "last_changed": "2026-10-03T21:30:00.000Z"},
+        }
+    }
+
+    saved = await _call(
+        client, {"type": "event_simulator/scenarios/save", **SCENARIO, "track_shifts": shifts}
+    )
+    assert saved["success"], saved
+    got = await _call(
+        client,
+        {"type": "event_simulator/scenarios/get", "scenario_id": saved["result"]["scenario_id"]},
+    )
+
+    assert got["result"]["track_shifts"] == shifts
+
+
+async def test_scenario_without_track_shifts_stores_none(hass: HomeAssistant, setup, hass_ws_client):
+    client = await hass_ws_client(hass)
+
+    saved = await _call(client, {"type": "event_simulator/scenarios/save", **SCENARIO})
+    got = await _call(
+        client,
+        {"type": "event_simulator/scenarios/get", "scenario_id": saved["result"]["scenario_id"]},
+    )
+
+    assert "track_shifts" not in got["result"]
+
+
+async def test_scenario_save_refuses_a_malformed_track_shift(
+    hass: HomeAssistant, setup, hass_ws_client
+):
+    client = await hass_ws_client(hass)
+
+    saved = await _call(
+        client,
+        {
+            "type": "event_simulator/scenarios/save",
+            **SCENARIO,
+            "track_shifts": {"binary_sensor.door": {"base": None}},
+        },
+    )
+
+    assert not saved["success"]
