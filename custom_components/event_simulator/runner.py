@@ -27,6 +27,8 @@ from .sandbox import child_command
 
 # Wall-clock budget for one replay. A day of busy history replays in seconds; this only catches a child that is stuck.
 DEFAULT_TIMEOUT = 300.0
+# Share of `timeout` the child gets as its own `time_limit_seconds` (unless the scenario sets one): it stops the replay there and answers with the runs so far, leaving the rest for it to boot, stop and write before it would be killed.
+TIME_LIMIT_SHARE = 0.8
 # Replays running at once; more wait their turn. Each child is a whole Home Assistant boot.
 MAX_CONCURRENT = 2
 # Caps on what crosses the pipes.
@@ -59,8 +61,10 @@ async def async_run_scenario(
 ) -> dict[str, Any]:
     """Replay `scenario` in a fresh sandbox child and return the result dict it wrote.
 
-    Raises `SandboxError` when the child times out, crashes, floods its output or writes no result, and `SimulatorError("too_large")` for a scenario over the input cap. A result carrying a structured `error` (invalid scenario or automation) is returned as is; it is an answer, not a failure. `command` replaces `child_command()`, for tests.
+    Raises `SandboxError` when the child times out, crashes, floods its output or writes no result, and `SimulatorError("too_large")` for a scenario over the input cap. A result carrying a structured `error` (invalid scenario or automation) is returned as is; it is an answer, not a failure. The child is told to stop by itself at `TIME_LIMIT_SHARE` of `timeout` (`time_limit_seconds`, unless the scenario sets it), so a replay that runs long still ends with the runs so far. `command` replaces `child_command()`, for tests.
     """
+    if "time_limit_seconds" not in scenario:
+        scenario = {**scenario, "time_limit_seconds": round(timeout * TIME_LIMIT_SHARE, 3)}
     payload = await hass.async_add_executor_job(json_bytes, scenario)
     if len(payload) > MAX_INPUT_BYTES:
         raise SimulatorError(

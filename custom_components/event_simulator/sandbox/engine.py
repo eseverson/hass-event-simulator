@@ -11,6 +11,10 @@ Timeline of a replay (all virtual time, see `vclock.py`)
 3. `[start, end)`: timeline events are written with `async_set` at their `at`; events at the same instant are written in list order. A recorded on/off of a replayed automation's own entity turns that automation on/off instead (`automation.turn_on` / `turn_off` semantics), so the entity's state, and every template reading it, is the sandbox's own. Every service call is intercepted at the `ServiceRegistry` (see `RecordingServiceRegistry`): recorded, answered with success (an empty response when one is asked for), and never executed, so recorded calls change no state.
 4. `end`: the automation's triggers are detached (`async_turn_off(stop_actions=False)`), so nothing new starts; the window is half-open and a run triggered at `end` itself is discarded. Runs already in flight (a `delay`, a `wait_for_trigger`, a queue) keep going for up to `overrun_seconds` of virtual time (default `DEFAULT_OVERRUN`, at most `MAX_OVERRUN`); a run still going at that bound is reported with outcome `unfinished` and a warning. Then HA is stopped.
 
+Runs that never let time move on
+--------------------------------
+Recorded service calls take no time, so an automation that re-triggers itself (it fires an event, or makes a service call, that one of its own triggers listens for) starts run after run at one virtual instant and the clock never moves again. Live Home Assistant would loop too, so the replay ends it and says so: an automation that starts `MAX_RUNS_PER_INSTANT` runs at one instant is turned off there, as `automation.turn_off` would (its runs in flight are stopped and its own recorded `on` no longer turns it back on), with a `runaway_loop` warning naming it, the instant and the count; its runs so far are kept and the rest of the scenario replays on. Independently, a wall-clock watchdog (scenario `time_limit_seconds`, default `DEFAULT_TIME_LIMIT`; the runner sets it under its own timeout) ends a replay still going at the limit, wherever virtual time stands: the window ends there, runs in flight are stopped, and a `time_limit` warning names each automation still running. A run stuck in code that never yields to the loop (a huge `repeat: count`) is cancelled to get there (see `_Watchdog`). Both are answers with the runs so far, not errors. `repeat: while` / `until` without a delay need neither: Home Assistant itself aborts them after 10000 iterations.
+
 Runs are read from HA's own automation traces (captured as `trace_automation` stores them, so the stored-traces limit never drops one) and serialized with `as_extended_dict()`.
 
 Result
@@ -24,7 +28,7 @@ Result
 
 `traces` sets how much each run carries: `full` (the default) is the shape above. `summary` drops `trace` and adds `conditions`, the result of each top-level condition by trace path (`{"condition/0": false}`; empty when none was evaluated). `none` keeps only `id`, `started`, `finished`, `outcome` and `trigger` as `{"idx", "id"}`, and records no service calls (`service_calls` is empty). Trimmed runs are reduced as each one finishes, so the child never holds more than Home Assistant's own few stored traces per automation; that keeps a month of many automations well under the runner's output cap.
 
-Under `automations`, each run and service call also carries `"automation": index`, per-automation warnings carry it too, and the result adds `"automations": [{"index", "entity_id", "loaded", "error": null | {"code", "message"}, "run_count"}]`. An automation the sandbox refuses (`invalid_automation`, `unsupported_automation`) is reported there with `loaded: false` and the others still replay; the top-level `error` is only for a problem with the scenario itself.
+Under `automations`, each run and service call also carries `"automation": index`, per-automation warnings carry it too, and the result adds `"automations": [{"index", "entity_id", "loaded", "error": null | {"code", "message"}, "run_count"}]`. An automation the sandbox refuses (`invalid_automation`, `unsupported_automation`) is reported there with `loaded: false` and the others still replay; one stopped mid-replay (`runaway_loop`, `time_limit`, see below) keeps `loaded: true` and gets that `error`. The top-level `error` is only for a problem with the scenario itself.
 
 `outcome`: `fired` (the actions ran to the end or a `stop`), `condition_failed` (`stopped_by` = the failing condition's trace path, e.g. `condition/0`), `dropped` (the script mode refused the run; `stopped_by` = `mode_single` / `max_runs` / `recursion`), `aborted` (a condition or `stop: error` inside the actions; `stopped_by` = last action path), `cancelled` (a `restart` re-trigger or shutdown), `error` (an exception; `stopped_by` = last action path, `error` = message), `unfinished` (still running at the overrun bound), `not_triggered` (HA 2026.9+: a trigger evaluated a change but did not fire, e.g. a non-numeric value for a threshold trigger, and HA recorded why; `stopped_by` = that reason, e.g. `entity_value_not_numeric`; nothing ran). Any other value is a `script_execution` this engine does not know yet, passed through as is.
 """
@@ -37,7 +41,9 @@ import logging
 import os
 import random
 import shutil
+import signal
 import tempfile
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -78,7 +84,7 @@ from homeassistant.helpers import (
 )
 from homeassistant.helpers import trigger as trigger_helper
 from homeassistant.helpers.json import ExtendedJSONEncoder
-from homeassistant.helpers.trace import trace_id_get
+from homeassistant.helpers.trace import script_execution_set, trace_id_get
 from homeassistant.loader import IntegrationNotFound, async_get_integration
 from homeassistant.setup import async_setup_component
 from homeassistant.util import slugify
@@ -124,6 +130,12 @@ _REGISTRY_STORES: dict[str, tuple[str, str, str | None, tuple[int, int]]] = {
 # What each run carries (scenario `traces`), most first; see the module docstring.
 TRACE_MODES = ("full", "summary", "none")
 DEFAULT_TRACES = "full"
+# Runs one automation may start at a single virtual instant before it counts as re-triggering itself without end and is turned off (`runaway_loop`). Recorded events of one instant start a handful; a loop starts them until something stops it.
+MAX_RUNS_PER_INSTANT = 1000
+# Real seconds a replay may take before the watchdog stops it with the runs so far (`time_limit`), unless the scenario sets `time_limit_seconds`. Under the runner's own timeout, so the child answers before it is killed.
+DEFAULT_TIME_LIMIT = 240.0
+# Real seconds the watchdog waits for the loop to take its stop before it cancels whatever code is running and keeps it from yielding (repeated until the loop answers).
+_HARD_STOP_GRACE = 2.0
 # Upper bound on registry entries a scenario may carry (the live side caps far lower).
 MAX_REGISTRY_ITEMS = 10_000
 # Device automation platforms the sandbox can run: those of entity-domain integrations (binary_sensor, light, sensor, ...), which work from the entity and device registries alone. Integration-specific ones (zha, mqtt, hue, ...) need that integration running.
@@ -173,6 +185,11 @@ class _Automation:
     entity: Any = None
     error: dict[str, str] | None = None
     run_count: int = 0
+    # Loop time of the last run it started, and how many it started at that instant.
+    instant: float | None = None
+    instant_runs: int = 0
+    # Turned off for re-triggering itself without end; its own recorded `on` no longer turns it back on.
+    runaway: bool = False
 
 
 @dataclass
@@ -192,6 +209,7 @@ class _Scenario:
     # `automations` rather than `automation`: runs, calls and per-automation warnings carry the index, and the result lists each automation.
     multi: bool = False
     traces: str = DEFAULT_TRACES
+    time_limit: float = DEFAULT_TIME_LIMIT
 
 
 def error_result(code: str, message: str, warnings: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -223,7 +241,15 @@ def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
         _write_own_last_state(config_dir, parsed)
         with patch_homeassistant_clock(clock):
             replay = _Replay(parsed, clock, config_dir)
-            return clock.loop.run_until_complete(replay.run())
+            task = clock.loop.create_task(replay.run())
+            with _Watchdog(clock.loop, parsed.time_limit, replay.time_limit_reached, replay.hard_stopping):
+                while True:
+                    try:
+                        return clock.loop.run_until_complete(task)
+                    except asyncio.CancelledError:
+                        # The hard stop landed in the loop's own code rather than in a run: carry on, the stop is queued.
+                        if task.done():
+                            return error_result("time_limit", f"The replay did not finish within its time limit of {parsed.time_limit:g} s", replay.warnings)
     finally:
         try:
             clock.loop.run_until_complete(clock.loop.shutdown_default_executor())
@@ -368,12 +394,18 @@ def _parse_scenario(raw: dict[str, Any]) -> _Scenario:
     elif not isinstance(traces, str) or traces not in TRACE_MODES:
         raise ScenarioError("invalid_scenario", f"traces must be one of {', '.join(TRACE_MODES)}, not {traces!r}")
 
+    time_limit = DEFAULT_TIME_LIMIT
+    if (limit_raw := raw.get("time_limit_seconds")) is not None:
+        if isinstance(limit_raw, bool) or not isinstance(limit_raw, (int, float)) or limit_raw <= 0:
+            raise ScenarioError("invalid_scenario", "time_limit_seconds must be a positive number")
+        time_limit = float(limit_raw)
+
     registry = _parse_registry(raw.get("registry"), warnings)
     automations = _automations(items, multi, registry, warnings)
     for automation in automations:
         automation.own_initial = initial_states.pop(automation.entity_id, None)
 
-    return _Scenario(core, start, end, automations, initial_states, events, services, overrun, seed, preview_features, registry, warnings, multi, traces)
+    return _Scenario(core, start, end, automations, initial_states, events, services, overrun, seed, preview_features, registry, warnings, multi, traces, time_limit)
 
 
 def _automations(items: list[Any], multi: bool, registry: dict[str, Any], warnings: list[dict[str, Any]]) -> list[_Automation]:
@@ -623,6 +655,65 @@ def _warning(code: str, message: str, at: datetime | None = None) -> dict[str, A
 # --- the replay ---------------------------------------------------------------------------------
 
 
+class _Overtime(asyncio.CancelledError):
+    """Raised by the watchdog's hard stop into code that keeps the loop from running: to Home Assistant it is a cancellation of that run."""
+
+
+class _Watchdog:
+    """Stops a replay that is still running after `limit` real seconds.
+
+    At the limit it queues `on_limit` on the loop, which ends the replay gracefully (see `_Replay.time_limit_reached`). That only runs once the loop gets control back; a run stuck in code that never yields (Home Assistant 2026.2 builds a schema per iteration of a repeat count, without awaiting) would keep it waiting until the runner kills the child. So, in the main thread, a `SIGALRM` every `_HARD_STOP_GRACE` seconds after the limit raises `_Overtime` into whatever is running until `on_limit` has run (calling `on_hard_stop` first, in the interrupted code's context, so it can tell whose run that is): inside a run that cancels the run, and the loop then takes the queued stop.
+
+    Both timers (`ITIMER_REAL`, `threading.Timer`) run on real time, which the virtual clock leaves alone. Off the main thread (signals are main-thread only) only the graceful stop is armed.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, limit: float, on_limit: Callable[[], None], on_hard_stop: Callable[[], None]) -> None:
+        self._loop = loop
+        self._limit = limit
+        self._on_limit = on_limit
+        self._on_hard_stop = on_hard_stop
+        self._answered = False
+        self._queued = False
+        self._timer: threading.Timer | None = None
+        self._previous: Any = None
+        self._signals = threading.current_thread() is threading.main_thread() and hasattr(signal, "setitimer")
+
+    def __enter__(self) -> _Watchdog:
+        if self._signals:
+            self._previous = signal.signal(signal.SIGALRM, self._alarm)
+            signal.setitimer(signal.ITIMER_REAL, self._limit)
+        else:
+            self._timer = threading.Timer(self._limit, self._queue_stop)
+            self._timer.daemon = True
+            self._timer.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self._signals:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, self._previous)
+        elif self._timer is not None:
+            self._timer.cancel()
+
+    def _queue_stop(self) -> None:
+        self._loop.call_soon_threadsafe(self._stop)
+
+    def _stop(self) -> None:
+        self._answered = True
+        self._on_limit()
+
+    def _alarm(self, _signum: int, _frame: Any) -> None:
+        if self._answered:
+            return
+        signal.setitimer(signal.ITIMER_REAL, _HARD_STOP_GRACE)
+        if not self._queued:
+            self._queued = True
+            self._queue_stop()
+            return
+        self._on_hard_stop()
+        raise _Overtime("Stopped by the replay's time limit")
+
+
 class _LogCollector(logging.Handler):
     """Turns HA warnings/errors logged during the window into result warnings (capped)."""
 
@@ -662,6 +753,12 @@ class _Replay:
         # Trace key (`automation.<id>`) and own entity id -> the automation, once loaded.
         self._by_key: dict[str, _Automation] = {}
         self._by_entity_id: dict[str, _Automation] = {}
+        # Resolved at `end`, or early when the time limit stops the replay.
+        self._window_end: asyncio.Future[None] = clock.loop.create_future()
+        self._halted = False
+        self._event_handles: list[asyncio.TimerHandle] = []
+        # Automations whose run the watchdog's hard stop cancelled.
+        self._hard_stopped: set[str] = set()
 
     def now(self) -> datetime:
         return self.clock.utcnow()
@@ -674,6 +771,7 @@ class _Replay:
             if self.scenario.traces != "full":
                 self._trim_when_finished(trace, len(self.runs) - 1)
             original_store(hass, trace, stored_traces)
+            self._count_run(trace.key)
 
         automation_trace.async_store_trace = store_trace
         collector = _LogCollector(self)
@@ -696,16 +794,80 @@ class _Replay:
                     what = "The automations" if self.scenario.multi else "The automation"
                     self.warnings.append(_warning("late_attach", f"{what} attached at {self.now().isoformat()}, after the window start", self.now()))
                 self._schedule_events()
-                await self._sleep_until(self.scenario.end)
+                self.clock.call_at_datetime(self.scenario.end, self._end_window)
+                await self._window_end
                 for automation in self._loaded():
-                    await automation.entity.async_turn_off(stop_actions=False)
-                await self._drain()
+                    # Stopped by the time limit, runs in flight stop too: there is no time left to let them finish.
+                    await automation.entity.async_turn_off(stop_actions=self._halted)
+                if not self._halted:
+                    await self._drain()
                 return self._result(collector)
             finally:
                 ha_logger.removeHandler(collector)
                 await self._stop()
         finally:
             automation_trace.async_store_trace = original_store
+
+    def _end_window(self) -> None:
+        if not self._window_end.done():
+            self._window_end.set_result(None)
+
+    def _count_run(self, key: str) -> None:
+        """Count a run that just started against its automation's runs at this virtual instant; past `MAX_RUNS_PER_INSTANT`, it is re-triggering itself without end."""
+        automation = self._by_key.get(key)
+        if automation is None or automation.runaway:
+            return
+        instant = self.clock.loop.time()
+        if automation.instant != instant:
+            automation.instant, automation.instant_runs = instant, 0
+        automation.instant_runs += 1
+        if automation.instant_runs >= MAX_RUNS_PER_INSTANT:
+            self._stop_runaway(automation)
+
+    def _stop_runaway(self, automation: _Automation) -> None:
+        """Turn off an automation that keeps starting runs at one instant (stopping its runs in flight), and say so. The rest of the replay goes on."""
+        automation.runaway = True
+        message = (
+            f"{automation.entity_id} started {automation.instant_runs} runs at {self.now().isoformat()} without virtual time moving on: it keeps "
+            "triggering itself (an event it fires or a service it calls is one of its own triggers), which live Home Assistant would also "
+            "repeat without end. It was turned off there; its runs up to then are kept"
+        )
+        self._warn(automation, "runaway_loop", message, self.now())
+        automation.error = {"code": "runaway_loop", "message": message}
+        self.hass.async_create_task(automation.entity.async_turn_off())
+
+    def hard_stopping(self) -> None:
+        """The watchdog is about to cancel the code that keeps the loop from running; note whose run that is (called in that code's context).
+
+        Home Assistant records a run only as cancelled when it stopped it itself, so the run's trace is marked cancelled here: a cancellation raised from inside a step would otherwise leave the run looking finished.
+        """
+        trace_id = trace_id_get()
+        if trace_id:
+            self._hard_stopped.add(trace_id[0])
+            script_execution_set("cancelled")
+
+    def time_limit_reached(self) -> None:
+        """The wall-clock time limit is up: end the window here, with the runs so far, and name the automations still running."""
+        if self._halted:
+            return
+        self._halted = True
+        for handle in self._event_handles:
+            handle.cancel()
+        limit = self.scenario.time_limit
+        rest = "the rest of the window was not replayed" if self.now() < self.scenario.end else "runs still in flight after the window end were not waited for"
+        message = f"The replay was stopped after its time limit of {limit:g} s of real time, at {self.now().isoformat()}; {rest}"
+        running = [
+            automation
+            for automation in self._loaded()
+            if automation.entity.action_script.is_running or f"automation.{automation.id}" in self._hard_stopped
+        ]
+        if not running:
+            self.warnings.append(_warning("time_limit", message, self.now()))
+        for automation in running:
+            text = f"{message}. {automation.entity_id} was still running"
+            self._warn(automation, "time_limit", text, self.now())
+            automation.error = automation.error or {"code": "time_limit", "message": text}
+        self._end_window()
 
     def _trim_when_finished(self, trace: Any, slot: int) -> None:
         """Replace the run's trace with its trimmed record as soon as it finishes, so only Home Assistant's own stored traces stay alive."""
@@ -845,12 +1007,13 @@ class _Replay:
             by_instant.setdefault(event.at, []).append(event)
         for at, events in by_instant.items():
             # One callback per instant: same-instant timers have no guaranteed order, list order does.
-            self.clock.call_at_datetime(at, self._play, events)
+            self._event_handles.append(self.clock.call_at_datetime(at, self._play, events))
 
     def _play(self, events: list[_Event]) -> None:
         for event in events:
             if (automation := self._by_entity_id.get(event.entity_id)) is not None:
-                self._play_own(automation.entity, event)
+                if not automation.runaway:
+                    self._play_own(automation.entity, event)
             else:
                 self.hass.states.async_set(event.entity_id, event.state, event.attributes, timestamp=event.at.timestamp())
 
@@ -867,7 +1030,7 @@ class _Replay:
         bound = self.clock.loop_time_for(self.scenario.end + self.scenario.overrun)
         scripts = [automation.entity.action_script for automation in self._loaded()]
         # No async_block_till_done here: it would wait for the in-flight runs themselves and so carry virtual time past the bound.
-        while any(script.is_running for script in scripts) and self.clock.loop.time() < bound:
+        while any(script.is_running for script in scripts) and self.clock.loop.time() < bound and not self._halted:
             await asyncio.sleep(min(_DRAIN_STEP, bound - self.clock.loop.time()))
 
     async def _stop(self) -> None:

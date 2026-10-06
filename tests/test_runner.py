@@ -52,8 +52,15 @@ def gone(pid: int) -> bool:
 async def test_returns_the_child_result(hass: HomeAssistant):
     result = await async_run_scenario(hass, SCENARIO, timeout=30, command=ECHO)
 
-    assert result["echo"] == SCENARIO
+    # The child is told to stop itself before the runner would kill it.
+    assert result["echo"] == {**SCENARIO, "time_limit_seconds": 24.0}
     assert result["runs"] == []
+
+
+async def test_a_time_limit_the_scenario_sets_is_kept(hass: HomeAssistant):
+    result = await async_run_scenario(hass, {**SCENARIO, "time_limit_seconds": 5}, timeout=30, command=ECHO)
+
+    assert result["echo"]["time_limit_seconds"] == 5
 
 
 async def test_timeout_kills_the_child(hass: HomeAssistant):
