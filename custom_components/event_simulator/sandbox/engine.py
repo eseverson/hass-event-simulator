@@ -1040,7 +1040,8 @@ class _Replay:
     def _count_run(self, key: str) -> None:
         """Count a run that just started against its automation's runs at this virtual instant; past `MAX_RUNS_PER_INSTANT`, it is re-triggering itself without end."""
         automation = self._by_key.get(key)
-        if automation is None or automation.runaway:
+        if automation is None or automation.runaway or automation.entity is None:
+            # A run started while setup was still going (see `_load_automations`) is not counted: there is no entity to turn off yet.
             return
         instant = self.clock.loop.time()
         if automation.instant != instant:
@@ -1281,6 +1282,11 @@ class _Replay:
                 automation.error = {"code": err.code, "message": str(err)}
         if not configs:
             return
+        # Record calls from here on, not once setup returns: a trigger can fire as it attaches (a calendar event at the window start) while setup still awaits real work, such as loading translations, that took longer than the attach (#45).
+        for automation in self.scenario.automations:
+            if automation.error is None:
+                self._by_key[f"automation.{automation.id}"] = automation
+        self.hass.services.intercepting = True
         if not await async_setup_component(self.hass, "automation", {"automation": configs}):
             raise ScenarioError("invalid_automation", "The automation integration failed to set up")
         # Setup awaits the trigger attachment itself. No async_block_till_done: it would wait out any run already started and so move virtual time.
@@ -1293,12 +1299,11 @@ class _Replay:
                 if not multi:
                     raise ScenarioError("invalid_automation", "The automation did not load")
                 automation.error = {"code": "invalid_automation", "message": "The automation did not load"}
+                self._by_key.pop(f"automation.{automation.id}", None)
                 continue
             automation.entity = entity
             automation.entity_id = entity.entity_id
-            self._by_key[f"automation.{automation.id}"] = automation
             self._by_entity_id[entity.entity_id] = automation
-        self.hass.services.intercepting = True
 
     async def _validate(self, automation: _Automation) -> dict[str, Any]:
         """The config to set up for one automation, checked as Home Assistant checks it; refusals raise `ScenarioError`."""
@@ -1657,7 +1662,7 @@ def _json_safe(value: Any) -> Any:
 class RecordingServiceRegistry(ServiceRegistry):
     """Service registry that records calls instead of executing them.
 
-    Until `intercepting` is set (once the automation under test is loaded) it behaves like the stock registry, so boot is unchanged. After that every service exists, every call is recorded and answered with success (an empty dict when a response is requested), and `call_service` is still fired on the bus so event triggers on it behave.
+    Until `intercepting` is set (just before the automations are set up) it behaves like the stock registry, so boot is unchanged. After that every service exists, every call is recorded and answered with success (an empty dict when a response is requested), and `call_service` is still fired on the bus so event triggers on it behave.
 
     A blocking call, after firing `call_service`, waits as a live call to a device does for its I/O round trip: until nothing else is left to run at this virtual instant (`VirtualTimeEventLoop.when_idle`; no virtual time passes). Services whose live handler never suspends (`_INSTANT_DOMAINS` / `_INSTANT_SERVICES`) answer at once. The calling run is thus still in flight while everything already started at this instant runs: a run its own `event` step or `call_service` re-triggered, or the next of several changes recorded at one instant, meets it running, so `mode: single` drops that run (`failed_single`), `restart` stops the caller and `max` runs fill up, as they do live.
     """

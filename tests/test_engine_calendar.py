@@ -6,11 +6,15 @@ Same harness as test_engine.py: every scenario runs through a real child process
 from __future__ import annotations
 
 import concurrent.futures
+import json
+from pathlib import Path
+import subprocess
+import sys
 from typing import Any
 
 import pytest
 
-from .test_engine import run_child, ts, utc
+from .test_engine import CHILD_TIMEOUT, run_child, ts, utc
 
 TZ = "America/Los_Angeles"
 START = "2026-09-06T00:00:00+00:00"
@@ -169,3 +173,40 @@ def test_a_calendar_without_events_attaches_and_says_so(results):
 def test_malformed_calendars_are_refused(results, name):
     assert results[name]["error"]["code"] == "invalid_scenario", results[name]["error"]
     assert "calendars" in results[name]["error"]["message"]
+
+
+# Runs the engine with the automation integration's translations loading slowly (as under CPU load, #45): its setup is still awaiting them after the triggers attached.
+_SLOW_TRANSLATIONS = """
+import json, sys, time
+from homeassistant.helpers import translation
+from custom_components.event_simulator.sandbox import engine
+
+original = translation.async_load_integrations
+
+async def slow(hass, integrations):
+    if "automation" in integrations:
+        await hass.async_add_executor_job(time.sleep, 0.3)
+    await original(hass, integrations)
+
+translation.async_load_integrations = slow
+print(json.dumps(engine.run_scenario(json.load(sys.stdin))))
+"""
+
+
+def test_a_run_at_the_window_start_is_recorded_while_setup_still_awaits():
+    """An event at the window start fires as the trigger attaches, while setup may still be waiting on real work: its calls are recorded like any other, not executed (#45)."""
+    built = scenario(
+        {
+            "triggers": [{"trigger": "calendar", "entity_id": "calendar.work", "event": "start"}],
+            "actions": [{"action": "logbook.log", "data": {"name": "x", "message": "{{ trigger.calendar_event.summary }}"}}],
+        },
+        calendars={"calendar.work": [{"start": START, "end": "2026-09-06T01:00:00+00:00", "summary": "At the start"}]},
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", _SLOW_TRANSLATIONS], input=json.dumps(built).encode(), capture_output=True, timeout=CHILD_TIMEOUT, cwd=Path(__file__).parent.parent, check=False
+    )
+    assert proc.returncode == 0, proc.stderr.decode()[-4000:]
+    result = json.loads(proc.stdout.decode().strip().splitlines()[-1])
+    assert result["error"] is None, result["error"]
+    assert [(run["outcome"], run["error"]) for run in result["runs"]] == [("fired", None)]
+    assert [(call["at"], call["service"], call["data"]["message"]) for call in result["service_calls"]] == [(START, "log", "At the start")]

@@ -273,7 +273,8 @@ def test_evaluator_matches_the_sandbox(name, sandbox_runs):
     fired = [(rounded(fire.at), fire.trigger) for fire in evaluator.fires(candidate)]
 
     assert sandbox_started, "the scenario should start runs"
-    assert {run["outcome"] for run in runs} <= {"fired", "condition_failed"}
+    odd = [{key: run.get(key) for key in ("started", "outcome", "stopped_by", "error")} for run in runs if run["outcome"] not in ("fired", "condition_failed")]
+    assert not odd, odd
     assert triggered == sandbox_started, [datetime.fromtimestamp(t, UTC).isoformat() for t, _ in sandbox_started]
     assert fired == sandbox_fired
     assert 0 < len(fired) < len(triggered) or not candidate.conditions
