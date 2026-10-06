@@ -521,14 +521,24 @@ async def _async_validate(
         return approximate(str(err))
     if isinstance(error := replay.get("error"), dict):
         return approximate(str(error.get("message") or error.get("code") or "the sandbox refused the scenario"))
+    if cut := _cut_short(replay, end):
+        # The window was not replayed to its end: every suggestion's fires after that point are missing.
+        return approximate(cut)
     loaded = {
         item.get("index"): item for item in replay.get("automations") or [] if isinstance(item, dict)
     }
     fires = fires_from_runs(replay.get("runs") or [], len(configs))
-    exact = [fires[n] if (loaded.get(n) or {}).get("loaded") else None for n in range(len(configs))]
+    # One that loaded but was stopped mid-replay (`runaway_loop`, `time_limit`) has only its fires up to there: not exact.
+    exact = [
+        fires[n] if (item := loaded.get(n) or {}).get("loaded") and not item.get("error") else None
+        for n in range(len(configs))
+    ]
     refused = [n for n, found in enumerate(exact) if found is None]
     if len(refused) == len(configs):
-        return approximate("the sandbox could not run any of them")
+        reason = ((loaded.get(0) or {}).get("error") or {}).get("message")
+        return approximate(
+            "the sandbox could not run any of them" + (f" ({reason})" if reason else "")
+        )
     warning = None
     if refused:
         reason = ((loaded.get(refused[0]) or {}).get("error") or {}).get("message") or "not loaded"
@@ -537,6 +547,18 @@ async def _async_validate(
             "message": f"{len(refused)} of {len(configs)} suggestions could not be checked in the sandbox and keep the miner's estimate ({reason})",
         }
     return await hass.async_add_executor_job(partial(apply_exact, result, exact, warning=warning))
+
+
+def _cut_short(replay: dict[str, Any], end: datetime) -> str | None:
+    """Why the replay stopped before the window's end (its `time_limit` warning), or None when it replayed it all. A time limit reached only while runs in flight after `end` were waited for leaves every fire in the window."""
+    for warning in replay.get("warnings") or []:
+        if not isinstance(warning, dict) or warning.get("code") != "time_limit":
+            continue
+        at = dt_util.parse_datetime(str(warning.get("at") or ""))
+        if at is None or at < end:
+            when = f" at {at.isoformat()}" if at is not None else ""
+            return f"the replay reached its time limit{when}, before the end of the window"
+    return None
 
 
 async def async_simulate(hass: HomeAssistant, scenario: dict[str, Any]) -> dict[str, Any]:

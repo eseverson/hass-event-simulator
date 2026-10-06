@@ -292,3 +292,72 @@ async def test_sun_events_come_from_the_instance_location(
     polar = websocket.async_sun_events(hass)(day.replace(month=6, day=21))
     assert polar["sunset"] is None
     assert polar["sunset"] == get_astral_event_date(hass, "sunset", day.replace(month=6, day=21))
+
+
+def same_rule(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    return a["triggers"] == b["triggers"] and a.get("conditions") == b.get("conditions")
+
+
+async def validate_with(hass, hass_ws_client, door_history, alter) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Suggest with the real validation child, its result changed by `alter(scenario, replay)` before it is scored. Returns (scenario sent, final event)."""
+    start, evenings = door_history
+    client = await hass_ws_client(hass)
+    sent: list[dict[str, Any]] = []
+    run_scenario = runner.async_run_scenario
+
+    async def spy(hass, scenario, **kwargs):
+        sent.append(scenario)
+        replay = await run_scenario(hass, scenario, **kwargs)
+        alter(scenario, replay)
+        return replay
+
+    with patch.object(runner, "async_run_scenario", spy):
+        msg_id = await subscribe(client, request(start, evenings))
+        _, final = await until_final(client, msg_id)
+    [scenario] = sent
+    return scenario, final
+
+
+@pytest.mark.parametrize("code", ["runaway_loop", "time_limit"])
+async def test_a_suggestion_stopped_mid_replay_is_not_exact(
+    hass: HomeAssistant, setup, door_history, hass_ws_client, code
+):
+    """#31: the sandbox stopped one automation partway (it kept re-triggering itself, or was still running at the time limit after the window): its fires are only those up to there, so it keeps the miner's estimate."""
+
+    def stop_first(scenario, replay):
+        entry = next(item for item in replay["automations"] if item["index"] == 0)
+        assert entry["loaded"] is True
+        entry["error"] = {"code": code, "message": f"automations[0] was stopped ({code})"}
+        replay["runs"] = [run for run in replay["runs"] if run["automation"] != 0 or run["started"] < scenario["start"]]
+        if code == "time_limit":
+            # Reached while runs in flight after the window end were waited for: the window itself was replayed in full.
+            replay["warnings"].append({"code": code, "message": "automations[0]: stopped", "at": scenario["end"], "automation": 0})
+
+    scenario, final = await validate_with(hass, hass_ws_client, door_history, stop_first)
+    stopped = [s for s in final["suggestions"] if same_rule(s["config"], scenario["automations"][0])]
+    assert len(stopped) == 1 and stopped[0]["exact"] is False
+    # Kept with the miner's estimate rather than scored on no fires at all.
+    assert stopped[0]["stats"]["fire_times"]
+    assert stopped[0] is final["suggestions"][-1]
+    others = [s for s in final["suggestions"] if s is not stopped[0]]
+    assert others and all(s["exact"] is True for s in others)
+    assert final["warning"]["code"] == "partly_validated"
+    assert f"({code})" in final["warning"]["message"]
+
+
+async def test_a_replay_cut_short_by_the_time_limit_validates_nothing(
+    hass: HomeAssistant, setup, door_history, hass_ws_client
+):
+    """#31: the time limit ended the window early: every suggestion's later fires are missing, so none is exact."""
+
+    def cut(scenario, replay):
+        at = dt_util.parse_datetime(scenario["start"]) + timedelta(days=2)
+        replay["runs"] = [run for run in replay["runs"] if dt_util.parse_datetime(run["started"]) <= at]
+        replay["warnings"].append({"code": "time_limit", "message": "The replay was stopped after its time limit", "at": at.isoformat()})
+
+    _, final = await validate_with(hass, hass_ws_client, door_history, cut)
+    assert final["suggestions"]
+    assert all(s["exact"] is False for s in final["suggestions"])
+    assert final["warning"]["code"] == "validation_failed"
+    assert "time limit" in final["warning"]["message"]
+    assert final["suggestions"][0]["stats"]["anchors_hit"] == 3
