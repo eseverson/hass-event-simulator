@@ -359,6 +359,7 @@ export const WARNING_LABELS = {
   initial_state_ignored: "The automation's initial_state was ignored",
   late_attach: "The automation attached late",
   run_unfinished: "Runs still going when the replay stopped",
+  self_service_call: "The automation calls itself; its own track decides when it is on",
   unknown_service: "Service calls to services this instance does not have",
   log: "Home Assistant logged warnings or errors",
   log_truncated: "More log messages were left out",
@@ -2256,7 +2257,8 @@ class EventSimulatorPanel extends Base {
   }
 
   _trackRow(track, scale) {
-    const name = this._friendlyName(track.entity_id);
+    // The automation's own track sets whether it is enabled in the replay, not a raw state.
+    const name = track.entity_id === this._entityId ? "This automation (enabled state)" : this._friendlyName(track.entity_id);
     const unit = this._unit(track);
     // While a change mark is dragged, the track draws the would-be timeline.
     const preview = this._evDrag?.entity_id === track.entity_id ? this._evDrag.preview : null;
