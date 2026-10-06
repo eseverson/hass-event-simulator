@@ -662,6 +662,7 @@ export const SLOW_RUN_MS = 3000; // a replay slower than this, of ...
 export const LARGE_SCENARIO_BYTES = 512 * 1024; // ... a request larger than this, backs off
 export const MAX_AUTO_RUN_DELAY = 10e3;
 const AUTO_RUN_KEY = "event_simulator.auto_run";
+export const AUTO_SUGGEST_KEY = "event_simulator.auto_suggest";
 
 /* The debounce after a replay that took `last.duration` ms for a `last.size` byte request.
  * A slow replay of a big scenario (days of a chatty sensor) waits about as long as that
@@ -674,17 +675,17 @@ export function autoRunDelay(last) {
 
 /* The remembered Auto-run toggle (default on). Storage can be missing or throw (private
  * windows, blocked site data); then it is just on. */
-export function readAutoRunPref(storage = globalThis.localStorage) {
+export function readAutoRunPref(storage = globalThis.localStorage, key = AUTO_RUN_KEY) {
   try {
-    return storage?.getItem(AUTO_RUN_KEY) !== "off";
+    return storage?.getItem(key) !== "off";
   } catch {
     return true;
   }
 }
 
-export function writeAutoRunPref(on, storage = globalThis.localStorage) {
+export function writeAutoRunPref(on, storage = globalThis.localStorage, key = AUTO_RUN_KEY) {
   try {
-    storage?.setItem(AUTO_RUN_KEY, on ? "on" : "off");
+    storage?.setItem(key, on ? "on" : "off");
   } catch {
     // not remembered; nothing else depends on it
   }
@@ -1644,9 +1645,16 @@ export function suggestAvailable(err) {
   return err?.code !== "unknown_command";
 }
 
+/* What each suggest stage is doing, in words. */
+export const SUGGEST_STAGES = {
+  loading: "Loading history",
+  mining: "Searching for triggers and conditions",
+  validating: "Checking the best ones in Home Assistant's sandbox",
+};
+
 /* A suggest/subscribe event (or a rejected subscribe, as {error}) for the panel:
- * {kind: "done", suggestions, hints}, {kind: "progress", text}, {kind: "unavailable"} or
- * {kind: "error", error: describeRunError(...)}. */
+ * {kind: "done", suggestions, hints, evaluated, warnings}, {kind: "progress", stage, text},
+ * {kind: "unavailable"} or {kind: "error", error: describeRunError(...)}. */
 export function suggestOutcome(event) {
   const e = isObject(event) ? event : {};
   const err = e.error ?? (isObject(e.result) && e.result.error && !Array.isArray(e.result.suggestions) ? e.result.error : null);
@@ -1655,11 +1663,272 @@ export function suggestOutcome(event) {
     return { kind: "error", error: describeRunError(err) };
   }
   const body = isObject(e.result) ? e.result : e;
-  if (Array.isArray(body.suggestions)) return { kind: "done", suggestions: body.suggestions, hints: Array.isArray(body.hints) ? body.hints : [] };
+  if (Array.isArray(body.suggestions)) {
+    const warnings = [body.warning, ...(Array.isArray(body.warnings) ? body.warnings : [])].filter((w) => w != null && w !== "").map(normalizeWarning);
+    return {
+      kind: "done",
+      suggestions: body.suggestions,
+      hints: Array.isArray(body.hints) ? body.hints : [],
+      evaluated: Number.isFinite(body.evaluated) ? body.evaluated : null,
+      warnings,
+    };
+  }
   const stage = body.stage ?? body.progress ?? body.status ?? body.type;
-  const counts = [body.done ?? body.count, body.total].filter((n) => Number.isFinite(n));
-  const text = stage ? `${String(stage).charAt(0).toUpperCase()}${String(stage).slice(1)}${counts.length === 2 ? ` ${counts[0]}/${counts[1]}` : ""}…` : "Working…";
-  return { kind: "progress", text };
+  const counts = [body.done ?? body.count ?? body.validated, body.total ?? body.candidates].filter((n) => Number.isFinite(n));
+  const name = stage ? (SUGGEST_STAGES[stage] ?? `${String(stage).charAt(0).toUpperCase()}${String(stage).slice(1)}`) : "";
+  const text = name ? `${name}${counts.length === 2 ? ` ${counts[0]}/${counts[1]}` : ""}…` : "Working…";
+  return { kind: "progress", stage: stage ? String(stage) : null, text };
+}
+
+// ---- suggestions ------------------------------------------------------------
+//
+// What suggest/subscribe answers (see the suggestions spec and suggest/score.py) turned into
+// what the panel draws: a card per suggestion, the fires of the selected one on a Fires row,
+// and the hints (outside fires, recurrences) on a Hints row that become labels in one click.
+// Everything here reads the result defensively: fields may be missing or of a newer shape.
+
+const msOf = (v) => {
+  const t = parseTime(isObject(v) ? v.at : v);
+  return Number.isFinite(t) ? t : null;
+};
+const msList = (v) => (Array.isArray(v) ? v : []).map(msOf).filter((t) => t !== null).sort((a, b) => a - b);
+const count = (v, fallback = 0) => (Number.isFinite(Number(v)) && v !== null && v !== "" ? Number(v) : fallback);
+
+/* A JSON value as block YAML, the way an automation is written by hand. Only what an
+ * automation config holds (objects, lists, strings, numbers, booleans, null); a string
+ * that YAML would read as something else is double-quoted. */
+export function toYaml(value, indent = 0) {
+  const pad = " ".repeat(indent);
+  const scalar = (v) => {
+    if (v === null || v === undefined) return "null";
+    if (typeof v === "number" || typeof v === "boolean") return String(v);
+    const s = String(v);
+    const plain =
+      /^[A-Za-z_./][\w ./()',;-]*$/.test(s) &&
+      !/^(true|false|yes|no|on|off|null|y|n|~)$/i.test(s) &&
+      !/[ ]$/.test(s) &&
+      !/: | #/.test(s);
+    return plain ? s : JSON.stringify(s);
+  };
+  const isEmpty = (v) => (Array.isArray(v) ? v.length === 0 : isObject(v) && Object.keys(v).length === 0);
+  if (Array.isArray(value)) {
+    if (!value.length) return `${pad}[]`;
+    return value
+      .map((item) => {
+        if ((isObject(item) || Array.isArray(item)) && !isEmpty(item)) {
+          const body = toYaml(item, indent + 2);
+          return `${pad}- ${body.slice(indent + 2)}`;
+        }
+        return `${pad}- ${isEmpty(item) ? (Array.isArray(item) ? "[]" : "{}") : scalar(item)}`;
+      })
+      .join("\n");
+  }
+  if (isObject(value)) {
+    const keys = Object.keys(value);
+    if (!keys.length) return `${pad}{}`;
+    return keys
+      .map((k) => {
+        const v = value[k];
+        const key = scalar(k);
+        if (isEmpty(v)) return `${pad}${key}: ${Array.isArray(v) ? "[]" : "{}"}`;
+        if (Array.isArray(v)) return `${pad}${key}:\n${toYaml(v, indent)}`;
+        if (isObject(v)) return `${pad}${key}:\n${toYaml(v, indent + 2)}`;
+        return `${pad}${key}: ${scalar(v)}`;
+      })
+      .join("\n");
+  }
+  return `${pad}${scalar(value)}`;
+}
+
+/* The part of a suggested config a card shows up front: its triggers and conditions
+ * (either key spelling), as YAML. */
+export function triggerYaml(config) {
+  const c = isObject(config) ? config : {};
+  const part = {};
+  const triggers = c.triggers ?? c.trigger;
+  const conditions = c.conditions ?? c.condition;
+  if (triggers !== undefined) part.triggers = triggers;
+  if (conditions !== undefined && !(Array.isArray(conditions) && !conditions.length)) part.conditions = conditions;
+  return toYaml(part);
+}
+
+/* One suggestion as a card shows it: {rank, explanation, exact, config, hits, total,
+ * missed: [{at, edge}], violations, outside, inside (ms, sorted), fires, fireTimes (ms or
+ * null when the backend sent none), whileHeld, whileTotal, approx (the miner's stats when
+ * the sandbox ones replaced them)}. */
+export function suggestionView(raw, index = 0) {
+  const s = isObject(raw) ? raw : {};
+  const stats = isObject(s.stats) ? s.stats : {};
+  const config = isObject(s.config) ? s.config : {};
+  const missed = (Array.isArray(stats.missed) ? stats.missed : [])
+    .map((m) => ({ at: msOf(m), edge: isObject(m) && m.edge === "end" ? "end" : "start" }))
+    .filter((m) => m.at !== null)
+    .sort((a, b) => a.at - b.at);
+  const total = count(stats.anchors_total);
+  const view = {
+    rank: count(s.rank, index + 1),
+    explanation: String(s.explanation || config.description || "").trim(),
+    exact: s.exact === true,
+    config,
+    hits: count(stats.anchors_hit, Math.max(0, total - missed.length)),
+    total,
+    missed,
+    violations: msList(stats.no_fire_violations),
+    outside: msList(stats.outside_fires),
+    inside: msList(stats.inside_fires),
+    fireTimes: Array.isArray(stats.fire_times ?? stats.fires_at) ? msList(stats.fire_times ?? stats.fires_at) : null,
+    whileHeld: count(stats.while_held),
+    whileTotal: count(stats.while_total),
+    approx: isObject(s.approx_stats) ? s.approx_stats : null,
+  };
+  view.fires = count(stats.fires, view.fireTimes ? view.fireTimes.length : view.hits + view.violations.length + view.outside.length + view.inside.length);
+  return view;
+}
+
+/* The anchors labels ask for: [{at, edge, label}] (label = the label's id), in time order. */
+export function labelAnchors(labels) {
+  const out = [];
+  for (const l of labels) {
+    if (l.kind !== "fire") continue;
+    if (l.anchor === "start" || l.anchor === "both") out.push({ at: l.start, edge: "start", label: l.id });
+    if (l.anchor === "end" || l.anchor === "both") out.push({ at: l.end, edge: "end", label: l.id });
+  }
+  return out.sort((a, b) => a.at - b.at);
+}
+
+/* The marks the Fires row draws for a suggestion view: [{t, kind}] in time order, kind
+ * "anchor" (hit a marked anchor: green), "no_fire" (inside a must-not period: red),
+ * "unlabeled" (outside every labeled period: grey), "inside" (in a should-fire period away
+ * from its anchors: neutral) or "missed" (an anchor nothing fired for). With every fire
+ * time sent, the ones not in the other buckets are the anchor hits; without them, each hit
+ * anchor stands in for its fire. */
+export function fireMarks(view, labels = []) {
+  const marks = [];
+  const bucket = new Map();
+  for (const [kind, list] of [["no_fire", view.violations], ["unlabeled", view.outside], ["inside", view.inside]]) {
+    for (const t of list) {
+      marks.push({ t, kind });
+      bucket.set(t, (bucket.get(t) || 0) + 1);
+    }
+  }
+  if (view.fireTimes) {
+    for (const t of view.fireTimes) {
+      const n = bucket.get(t) || 0;
+      if (n) bucket.set(t, n - 1);
+      else marks.push({ t, kind: "anchor" });
+    }
+  } else {
+    const missed = new Set(view.missed.map((m) => `${m.at}|${m.edge}`));
+    for (const a of labelAnchors(labels)) if (!missed.has(`${a.at}|${a.edge}`)) marks.push({ t: a.at, kind: "anchor", approx: true });
+  }
+  for (const m of view.missed) marks.push({ t: m.at, kind: "missed", edge: m.edge });
+  return marks.sort((a, b) => a.t - b.t);
+}
+
+export const HINT_KINDS = { outside_fire: "Fires here too", recurrence: "Looks like the same event" };
+
+/* A hint as the Hints row draws it: {index, kind, at, similarity (0..1), suggestions,
+ * description, entityId, from, to}, or null when it has no time. */
+export function hintView(raw, index = 0) {
+  const h = isObject(raw) ? raw : {};
+  const at = msOf(h.at);
+  if (at === null) return null;
+  const sim = Number(h.similarity);
+  return {
+    index,
+    kind: h.kind === "recurrence" ? "recurrence" : "outside_fire",
+    at,
+    similarity: Number.isFinite(sim) ? Math.min(1, Math.max(0, sim)) : 0.5,
+    suggestions: Array.isArray(h.suggestions) ? h.suggestions.filter((n) => Number.isFinite(n)) : [],
+    description: String(h.description || "").trim(),
+    entityId: h.entity_id ?? null,
+    from: h.from ?? null,
+    to: h.to ?? null,
+  };
+}
+
+/* How big and how solid a hint marker is: likelier ones larger and more opaque. */
+export function hintMarkStyle(similarity) {
+  const s = Math.min(1, Math.max(0, Number(similarity) || 0));
+  return { r: Math.round((3 + 4 * s) * 10) / 10, opacity: Math.round((0.35 + 0.65 * s) * 100) / 100 };
+}
+
+export const HINT_SPAN_MIN = 60e3;
+
+/* The free stretch around `t` that labels of `kind` leave: [lo, hi) between the nearest
+ * such label ending at or before t and the next one starting after it, inside the window;
+ * null when t lies inside one. */
+function freeAround(labels, kind, t, { start, end }) {
+  let lo = start;
+  let hi = end;
+  for (const l of labels) {
+    if (l.kind !== kind) continue;
+    if (l.start <= t && t < l.end) return null;
+    if (l.end <= t) lo = Math.max(lo, l.end);
+    else if (l.start > t) hi = Math.min(hi, l.start);
+  }
+  return { lo, hi };
+}
+
+/* The label a hint's quick action places, for placeLabel: {ok: true, label} or {ok: false,
+ * error}. "yes" (this too) makes a should-fire period with `anchor` whose anchor lands on
+ * the hint: it starts there (anchor start, both, while) or ends there (anchor end), as long
+ * as the user's other should-fire periods with that anchor (the median), else the
+ * tolerance window. "no" (not here) makes a must-not period over the tolerance window around
+ * it. Either is cut short rather than run into a period of the other kind, and kept inside
+ * the window. */
+export function hintLabel(hint, action, { labels = [], anchor = "start", tolerance = DEFAULT_TOLERANCE, window }) {
+  const t = Math.round(hint.at);
+  if (!(t >= window.start && t < window.end)) return { ok: false, error: "That hint is outside the window." };
+  const slack = Math.max(HINT_SPAN_MIN, tolerance.before, tolerance.after);
+  if (action === "no") {
+    const free = freeAround(labels, "fire", t, window);
+    if (!free) return { ok: false, error: "That moment is inside a should-fire period already." };
+    const lo = Math.max(free.lo, t - Math.max(HINT_SPAN_MIN, tolerance.before));
+    const hi = Math.min(free.hi, t + Math.max(HINT_SPAN_MIN, tolerance.after));
+    if (hi - lo < MIN_LABEL_SPAN) return { ok: false, error: "There is no room for a must-not-fire period there." };
+    return { ok: true, label: { start: lo, end: hi, kind: "no_fire", anchor: "start" } };
+  }
+  const a = LABEL_ANCHORS.includes(anchor) ? anchor : "start";
+  const spans = labels
+    .filter((l) => l.kind === "fire" && l.anchor === a)
+    .map((l) => l.end - l.start)
+    .sort((x, y) => x - y);
+  const span = spans.length ? spans[Math.floor((spans.length - 1) / 2)] : slack;
+  const free = freeAround(labels, "no_fire", t, window);
+  if (!free) return { ok: false, error: "That moment is inside a must-not-fire period." };
+  let lo;
+  let hi;
+  if (a === "end") {
+    hi = Math.min(t, free.hi);
+    lo = Math.max(free.lo, hi - span);
+  } else {
+    lo = t;
+    hi = Math.min(free.hi, t + span);
+  }
+  if (hi - lo < MIN_LABEL_SPAN) return { ok: false, error: "There is no room for a should-fire period there." };
+  return { ok: true, label: { start: lo, end: hi, kind: "fire", anchor: a } };
+}
+
+/* The view centered on t, zoomed in to at most `maxSpan` so the spot is legible. */
+export function jumpView([t0, t1], t, [lo, hi], maxSpan = 2 * 3600e3) {
+  const span = Math.min(t1 - t0, maxSpan);
+  return clampView(t - span / 2, t + span / 2, lo, hi);
+}
+
+/* What the Suggest card says when it has no suggestions to show: {kind, text} or null. */
+export function suggestEmptyState({ available, tracks, fireLabels, state }) {
+  if (available === false) {
+    return { kind: "unavailable", text: "This version of the integration has no suggestion backend yet (event_simulator/suggest/subscribe is missing). Update the integration and reload Home Assistant." };
+  }
+  if (!tracks) return { kind: "no_tracks", text: "Add the entities to learn from as tracks, or seed them from an automation." };
+  if (!fireLabels) return { kind: "no_labels", text: "Mark at least one period where it should fire: drag across the Labels row, then pick Should fire." };
+  if (state?.error && !state?.result) return null;
+  if (state?.result && !state.result.suggestions.length) {
+    return { kind: "none_found", text: "Nothing fits these labels. Add tracks for entities that change when it should fire (a door, a motion sensor, the sun's elevation), label more periods, or widen the tolerance." };
+  }
+  if (!state?.result) return { kind: "waiting", text: state?.running ? "Looking for triggers and conditions that fit…" : "Press Suggest now to look for triggers and conditions that fit the labels." };
+  return null;
 }
 
 // ---- panel ----------------------------------------------------------------
@@ -1690,6 +1959,24 @@ const SCROLL_MIN_THUMB = 28; // px
 const DISCRETE_H = 24;
 const NUMERIC_H = 56;
 const RESULTS_H = 38;
+const HINTS_H = 26;
+const FIRES_H = 26;
+
+/* The Fires row's marker for a fire mark (see fireMarks): shape as well as color. */
+function fireMarker(m, x, y) {
+  switch (m.kind) {
+    case "anchor":
+      return m.approx ? `<circle cx="${x}" cy="${y}" r="4.5" class="fm anchor approx"/>` : `<circle cx="${x}" cy="${y}" r="5" class="fm anchor"/>`;
+    case "no_fire":
+      return `<path d="M${x},${y - 6}L${x + 6},${y}L${x},${y + 6}L${x - 6},${y}Z" class="fm nofire"/>`;
+    case "inside":
+      return `<circle cx="${x}" cy="${y}" r="4" class="fm inside"/>`;
+    case "missed":
+      return `<circle cx="${x}" cy="${y}" r="5.5" class="fm missed"/>`;
+    default:
+      return `<rect x="${x - 4}" y="${y - 4}" width="8" height="8" class="fm unlabeled"/>`;
+  }
+}
 
 function presetWindow(id, now = Date.now()) {
   const end = Math.ceil(now / 60e3) * 60e3;
@@ -1816,8 +2103,21 @@ class EventSimulatorPanel extends Base {
     this._tolerance = { ...DEFAULT_TOLERANCE };
     this._tolError = null;
     this._suggestAvail = null; // null until probed, then true / false
-    this._suggestRun = null; // {done, unsub}
-    this._suggestState = null; // {running, text, error, result}
+    this._suggestRun = null; // the suggest/subscribe in flight: {seq, print, done, unsub}
+    // {running, text, stage, error, stale, result: {suggestions: [suggestionView], hints:
+    // [hintView], evaluated, warnings}}; a result stays shown (dimmed) while the next runs.
+    this._suggestState = null;
+    this._suggestPrint = null; // the request the shown result answers
+    this._suggestSel = null; // rank of the suggestion drawn on the Fires row
+    this._hintSel = null; // index of the hint whose popover is open
+    this._copied = null; // rank whose YAML was just copied
+    // Auto-suggest: the same debounce and newest-wins machinery as auto-run.
+    this._autoSuggest = readAutoRunPref(globalThis.localStorage, AUTO_SUGGEST_KEY);
+    this._suggestScheduler = new ReplayScheduler({
+      enabled: this._autoSuggest,
+      start: (seq, opts) => this._startSuggest(seq, opts),
+      cancel: (seq) => this._cancelSuggest(seq),
+    });
   }
 
   get _running() {
@@ -1870,6 +2170,7 @@ class EventSimulatorPanel extends Base {
     // A reconnect drops the replay subscription without an answer; ask again.
     this._hass.connection?.addEventListener?.("ready", () => {
       if (this._scheduler.running) this._scheduler.change();
+      if (this._suggestScheduler.running) this._suggestScheduler.change();
     });
     this._loading = "Loading automations…";
     this._render();
@@ -2076,6 +2377,7 @@ class EventSimulatorPanel extends Base {
     this._window = { start, end };
     this._view = [start, end];
     this._clearResult();
+    this._suggestChanged();
     if (this._tracks.some((t) => t.edited)) {
       this._notice = "The window changed, so every track was reloaded from history and the timeline edits were dropped.";
     }
@@ -2103,6 +2405,8 @@ class EventSimulatorPanel extends Base {
     this._labelDrag = null;
     this._labelError = null;
     this._notice = null;
+    this._hintSel = null;
+    if (mode === "suggest") this._suggestScheduler.change();
     if (mode === "replay") {
       this._labelSel = null;
       const { start, end } = this._window;
@@ -2409,8 +2713,15 @@ class EventSimulatorPanel extends Base {
 
   /* Labels changed: the save state and anything suggested from the old ones are out of date. */
   _labelsChanged() {
-    if (this._suggestState?.result) this._suggestState = { ...this._suggestState, stale: true };
+    this._suggestChanged();
     this._updateDirty();
+  }
+
+  /* Something suggestions depend on changed (labels, tolerance, tracks, window): the shown
+   * ones are out of date, and auto-suggest asks again once the changes pause. */
+  _suggestChanged() {
+    if (this._suggestState?.result) this._suggestState = { ...this._suggestState, stale: true };
+    this._suggestScheduler.change();
   }
 
   // ---- suggest ------------------------------------------------------------------
@@ -2436,26 +2747,51 @@ class EventSimulatorPanel extends Base {
     );
   }
 
-  /* Press Suggest: subscribe to suggest/subscribe (newest wins: a running one is dropped).
-   * The results UI is the next panel unit; this shows progress, errors and a count. */
-  _runSuggest() {
-    if (!this._canSuggest()) return;
-    this._cancelSuggest();
-    const message = suggestMessage({
+  /* The suggest/subscribe request for the current entities, window, labels and tolerance. */
+  _suggestRequest() {
+    return suggestMessage({
       entityIds: this._tracks.map((t) => t.entity_id),
       start: this._window.start,
       end: this._window.end,
       labels: this._labels,
       tolerance: this._tolerance,
     });
-    const tooLarge = messageSizeError(message);
-    if (tooLarge) {
-      this._suggestState = { running: false, error: describeRunError(tooLarge) };
-      return this._render();
+  }
+
+  /* Suggest now: ask even when nothing changed since the shown suggestions. */
+  _runSuggest() {
+    this._suggestScheduler.runNow();
+  }
+
+  _setAutoSuggest(on) {
+    this._autoSuggest = !!on;
+    writeAutoRunPref(this._autoSuggest, globalThis.localStorage, AUTO_SUGGEST_KEY);
+    this._suggestScheduler.setEnabled(this._autoSuggest);
+    this._render();
+  }
+
+  /* The scheduler's `start`: subscribe to suggest/subscribe for request `seq`, or skip it when
+   * the shown suggestions already answer the same request (unless forced by Suggest now). */
+  _startSuggest(seq, { forced }) {
+    if (!this._canSuggest()) return null;
+    const message = this._suggestRequest();
+    const print = JSON.stringify(message);
+    const st = this._suggestState;
+    if (!forced && st?.result && !st.error && print === this._suggestPrint) {
+      this._suggestState = { ...st, stale: false };
+      this._renderSoon();
+      return null;
     }
-    const run = { done: false, unsub: null };
+    const size = messageBytes(message);
+    const tooLarge = messageSizeError(message, size);
+    if (tooLarge) {
+      this._suggestState = { ...st, running: false, error: describeRunError(tooLarge) };
+      this._renderSoon();
+      return null;
+    }
+    const run = { seq, print, done: false, unsub: null };
     this._suggestRun = run;
-    this._suggestState = { running: true, text: "Starting…" };
+    this._suggestState = { ...st, running: true, text: "Starting…", stage: null, error: null };
     this._hass.connection
       .subscribeMessage((event) => this._onSuggestEvent(run, event), message, { resubscribe: false })
       .then((unsub) => {
@@ -2463,34 +2799,141 @@ class EventSimulatorPanel extends Base {
         if (run.done) this._unsubscribe(run);
       })
       .catch((err) => this._onSuggestEvent(run, { error: err }));
-    this._render();
+    this._renderSoon();
+    return { size };
   }
 
-  _cancelSuggest() {
+  /* The scheduler's `cancel` (and a scenario load): drop the suggest run in flight;
+   * unsubscribing kills its sandbox child. */
+  _cancelSuggest(seq = null) {
     const run = this._suggestRun;
-    if (!run) return;
+    if (!run || (seq !== null && run.seq !== seq)) return;
     run.done = true;
     this._suggestRun = null;
     this._unsubscribe(run);
+    if (this._suggestState?.running) this._suggestState = { ...this._suggestState, running: false };
+  }
+
+  /* Nothing suggested any more (a scenario loaded): drop the run, the result and the picks. */
+  _resetSuggest() {
+    this._suggestScheduler.invalidate();
+    this._cancelSuggest();
+    this._suggestState = null;
+    this._suggestPrint = null;
+    this._suggestSel = null;
+    this._hintSel = null;
   }
 
   _onSuggestEvent(run, event) {
     if (run.done || run !== this._suggestRun) return;
     const outcome = suggestOutcome(event);
     if (outcome.kind === "progress") {
-      this._suggestState = { ...this._suggestState, running: true, text: outcome.text };
+      this._suggestState = { ...this._suggestState, running: true, text: outcome.text, stage: outcome.stage };
       return this._renderSoon();
     }
-    this._cancelSuggest();
+    run.done = true;
+    this._suggestRun = null;
+    this._unsubscribe(run);
+    if (!this._suggestScheduler.finish(run.seq)) return; // a newer request replaced it
+    const prev = this._suggestState || {};
     if (outcome.kind === "unavailable") {
       this._suggestAvail = false;
       this._suggestState = null;
     } else if (outcome.kind === "error") {
-      this._suggestState = { running: false, error: outcome.error };
+      this._suggestState = { ...prev, running: false, error: outcome.error, stale: !!prev.result };
     } else {
-      this._suggestState = { running: false, result: { suggestions: outcome.suggestions, hints: outcome.hints } };
+      const suggestions = outcome.suggestions.map((raw, i) => suggestionView(raw, i));
+      const hints = outcome.hints.map((raw, i) => hintView(raw, i)).filter(Boolean);
+      this._suggestPrint = run.print;
+      this._suggestState = {
+        running: false,
+        result: { suggestions, hints, evaluated: outcome.evaluated, warnings: outcome.warnings },
+        stale: this._suggestScheduler.dirty || JSON.stringify(this._suggestRequest()) !== run.print,
+      };
+      // Keep the suggestion on the timeline across re-suggests when it is still there.
+      if (!suggestions.some((v) => v.rank === this._suggestSel)) this._suggestSel = suggestions[0]?.rank ?? null;
+      this._hintSel = null;
     }
     this._renderSoon();
+  }
+
+  _suggestion(rank) {
+    return this._suggestState?.result?.suggestions.find((v) => v.rank === rank) || null;
+  }
+
+  /* Copy a suggestion's full YAML; where the clipboard is refused, open it to copy by hand. */
+  _copySuggestion(rank) {
+    const view = this._suggestion(rank);
+    if (!view) return;
+    const text = `${toYaml(view.config)}\n`;
+    const done = () => {
+      this._copied = rank;
+      this._render();
+      clearTimeout(this._copiedTimer);
+      this._copiedTimer = setTimeout(() => {
+        this._copied = null;
+        this._render();
+      }, 2000);
+    };
+    const manual = () => {
+      this._open[`sg-yaml-${rank}`] = true;
+      this._notice = "The clipboard is not available here; the full YAML is open below to copy by hand.";
+      this._render();
+    };
+    const clip = globalThis.navigator?.clipboard;
+    if (clip?.writeText) clip.writeText(text).then(done, manual);
+    else manual();
+  }
+
+  /* Open in simulator: Replay mode, same window and tracks, with the suggestion as the
+   * automation config (an edit of the seeding automation when there is one); the labels stay
+   * on their row as an overlay. */
+  _openSuggestion(rank) {
+    const view = this._suggestion(rank);
+    if (!view) return;
+    const config = view.config;
+    const real = this._automation && !this._automation.suggested;
+    if (real) {
+      this._cfgDraft = stableStringify(config) === stableStringify(this._automation.config) ? null : config;
+    } else {
+      this._automation = { config, referenced_entities: this._tracks.map((t) => t.entity_id), suggested: rank };
+      this._cfgDraft = null;
+    }
+    this._cfgError = null;
+    this._labelSel = null;
+    this._hintSel = null;
+    this._setMode("replay");
+    const cut = this._notice;
+    this._renderConfig();
+    this._clearResult();
+    this._notice = [
+      `Suggestion #${rank} is loaded${real ? ` as an edit of ${this._entityId}` : ""}. Its action is a placeholder (logbook.log): replace it with what the automation should do. Nothing is saved to Home Assistant.`,
+      cut,
+    ].filter(Boolean).join(" ");
+    this._render();
+  }
+
+  /* A hint's quick label: "yes" (should fire here too, with the remembered anchor) or "no"
+   * (must not fire here); then suggest again with it. */
+  _applyHint(action) {
+    const hint = this._suggestState?.result?.hints[this._hintSel];
+    if (!hint) return;
+    const r = hintLabel(hint, action, { labels: this._labels, anchor: this._labelDefault.anchor, tolerance: this._tolerance, window: this._window });
+    if (!r.ok) {
+      this._labelError = r.error;
+      return this._render();
+    }
+    this._hintSel = null;
+    const before = this._labels;
+    this._placeLabel(action === "yes" ? "label: this too" : "label: not here", r.label);
+    if (this._labels !== before) this._suggestScheduler.runNow();
+  }
+
+  /* Bring time t into view, zoomed in enough to see it. */
+  _jumpTo(t) {
+    if (!Number.isFinite(t)) return;
+    this._setView(jumpView(this._view, t, this._bounds()));
+    this.shadowRoot.getElementById("tl-wrap")?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
   }
 
   _setTolerance(which, text) {
@@ -2573,7 +3016,7 @@ class EventSimulatorPanel extends Base {
           <div id="cfg-error" class="err small" hidden></div>
           <div id="cfg-diff"></div>
           <div class="cfg-actions">
-            <button data-action="cfg-revert" id="cfg-revert">Revert to saved automation</button>
+            <button data-action="cfg-revert" id="cfg-revert">${this._automation.suggested ? `Revert to suggestion #${esc(this._automation.suggested)}` : "Revert to saved automation"}</button>
             <span class="muted small" id="cfg-status"></span>
           </div>
         </div>
@@ -2752,7 +3195,8 @@ class EventSimulatorPanel extends Base {
     if (!badge) return;
     const edited = this._cfgDraft !== null;
     badge.className = `chip ${this._cfgError ? "fail" : edited ? "edited" : "none"}`;
-    badge.textContent = this._cfgError ? "invalid" : edited ? "edited" : "as saved";
+    const suggested = this._automation?.suggested;
+    badge.textContent = this._cfgError ? "invalid" : edited ? "edited" : suggested ? `suggestion #${suggested}` : "as saved";
     const error = root.getElementById("cfg-error");
     error.hidden = !this._cfgError;
     error.textContent = this._cfgError || "";
@@ -2761,7 +3205,9 @@ class EventSimulatorPanel extends Base {
       ? "Run is off until the config parses."
       : edited
         ? "Run uses this edited config."
-        : "Run uses the automation as saved in Home Assistant.";
+        : suggested
+          ? `Run uses suggestion #${suggested} as suggested; replace its placeholder action with yours.`
+          : "Run uses the automation as saved in Home Assistant.";
   }
 
   /* The result no longer applies (another automation, window or scenario): drop it and
@@ -2781,11 +3227,13 @@ class EventSimulatorPanel extends Base {
   _markStale() {
     if (this._result) this._resultStale = true;
     this._scheduler.change();
+    this._suggestChanged();
   }
 
   /* Whether a replay can start now: an automation, no load pending, a config that parses. */
   _syncReady() {
     this._scheduler.setReady(this._mode === "replay" && !!this._automation && !this._loading && !this._cfgError);
+    this._suggestScheduler.setReady(this._mode === "suggest" && this._canSuggest());
   }
 
   _run() {
@@ -3046,8 +3494,7 @@ class EventSimulatorPanel extends Base {
     this._tracks = [];
     this._clearResult();
     this._clearEdits();
-    this._cancelSuggest();
-    this._suggestState = null;
+    this._resetSuggest();
     // Saved from Suggest mode (it has options) or not; labels load either way.
     this._mode = isObject(record.suggest_options) ? "suggest" : "replay";
     this._labels = labelsFromScenario(record.labels);
@@ -3302,8 +3749,8 @@ class EventSimulatorPanel extends Base {
       </ha-card>`;
   }
 
-  /* Suggest mode's row in place of Run: the match tolerance, the Suggest button and what it
-   * is doing. The suggestions list itself is the next panel unit. */
+  /* Suggest mode's row in place of Run: the match tolerance, Auto-suggest, Suggest now and
+   * what it is doing. The suggestions themselves are the card under the timeline. */
   _suggestRowHtml() {
     const tol = this._tolerance;
     const minutes = (ms) => String(Math.round((ms / 60e3) * 100) / 100);
@@ -3311,16 +3758,16 @@ class EventSimulatorPanel extends Base {
     const inWindow = labelsInWindow(this._labels, this._window.start, this._window.end);
     const fires = inWindow.filter((l) => l.kind === "fire").length;
     let status;
-    if (this._suggestAvail === false) status = `<span class="muted small" id="suggest-status">Suggestions are not available yet.</span>`;
+    if (this._suggestAvail === false) status = `<span class="muted small" id="suggest-status">Suggestions are not available in this version of the integration.</span>`;
     else if (st?.running) status = `<span class="spinner" aria-label="Suggesting"></span><span class="muted small" id="suggest-status">${esc(st.text || "Working…")}</span>`;
     else if (st?.error) status = `<span class="err small" id="suggest-status" role="alert">${esc(st.error.title)}: ${esc(st.error.message)}</span>`;
     else if (st?.result) {
       const n = st.result.suggestions.length;
-      status = `<span class="muted small" id="suggest-status">${n} suggestion${n === 1 ? "" : "s"} found${st.stale ? " (labels changed since)" : ""}.</span>`;
+      status = `<span class="muted small" id="suggest-status">${n} suggestion${n === 1 ? "" : "s"}${st.stale ? ` <span class="stale">(the inputs changed since${this._autoSuggest ? "" : "; Suggest now updates them"})</span>` : ""}.</span>`;
     } else if (!this._tracks.length) status = `<span class="muted small" id="suggest-status">Add the entities to learn from as tracks.</span>`;
-    else if (!fires) status = `<span class="muted small" id="suggest-status">Label at least one period where the automation should fire.</span>`;
+    else if (!fires) status = `<span class="muted small" id="suggest-status">Mark at least one period where it should fire.</span>`;
     else status = `<span class="muted small" id="suggest-status">${fires} should-fire and ${inWindow.length - fires} must-not-fire period${inWindow.length - fires === 1 ? "" : "s"} labeled.</span>`;
-    const title = this._suggestAvail === false ? "Suggestions are not available yet" : "Suggest a trigger and conditions from the labeled periods";
+    const title = this._suggestAvail === false ? "Suggestions are not available in this version of the integration" : "Suggest a trigger and conditions from the labeled periods, even when nothing changed";
     return `
       <div class="run-row suggest-row">
         <div class="tolerance" role="group" aria-label="Match tolerance">
@@ -3331,10 +3778,83 @@ class EventSimulatorPanel extends Base {
           <input id="tol-after" type="number" min="0" max="${MAX_TOLERANCE_MIN}" step="0.5" value="${minutes(tol.after)}" aria-label="Minutes after an anchor">
           <span class="small">min after it</span>
         </div>
-        <button class="primary" data-action="suggest" ${this._canSuggest() && !st?.running ? "" : "disabled"} title="${esc(title)}">Suggest</button>
+        <label class="auto-run" title="Suggest again automatically after each change to the labels, tracks, window or tolerance">
+          <input type="checkbox" id="auto-suggest" ${this._autoSuggest ? "checked" : ""}> Auto-suggest
+        </label>
+        <button class="${this._autoSuggest ? "" : "primary"}" data-action="suggest" ${this._canSuggest() ? "" : "disabled"} title="${esc(title)}">Suggest now</button>
         ${status}
         ${this._tolError ? `<span class="err small" role="alert">${esc(this._tolError)}</span>` : ""}
       </div>`;
+  }
+
+  /* The Suggestions card under the timeline: what to do next when there is nothing to show,
+   * else one card per suggestion, best first. */
+  _suggestCardHtml() {
+    const st = this._suggestState;
+    const result = st?.result;
+    const fires = labelsInWindow(this._labels, this._window.start, this._window.end).filter((l) => l.kind === "fire").length;
+    const empty = suggestEmptyState({ available: this._suggestAvail, tracks: this._tracks.length, fireLabels: fires, state: st });
+    const running = st?.running ? `<span class="updating-note"><span class="spinner small"></span>${esc(st.text || "updating…")}</span>` : "";
+    const stale = !st?.running && st?.stale && result ? `<span class="stale small">the inputs changed since these were suggested</span>` : "";
+    const head = `<div class="sg-top"><h2>Suggestions</h2>${result?.evaluated ? `<span class="muted small">best of ${result.evaluated} candidate${result.evaluated === 1 ? "" : "s"}</span>` : ""}${running}${stale}</div>`;
+    const error = st?.error ? `<div class="alert error" role="alert"><div><strong>${esc(st.error.title)}</strong>: ${esc(st.error.message)}</div></div>` : "";
+    const warnings = result?.warnings?.length ? this._warningsHtml(result.warnings) : "";
+    const body = empty
+      ? `<div class="empty sg-empty" data-empty="${empty.kind}">${esc(empty.text)}</div>`
+      : `<ol class="sg-list">${result.suggestions.map((v) => this._suggestionHtml(v)).join("")}</ol>`;
+    return `<ha-card><div class="card-content suggest-card${st?.running && result ? " updating" : ""}">${head}${error}${warnings}${body}</div></ha-card>`;
+  }
+
+  /* Times as jump links: the first `max`, then how many more. */
+  _jumpLinks(times, cls = "") {
+    const max = 4;
+    const links = times.slice(0, max).map((t) => `<button class="link jump ${cls}" data-action="jump" data-t="${t}" title="Show this moment on the timeline">${esc(this._fullTime(t))}</button>`);
+    if (times.length > max) links.push(`<span class="muted small">and ${times.length - max} more</span>`);
+    return links.join(" ");
+  }
+
+  _suggestionHtml(v) {
+    const sel = v.rank === this._suggestSel;
+    const badge = v.exact
+      ? `<span class="chip pass" title="These numbers are what Home Assistant itself did when the suggestion was replayed in the sandbox">checked in HA's sandbox</span>`
+      : `<span class="chip none" title="These numbers come from the fast estimate; the sandbox did not check this one">estimated</span>`;
+    const hitAll = v.total > 0 && v.hits === v.total;
+    const missed = v.missed.length
+      ? ` · missed ${v.missed.map((m) => `<button class="link jump" data-action="jump" data-t="${m.at}" title="Show this ${m.edge === "end" ? "end" : "start"} on the timeline">${esc(this._fullTime(m.at))}${m.edge === "end" ? " (end)" : ""}</button>`).join(" ")}`
+      : "";
+    const stats = [
+      `<li><span class="chip ${hitAll ? "pass" : v.hits ? "none" : "fail"}">${v.hits}/${v.total}</span> marked anchor${v.total === 1 ? "" : "s"} hit${missed}</li>`,
+      v.violations.length
+        ? `<li class="err"><strong>${v.violations.length} fire${v.violations.length === 1 ? "" : "s"} in must-not periods</strong> · ${this._jumpLinks(v.violations, "err")}</li>`
+        : v.total || this._labels.some((l) => l.kind === "no_fire")
+          ? `<li class="muted">no fires in must-not periods</li>`
+          : "",
+      `<li>${v.outside.length ? `${v.outside.length} fire${v.outside.length === 1 ? "" : "s"} in unlabeled time · ${this._jumpLinks(v.outside)}` : `<span class="muted">no fires in unlabeled time</span>`}</li>`,
+      v.inside.length ? `<li class="muted">${v.inside.length} more inside should-fire periods, away from their anchors</li>` : "",
+      v.whileTotal ? `<li>conditions hold throughout ${v.whileHeld}/${v.whileTotal} “while” period${v.whileTotal === 1 ? "" : "s"}</li>` : "",
+      v.exact && v.approx && Number.isFinite(v.approx.fires) && v.approx.fires !== v.fires ? `<li class="muted small">the estimate said ${v.approx.fires} fires; the sandbox found ${v.fires}</li>` : "",
+    ].filter(Boolean).join("");
+    const key = `sg-yaml-${v.rank}`;
+    return `
+      <li class="sg${sel ? " sel" : ""}" data-rank="${v.rank}">
+        <div class="sg-head">
+          <button class="link sg-rank" data-action="sg-select" data-rank="${v.rank}" aria-pressed="${sel}" title="${sel ? "On the timeline (Fires row)" : "Show its fires on the timeline"}">#${v.rank}</button>
+          ${badge}
+          ${sel ? `<span class="chip on-tl">on the timeline</span>` : `<button class="link small" data-action="sg-select" data-rank="${v.rank}">show on timeline</button>`}
+          <span class="muted small sg-fires">${v.fires} fire${v.fires === 1 ? "" : "s"} in the window</span>
+        </div>
+        <p class="sg-expl">${esc(v.explanation || "No explanation was sent for this one.")}</p>
+        <ul class="sg-stats">${stats}</ul>
+        <pre class="mono sg-yaml">${esc(triggerYaml(v.config))}</pre>
+        <details class="sg-full" data-key="${key}" ${this._openAttr(key)}>
+          <summary>Full automation YAML</summary>
+          <pre class="mono sg-yaml">${esc(toYaml(v.config))}</pre>
+        </details>
+        <div class="sg-actions">
+          <button data-action="sg-copy" data-rank="${v.rank}">${this._copied === v.rank ? "Copied" : "Copy YAML"}</button>
+          <button class="primary small-btn" data-action="sg-open" data-rank="${v.rank}" title="Replay this suggestion in the simulator, on the same window and tracks">Open in simulator</button>
+        </div>
+      </li>`;
   }
 
   /* The saved-scenario controls: current name and save state, Save / Save as, the name
@@ -3496,6 +4016,7 @@ class EventSimulatorPanel extends Base {
             <div id="cursor" hidden></div>
             <div id="tip" hidden></div>
             <div id="label-pop" class="label-pop" hidden></div>
+            <div id="hint-pop" class="label-pop" hidden></div>
           </div>
           ${this._labelSel ? this._labelEditorHtml() : this._editorHtml()}
           ${this._tracks.length === 0 && !this._loading
@@ -3677,6 +4198,10 @@ class EventSimulatorPanel extends Base {
     if (label) label.textContent = `${formatDuration(t1 - t0)} visible`;
     const parts = [this._axisSvg(scale)];
     if (this._mode === "suggest" || this._labels.length) parts.push(this._labelsRow(scale));
+    if (this._mode === "suggest" && this._suggestState?.result) {
+      parts.push(this._hintsRow(scale));
+      if (this._suggestion(this._suggestSel)) parts.push(this._firesRow(scale));
+    }
     if (this._mode === "replay" && (this._result || this._running)) parts.push(this._resultsRow(scale));
     for (const track of this._tracks) parts.push(this._trackRow(track, scale));
     tl.innerHTML = parts.join("");
@@ -3685,6 +4210,97 @@ class EventSimulatorPanel extends Base {
     const cursor = this.shadowRoot.getElementById("cursor");
     if (axis && cursor) cursor.style.top = `${axis.offsetHeight}px`;
     this._placeLabelPopover(scale);
+    this._placeHintPopover(scale);
+  }
+
+  /* The Hints row: where the top suggestions fire outside the labels (circles) and where the
+   * labeled change happens again elsewhere (diamonds); likelier ones larger and more solid. */
+  _hintsRow(scale) {
+    const hints = this._suggestState.result.hints;
+    let out = this._gridLines(scale, HINTS_H);
+    const y = HINTS_H / 2;
+    for (const h of hints) {
+      if (h.at < scale.t0 || h.at > scale.t1) continue;
+      const x = scale.toX(h.at);
+      const { r, opacity } = hintMarkStyle(h.similarity);
+      if (h.index === this._hintSel) out += `<circle cx="${x}" cy="${y}" r="${r + 4}" class="selected"/>`;
+      out +=
+        h.kind === "recurrence"
+          ? `<path d="M${x},${y - r - 1}L${x + r + 1},${y}L${x},${y + r + 1}L${x - r - 1},${y}Z" class="hint recur" opacity="${opacity}"/>`
+          : `<circle cx="${x}" cy="${y}" r="${r}" class="hint outside" opacity="${opacity}"/>`;
+    }
+    const n = (kind) => hints.filter((h) => h.kind === kind).length;
+    const meta = hints.length
+      ? `<span class="legend-item"><svg class="legend-mark" width="12" height="12" aria-hidden="true"><circle cx="6" cy="6" r="4.5" class="hint outside"/></svg>${n("outside_fire")} outside fire${n("outside_fire") === 1 ? "" : "s"}</span> · <span class="legend-item"><svg class="legend-mark" width="12" height="12" aria-hidden="true"><path d="M6,1L11,6L6,11L1,6Z" class="hint recur"/></svg>${n("recurrence")} look${n("recurrence") === 1 ? "s" : ""} like the same event</span> · click one to label it`
+      : "nothing to label outside the periods";
+    return `
+      <div class="row hints-row">
+        <div class="track-head"><span class="name">Hints</span><span class="meta">${meta}</span></div>
+        <svg class="hints" data-row="hints" width="${scale.width}" height="${HINTS_H}">${out}</svg>
+      </div>`;
+  }
+
+  /* The Fires row: where the selected suggestion fires, green on a marked anchor, red inside
+   * a must-not period, grey in unlabeled time; a dashed ring where an anchor was missed. */
+  _firesRow(scale) {
+    const view = this._suggestion(this._suggestSel);
+    const marks = fireMarks(view, this._labels);
+    const y = FIRES_H / 2;
+    let out = this._gridLines(scale, FIRES_H);
+    for (const m of marks) {
+      if (m.t < scale.t0 || m.t > scale.t1) continue;
+      out += fireMarker(m, scale.toX(m.t), y);
+    }
+    const c = (kind) => marks.filter((m) => m.kind === kind).length;
+    const parts = [
+      [c("anchor"), "anchor", "on an anchor"],
+      [c("no_fire"), "no_fire", "in must-not periods"],
+      [c("unlabeled"), "unlabeled", "unlabeled"],
+      [c("inside"), "inside", "inside a period"],
+      [c("missed"), "missed", c("missed") === 1 ? "anchor missed" : "anchors missed"],
+    ]
+      .filter(([n]) => n)
+      .map(([n, kind, text]) => `<span class="legend-item"><svg class="legend-mark" width="14" height="14" aria-hidden="true">${fireMarker({ kind }, 7, 7)}</svg>${n} ${text}</span>`)
+      .join(" · ");
+    return `
+      <div class="row fires-row">
+        <div class="track-head"><span class="name">Fires of #${view.rank}</span><span class="meta">${parts || "never fires in this window"}</span></div>
+        <svg class="fires" data-row="fires" width="${scale.width}" height="${FIRES_H}">${out}</svg>
+      </div>`;
+  }
+
+  /* The popover for the selected hint: what it is, and the two quick labels. */
+  _placeHintPopover(scale) {
+    const pop = this.shadowRoot.getElementById("hint-pop");
+    if (!pop) return;
+    const hint = this._mode === "suggest" ? this._suggestState?.result?.hints[this._hintSel] : null;
+    const row = this.shadowRoot.querySelector("#tl .hints-row");
+    if (!hint || !row) {
+      pop.hidden = true;
+      pop.innerHTML = "";
+      return;
+    }
+    const anchor = this._labelDefault.anchor;
+    const ranks = hint.suggestions.length ? `<span class="muted small">from suggestion${hint.suggestions.length === 1 ? "" : "s"} ${hint.suggestions.map((r) => `#${r}`).join(", ")}</span>` : "";
+    pop.hidden = false;
+    pop.innerHTML = `
+      <div class="small"><strong>${esc(HINT_KINDS[hint.kind])}</strong> · ${esc(this._fullTime(hint.at))} <span class="muted">· ${Math.round(hint.similarity * 100)}% alike</span> ${ranks}</div>
+      ${hint.description ? `<div class="small">${esc(hint.description)}</div>` : ""}
+      <div class="pop-group">
+        <button class="primary small-btn" data-action="hint-yes" title="Label a should-fire period here (${esc(ANCHOR_TEXT[anchor])}) and suggest again">Yes, this too</button>
+        <button class="nofire-btn" data-action="hint-no" title="Label a must-not-fire period around it and suggest again">No, not here</button>
+        <button class="link" data-action="hint-close">Close</button>
+      </div>`;
+    const place = () => {
+      const wrap = this.shadowRoot.getElementById("tl-wrap");
+      if (!pop.isConnected || !row.isConnected || !wrap) return;
+      const top = row.getBoundingClientRect().bottom - wrap.getBoundingClientRect().top + 4;
+      const left = Math.min(Math.max(0, scale.toX(hint.at) - 20), Math.max(0, wrap.clientWidth - pop.offsetWidth));
+      pop.style.top = `${top}px`;
+      pop.style.left = `${left}px`;
+    };
+    place();
+    requestAnimationFrame(place);
   }
 
   /* The labels to draw: the list, with a label being moved or resized drawn where it would land. */
@@ -4022,6 +4638,7 @@ class EventSimulatorPanel extends Base {
   }
 
   _detailCard() {
+    if (this._mode === "suggest") return this._hasTimeline() ? `<div class="detail">${this._suggestCardHtml()}</div>` : "";
     const result = this._result;
     if (!result || this._mode !== "replay") return "";
     return `<div class="detail${this._running ? " updating" : ""}">${this._detailHtml(result)}</div>`;
@@ -4243,6 +4860,7 @@ class EventSimulatorPanel extends Base {
    * body (move), or start brushing a new period. A finger has to rest for LONG_PRESS_MS
    * before a brush starts, so a swipe meant to scroll the page labels nothing. */
   _onLabelDown(ev, row) {
+    this._hintSel = null;
     const svg = ev.target.closest("svg[data-row]");
     const x = ev.clientX - svg.getBoundingClientRect().left;
     const scale = this._scale();
@@ -4448,6 +5066,17 @@ class EventSimulatorPanel extends Base {
       this._selectedRun = hit.run.index;
       return this._render();
     }
+    const row = this._rowAt(ev.clientX, ev.clientY)?.dataset.row;
+    if (row === "hints") {
+      const hint = this._hintsHit(ev);
+      this._hintSel = hint ? hint.index : null;
+      if (hint) {
+        this._labelSel = null;
+        this._labelDraft = null;
+        this._labelError = null;
+      }
+      return this._render();
+    }
     // A click (tap) on a track selects the state there, and remembers the time for "Add change".
     // A second one on the same spot adds a change there. Detected here rather than with
     // dblclick, which never fires: the first click redraws the timeline, and pointer
@@ -4530,6 +5159,26 @@ class EventSimulatorPanel extends Base {
   }
 
   /* The run or service call under the pointer on the results row. */
+  /* The hint marker nearest the pointer on the Hints row, within reach. */
+  _hintsHit(ev) {
+    const svg = this._rowAt(ev.clientX, ev.clientY);
+    const hints = this._suggestState?.result?.hints;
+    if (svg?.dataset.row !== "hints" || !hints) return null;
+    const x = ev.clientX - svg.getBoundingClientRect().left;
+    const scale = this._scale();
+    return findNearest(hints.map((h) => ({ x: scale.toX(h.at), hint: h })), x, ev.pointerType === "touch" ? 16 : 10)?.hint ?? null;
+  }
+
+  /* The fire mark nearest the pointer on the Fires row, within reach. */
+  _firesHit(ev) {
+    const svg = this._rowAt(ev.clientX, ev.clientY);
+    const view = this._suggestion(this._suggestSel);
+    if (svg?.dataset.row !== "fires" || !view) return null;
+    const x = ev.clientX - svg.getBoundingClientRect().left;
+    const scale = this._scale();
+    return findNearest(fireMarks(view, this._labels).map((m) => ({ x: scale.toX(m.t), mark: m })), x, 8)?.mark ?? null;
+  }
+
   _resultsHit(ev) {
     if (!this._result) return null;
     const svg = this._rowAt(ev.clientX, ev.clientY);
@@ -4585,6 +5234,25 @@ class EventSimulatorPanel extends Base {
       } else {
         html = `<div class="mono small">${esc(this._fullTime(t))}</div>${suggest ? `<div class="muted small">drag across a period to label it</div>` : ""}`;
       }
+    } else if (svg.dataset.row === "hints") {
+      const h = this._hintsHit(ev);
+      html = h
+        ? `<div class="mono small">${esc(this._fullTime(h.at))}</div><div><strong>${esc(HINT_KINDS[h.kind])}</strong> <span class="muted small">${Math.round(h.similarity * 100)}% alike</span></div>
+          ${h.description ? `<div class="small">${esc(h.description)}</div>` : ""}<div class="muted small">click to label it</div>`
+        : `<div class="mono small">${esc(this._fullTime(t))}</div>`;
+      overMark = !!h;
+    } else if (svg.dataset.row === "fires") {
+      const m = this._firesHit(ev);
+      const what = {
+        anchor: m?.approx ? "Hits this anchor" : "Fires on a marked anchor",
+        no_fire: "Fires inside a must-not period",
+        unlabeled: "Fires in unlabeled time",
+        inside: "Fires inside a should-fire period, away from its anchors",
+        missed: `Misses this ${m?.edge === "end" ? "end" : "start"} anchor`,
+      };
+      html = m
+        ? `<div class="mono small">${esc(this._fullTime(m.t))}</div><div><strong>${esc(what[m.kind])}</strong></div>`
+        : `<div class="mono small">${esc(this._fullTime(t))}</div>`;
     } else if (svg.dataset.row === "results") {
       const hit = this._resultsHit(ev);
       if (hit?.run) {
@@ -4661,6 +5329,17 @@ class EventSimulatorPanel extends Base {
     } else if (action === "label-delete") this._deleteLabel(this._labelSel);
     else if (action === "label-apply") this._applyLabelEditor();
     else if (action === "suggest") this._runSuggest();
+    else if (action === "sg-select") {
+      this._suggestSel = Number(el.dataset.rank);
+      this._render();
+    } else if (action === "sg-copy") this._copySuggestion(Number(el.dataset.rank));
+    else if (action === "sg-open") this._openSuggestion(Number(el.dataset.rank));
+    else if (action === "jump") this._jumpTo(Number(el.dataset.t));
+    else if (action === "hint-yes" || action === "hint-no") this._applyHint(action === "hint-yes" ? "yes" : "no");
+    else if (action === "hint-close") {
+      this._hintSel = null;
+      this._render();
+    }
     else if (action === "cfg-revert") this._revertConfig();
     else if (action === "sc-save") this._onSave(false);
     else if (action === "sc-save-as") this._onSave(true);
@@ -4703,6 +5382,7 @@ class EventSimulatorPanel extends Base {
     const id = ev.target.id;
     if (id === "automation") this._selectAutomation(ev.target.value);
     else if (id === "auto-run") this._setAutoRun(ev.target.checked);
+    else if (id === "auto-suggest") this._setAutoSuggest(ev.target.checked);
     else if (id === "lb-kind" && this._labelSel) this._updateLabel(this._labelSel, { kind: ev.target.value });
     else if (id === "lb-anchor" && this._labelSel) this._updateLabel(this._labelSel, { anchor: ev.target.value });
     else if (id === "tol-before" || id === "tol-after") this._setTolerance(id === "tol-before" ? "before" : "after", ev.target.value);
@@ -4747,6 +5427,10 @@ class EventSimulatorPanel extends Base {
     if (!path.includes(this) && origin !== document.body && origin !== document.documentElement) return;
     const typing = path.some((el) => /^(INPUT|TEXTAREA|SELECT|HA-YAML-EDITOR|HA-CODE-EDITOR)$/.test(el.tagName || "") || el.isContentEditable);
     const inEditor = ["ed-time", "ed-state", "ed-attrs", "lb-start", "lb-end", "lb-kind", "lb-anchor"].includes(origin.id);
+    if (ev.key === "Escape" && !typing && this._hintSel !== null) {
+      this._hintSel = null;
+      return this._render();
+    }
     if (ev.key === "Escape" && (!typing || inEditor) && (this._labelDraft || this._labelSel || this._labelDrag)) {
       clearTimeout(this._labelDrag?.timer);
       this._labelDrag = null;
@@ -4935,6 +5619,7 @@ class EventSimulatorPanel extends Base {
       .track-head .stale { color: var(--warning-color, #ff9800); }
       .legend-item { white-space: nowrap; }
       .legend-mark { vertical-align: -2px; margin-right: 3px; overflow: visible; }
+      #tl svg.legend-mark { display: inline-block; overflow: visible; }
       svg.track, svg.results { background: var(--secondary-background-color); border-radius: 4px; }
       .tick { stroke: var(--secondary-text-color); }
       .baseline { stroke: var(--divider-color); }
@@ -5027,6 +5712,34 @@ class EventSimulatorPanel extends Base {
       .pop-group button.primary.small-btn { padding: 4px 12px; }
       .pop-group .nofire-btn { border-color: var(--error-color, #db4437); }
       .pop-group .nofire-btn.primary { background: var(--error-color, #db4437); border-color: var(--error-color, #db4437); }
+      svg.hints, svg.fires { background: var(--secondary-background-color); border-radius: 4px; }
+      svg.hints { cursor: pointer; }
+      .hint.outside { fill: var(--secondary-text-color); }
+      .hint.recur { fill: var(--info-color, #039be5); }
+      .fm.anchor { fill: var(--success-color, #43a047); }
+      .fm.anchor.approx { fill: var(--card-background-color, #fff); stroke: var(--success-color, #43a047); stroke-width: 2; }
+      .fm.nofire { fill: var(--error-color, #db4437); }
+      .fm.unlabeled { fill: var(--secondary-text-color); opacity: .8; }
+      .fm.inside { fill: none; stroke: var(--secondary-text-color); stroke-width: 1.5; }
+      .fm.missed { fill: none; stroke: var(--success-color, #43a047); stroke-width: 1.5; stroke-dasharray: 3 2; }
+      .suggest-card h2 { margin: 0; font-size: 1.1em; font-weight: 500; }
+      .sg-top { display: flex; align-items: baseline; gap: 6px 12px; flex-wrap: wrap; margin-bottom: 10px; }
+      .sg-top .stale { color: var(--warning-color, #ff9800); }
+      .sg-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+      .sg { border: 1px solid var(--divider-color); border-left: 4px solid var(--divider-color); border-radius: 8px; padding: 10px 12px; min-width: 0; }
+      .sg.sel { border-left-color: var(--primary-color); box-shadow: 0 0 0 1px var(--primary-color) inset; }
+      .sg-head { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; }
+      .sg-rank { font-weight: 600; font-size: 1.05em; }
+      .sg-fires { margin-left: auto; }
+      .chip.on-tl { background: rgba(3,155,229,.15); color: var(--info-color, #039be5); }
+      .sg-expl { margin: 8px 0 6px; font-size: 1.02em; line-height: 1.4; }
+      .sg-stats { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 3px; font-size: 0.9em; }
+      .sg-stats .jump { font-family: var(--code-font-family, monospace); font-size: 0.95em; }
+      .sg-stats .jump.err { color: var(--error-color, #db4437); }
+      .sg-yaml { margin: 0; padding: 8px 10px; border-radius: 6px; background: var(--secondary-background-color); overflow: auto; max-height: 360px; font-size: 0.88em; white-space: pre; }
+      .sg-full { margin-top: 6px; }
+      .sg-full summary { cursor: pointer; color: var(--secondary-text-color); font-size: 0.9em; margin-bottom: 4px; }
+      .sg-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
       .label-editor.fire { border-left-color: var(--success-color, #43a047); }
       .label-editor.nofire { border-left-color: var(--error-color, #db4437); }
       @media (max-width: 600px) {

@@ -230,10 +230,13 @@ test("suggest availability comes from how the backend refuses an empty request",
 
 test("suggest events read as progress, a result, unavailable, or an error", () => {
   assert.deepEqual(suggestOutcome({ error: { code: "unknown_command", message: "Unknown command." } }), { kind: "unavailable" });
-  assert.deepEqual(suggestOutcome({ stage: "mining" }), { kind: "progress", text: "Mining…" });
-  assert.deepEqual(suggestOutcome({ stage: "validating", done: 2, total: 5 }), { kind: "progress", text: "Validating 2/5…" });
-  assert.deepEqual(suggestOutcome({ result: { suggestions: [{ config: {} }], hints: [1] } }), { kind: "done", suggestions: [{ config: {} }], hints: [1] });
-  assert.deepEqual(suggestOutcome({ suggestions: [] }), { kind: "done", suggestions: [], hints: [] });
+  assert.deepEqual(suggestOutcome({ stage: "mining" }), { kind: "progress", stage: "mining", text: "Searching for triggers and conditions…" });
+  assert.deepEqual(suggestOutcome({ stage: "validating", done: 2, total: 5 }), { kind: "progress", stage: "validating", text: "Checking the best ones in Home Assistant's sandbox 2/5…" });
+  assert.deepEqual(suggestOutcome({ stage: "pondering" }), { kind: "progress", stage: "pondering", text: "Pondering…" });
+  assert.deepEqual(suggestOutcome({ result: { suggestions: [{ config: {} }], hints: [1], evaluated: 40 } }), { kind: "done", suggestions: [{ config: {} }], hints: [1], evaluated: 40, warnings: [] });
+  assert.deepEqual(suggestOutcome({ suggestions: [] }), { kind: "done", suggestions: [], hints: [], evaluated: null, warnings: [] });
+  const fellBack = suggestOutcome({ suggestions: [], warning: { code: "validation_failed", message: "sandbox died" } });
+  assert.deepEqual(fellBack.warnings, [{ code: "validation_failed", message: "sandbox died", at: null }]);
   const err = suggestOutcome({ error: { code: "timeout", message: "slow" } });
   assert.equal(err.kind, "error");
   assert.equal(err.error.code, "timeout");
