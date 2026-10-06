@@ -15,7 +15,8 @@ How it searches (see docs/superpowers/specs/2026-10-05-suggestions-design.md):
    Triggers that hit fewer than `min_recall` of the best trigger's anchors are dropped before any condition search, and only the best `beam` go on.
    When no single trigger hits every anchor of a side, ORs of up to `max_triggers` triggers (possibly on different entities or of different kinds) join them: greedy set cover from each of the best `union_seeds` triggers, each step adding the trigger, searched again around the anchors still missed, that hits the most of them with the fewest bad fires. A trigger joins only as evidence, not chance: it hits the missed anchors more often than its fires would at random (binomial tail at `union_alpha`), and one fitted to a single moment (a clock time, a threshold, a `for:`) never joins for one anchor. The parts of an OR keep their side's trigger id, so a start/end pair stays a pair; each extra part costs as much simplicity as a condition.
 3. Conditions, greedily: from each trigger (or trigger pair), add the condition that removes the most bad fires (must-not first, then unlabeled within the labeled stretch, then beyond it) while keeping every anchor hit and every `while` period held, up to `max_conditions`, branching on the best `branch` choices at each step. Condition values come from the state at the anchor fires (and throughout `while` periods) against the state at the bad fires; numeric thresholds are the roundest number between the good and the bad values.
-4. Every candidate is scored exactly by the evaluator, deduplicated (candidates that fire at the same instants keep only the simplest), ranked by `score.rank_key` and `tie_break` (fewer options, fires closer to the anchors, fewer unlabeled fires overall) and cut to `top_k`.
+4. Every candidate is scored exactly by the evaluator, deduplicated (candidates that fire at the same instants keep only the simplest), ranked by `score.rank_key` and `tie_break` (fewer options, fires closer to the anchors, fewer unlabeled fires overall), and folded into cards: candidates of one structure (`kinds.structure`: the same parts with other thresholds, durations, offsets or clock times) are one card, the best of them its suggestion and up to `MAX_VARIANTS` more its `variants`. Cards with clock-like parts (a time of day, a weekday, the sun) then go after cards with fewer that do about as well (`score.prefer_entities`). The result is the first `top_k` cards plus, past them, the best `KIND_COVERAGE` of each trigger kind found (`kinds.candidate_kinds`), at most `MAX_CARDS`.
+   The greedy condition step (3) likewise tries a clock-like condition after an entity condition that removes nearly as many bad fires, and always keeps a place in its branch for the best entity condition.
 5. When the best suggestion still misses anchors or fires where it should not, one tracked numeric entity rising above another of the same unit (what only a template trigger expresses) is checked against the anchors; one that fits them better is named in the explanations (`Relation`), never generated.
 """
 
@@ -52,7 +53,8 @@ from .model import (
     Trigger,
     render_automation,
 )
-from .score import Stats, clock_roundness, rank_key, roundness, score_candidate, simplicity
+from .kinds import candidate_kinds, structure
+from .score import Stats, clock_parts, clock_roundness, prefer_entities, rank_key, roundness, score_candidate, simplicity
 from .timeline import NON_NUMERIC, UNAVAILABLE_STATES, StepFunction, Timeline, to_iso
 
 FRIENDLY_DURATIONS = (5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 600, 900, 1200, 1800, 2700, 3600, 5400, 7200, 10800)
@@ -71,6 +73,9 @@ MAX_CALENDAR_OFFSET = 2 * DAY  # the furthest a calendar trigger fires from its 
 RELATION_ENTITIES = 12  # numeric entities (with a unit) whose pairs are checked for a relation that needs a template trigger
 RELATION_RECALL = 0.8  # share of the anchors such a relation must hit
 # `event_data` keys in the order they are preferred when several pick out the same events (a device's id over its radio address).
+MAX_CARDS = 25  # most suggestions one result carries: they are validated in one sandbox child, which takes at most this many automations (sandbox/engine.py MAX_AUTOMATIONS)
+MAX_VARIANTS = 4  # near-duplicates folded into one card
+KIND_COVERAGE = 3  # cards of each trigger kind found that the result carries, past the top-K, so a filter by kind is never empty
 EVENT_KEYS = ("device_id", "entity_id", "tag_id", "device_ieee", "unique_id", "id", "command", "type", "subtype", "action", "event", "button")
 
 
@@ -105,6 +110,19 @@ class SuggestOptions:
 
 
 @dataclass(frozen=True, slots=True)
+class Variant:
+    """A near-duplicate of a suggestion (the same structure, other numbers: `kinds.structure`), folded into its card. Always the miner's estimate: exact validation replays only the card itself."""
+
+    candidate: Candidate
+    stats: Stats
+    config: dict[str, Any]
+    explanation: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"config": self.config, "stats": self.stats.as_dict(), "explanation": self.explanation, "exact": False}
+
+
+@dataclass(frozen=True, slots=True)
 class Suggestion:
     rank: int
     candidate: Candidate
@@ -115,9 +133,33 @@ class Suggestion:
     exact: bool | None = None
     approx_stats: Stats | None = None
     diverged: bool = False
+    variants: tuple[Variant, ...] = ()  # near-duplicates, best first
+    helpers: tuple[dict[str, Any], ...] = ()  # helpers the suggestion needs (#42)
+
+    @property
+    def kinds(self) -> list[str]:
+        return candidate_kinds(self.candidate, self._helper_entities)[0]
+
+    @property
+    def trigger_kinds(self) -> list[str]:
+        return candidate_kinds(self.candidate, self._helper_entities)[1]
+
+    @property
+    def _helper_entities(self) -> set[str]:
+        return {h["entity_id"] for h in self.helpers if h.get("entity_id")}
 
     def as_dict(self) -> dict[str, Any]:
-        out = {"rank": self.rank, "config": self.config, "stats": self.stats.as_dict(), "explanation": self.explanation}
+        kinds, trigger_kinds = candidate_kinds(self.candidate, self._helper_entities)
+        out = {
+            "rank": self.rank,
+            "config": self.config,
+            "stats": self.stats.as_dict(),
+            "explanation": self.explanation,
+            "kinds": kinds,
+            "trigger_kinds": trigger_kinds,
+            "variants": [v.as_dict() for v in self.variants],
+            "helpers": [dict(h) for h in self.helpers],
+        }
         if self.exact is not None:
             out["exact"] = self.exact
         if self.approx_stats is not None:
@@ -163,10 +205,13 @@ class SuggestResult:
     context: SearchContext | None = field(default=None, repr=False, compare=False)
 
     def as_dict(self) -> dict[str, Any]:
+        suggestions = [s.as_dict() for s in self.suggestions]
+        counts: Counter[str] = Counter(kind for s in suggestions for kind in s["kinds"])
         out: dict[str, Any] = {
-            "suggestions": [s.as_dict() for s in self.suggestions],
+            "suggestions": suggestions,
             "hints": [h.as_dict() for h in self.hints],
             "evaluated": self.evaluated,
+            "kind_counts": dict(sorted(counts.items())),
         }
         if self.warning is not None:
             out["warning"] = self.warning
@@ -1564,10 +1609,19 @@ class _Search:
                     if removed_nf + removed_near + removed_far == 0:
                         continue
                     part = Candidate((), (condition,))
-                    key = (-removed_nf, -removed_near, simplicity(part)[2], complexity(part), -removed_far)
+                    # A clock-like condition fits almost any few labels: it goes after an entity condition removing as many must-not fires and nearly as many (a fifth fewer) unlabeled ones within the labeled stretch, and after one alike in every way.
+                    clock = clock_parts(part) > 0
+                    near_credit = removed_near - removed_near // 5 if clock else removed_near
+                    key = (-removed_nf, -near_credit, simplicity(part)[2], complexity(part), -removed_far, clock)
                     options.append((key, condition, nm))
                 options.sort(key=lambda item: item[0])
-                for _, condition, nm in options[: self.options.branch]:
+                picked = options[: self.options.branch]
+                # Clock-like conditions can fill the branch with windows a quarter hour apart: keep a place for the best entity condition.
+                if picked and all(key[-1] for key, *_ in picked):
+                    entity = next((item for item in options[len(picked):] if not item[0][-1]), None)
+                    if entity is not None:
+                        picked[-1] = entity
+                for _, condition, nm in picked:
                     chosen_set = frozenset((*conditions, condition))
                     if chosen_set in seen:
                         continue
@@ -1714,6 +1768,20 @@ def _hints(search: _Search, anchors: Sequence[Anchor], suggestions: Sequence[Sug
 # Entry point
 
 
+def _with_coverage(cards: Sequence[list[_Scored]], top_k: int) -> list[list[_Scored]]:
+    """The first `top_k` cards, then, in rank order, any card of a trigger kind that has fewer than `KIND_COVERAGE` so far (so a filter by kind is never empty), at most `MAX_CARDS` in all."""
+    kept = list(cards[:top_k])
+    have: Counter[str] = Counter(kind for card in kept for kind in candidate_kinds(card[0].candidate)[1])
+    for card in cards[top_k:]:
+        if len(kept) >= MAX_CARDS:
+            break
+        trigger_kinds = candidate_kinds(card[0].candidate)[1]
+        if any(have[kind] < KIND_COVERAGE for kind in trigger_kinds):
+            kept.append(card)
+            have.update(trigger_kinds)
+    return kept[:MAX_CARDS]
+
+
 @dataclass(frozen=True, slots=True)
 class SearchContext:
     search: _Search
@@ -1769,15 +1837,21 @@ def suggest(
         scored += search.grow(base)
     check()
     scored.sort(key=lambda s: s.key)
-    kept: list[_Scored] = []
-    seen: set[tuple[Any, ...]] = set()
+    # One per set of fire instants, then near-duplicates (one structure, other numbers) folded into cards, best first.
+    # Of candidates firing at the same instants, the best placed, unless a later one has fewer clock-like parts and is no less simple (it fires alike and says why): it takes that place.
+    unique: dict[tuple[Any, ...], tuple[int, tuple[int, ...], _Scored]] = {}
     for item in scored:
-        if item.stats.anchors_hit == 0 or item.signature in seen:
+        if item.stats.anchors_hit == 0:
             continue
-        seen.add(item.signature)
-        kept.append(item)
-        if len(kept) >= options.top_k:
-            break
+        clocks, simple = clock_parts(item.candidate), simplicity(item.candidate)
+        found = unique.get(item.signature)
+        if found is None or (clocks < found[0] and simple <= found[1]):
+            unique[item.signature] = (clocks, simple, item)
+    groups: dict[tuple[Any, ...], list[_Scored]] = {}
+    for *_, item in unique.values():
+        groups.setdefault(structure(item.candidate), []).append(item)
+    cards = prefer_entities(list(groups.values()), stats=lambda g: g[0].stats, candidate=lambda g: g[0].candidate)
+    kept = _with_coverage(cards, options.top_k)
 
     edges = {a.edge for a in anchors}
     if while_only:
@@ -1790,15 +1864,19 @@ def suggest(
         words = "marked starts and ends"
     # Only when the best suggestion still misses (a cheap check, only then): a relation between two sensors the labels follow, which no single-entity trigger expresses.
     relation = None
-    if kept and not paired and (kept[0].stats.missed or kept[0].stats.no_fire_violations or kept[0].stats.outside_nearby):
+    if kept and not paired and ((best := kept[0][0].stats).missed or best.no_fire_violations or best.outside_nearby):
         check()
         relation = search.relation(anchors)
-    suggestions = []
-    for rank, item in enumerate(kept):
+    def rendered(item: _Scored) -> tuple[dict[str, Any], str]:
         explanation = explain(item.candidate, item.stats, words, relation, search.calendar_note(item.candidate, item.stats))
         alias = f"Suggested: {describe(item.candidate)[:80]}"
-        config = render_automation(item.candidate, alias=alias, description=explanation)
-        suggestions.append(Suggestion(rank, item.candidate, item.stats, config, explanation))
+        return render_automation(item.candidate, alias=alias, description=explanation), explanation
+
+    suggestions = []
+    for rank, (item, *others) in enumerate(kept):
+        config, explanation = rendered(item)
+        variants = tuple(Variant(other.candidate, other.stats, *rendered(other)) for other in others[:MAX_VARIANTS])
+        suggestions.append(Suggestion(rank, item.candidate, item.stats, config, explanation, variants=variants))
     return SuggestResult(
         suggestions, _hints(search, anchors, suggestions), search.evaluated, context=SearchContext(search, words, relation)
     )

@@ -29,6 +29,8 @@ from custom_components.event_simulator.suggest.model import (
 )
 from custom_components.event_simulator.suggest.score import score_candidate
 from custom_components.event_simulator.suggest.search import (
+    KIND_COVERAGE,
+    MAX_CARDS,
     SuggestOptions,
     clock_triggers,
     dedupe,
@@ -609,9 +611,13 @@ def test_no_should_fire_labels_means_no_suggestions():
 
 
 def test_results_are_ranked_deduped_and_capped_at_top_k():
+    """The top `top_k` cards, then only cards that cover a trigger kind with fewer than `KIND_COVERAGE` so far (tests/test_suggest_rank.py)."""
     tl, labels, sun = door_after_sunset(random.Random(1))
     result = run(tl, labels, sun=sun, top_k=5)
-    assert 1 <= len(result.suggestions) <= 5
+    assert 1 <= len(result.suggestions) <= MAX_CARDS
+    for n, suggestion in enumerate(result.suggestions[5:], start=5):
+        earlier = [s.trigger_kinds for s in result.suggestions[:n]]
+        assert any(sum(kind in kinds for kinds in earlier) < KIND_COVERAGE for kind in suggestion.trigger_kinds)
     keys = [s.rank for s in result.suggestions]
     assert keys == sorted(keys)
     signatures = [(tuple(s.stats.no_fire_violations), s.stats.outside_fires, s.stats.anchors_hit, s.stats.fires, s.explanation) for s in result.suggestions]

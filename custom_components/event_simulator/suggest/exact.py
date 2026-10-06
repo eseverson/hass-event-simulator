@@ -11,7 +11,7 @@ from typing import Any
 
 from .evaluate import Evaluator, Fire
 from .model import Candidate
-from .score import Stats, rank_key, score_fires
+from .score import Stats, prefer_entities, rank_key, score_fires
 from .search import Suggestion, SuggestResult, _hints, explain, tie_break
 from .timeline import to_ts
 
@@ -117,7 +117,7 @@ def apply_exact(
 ) -> SuggestResult:
     """`result` with each suggestion re-scored on its exact fires (`exact[n]` for `result.suggestions[n]`; None where the sandbox could not run it), re-ranked, and hints recomputed.
 
-    Order: suggestions that validated and agree with the miner, then those that diverged, then any the sandbox could not run (kept with the miner's stats, `exact: false`). Within each group, `score.rank_key` on the exact stats, then the miner's tie-breaks. Suggestions in `unchecked` were not replayed on purpose (too many runs, `plan_validation`): they keep the miner's stats, `exact: false`, and rank among the ones that agree on those stats, since nothing says they are wrong.
+    Order: suggestions that validated and agree with the miner, then those that diverged, then any the sandbox could not run (kept with the miner's stats, `exact: false`). Within each group, `score.rank_key` on the exact stats, then the miner's tie-breaks, then `score.prefer_entities`. Variants (near-duplicates folded into a card) are not replayed: they keep the miner's estimate, `exact: false`, which saves the validation budget for the cards themselves. Suggestions in `unchecked` were not replayed on purpose (too many runs, `plan_validation`): they keep the miner's stats, `exact: false`, and rank among the ones that agree on those stats, since nothing says they are wrong.
     """
     context = result.context
     if context is None or not result.suggestions:
@@ -161,6 +161,11 @@ def apply_exact(
             )
         )
     ranked.sort(key=lambda item: item[0])
-    suggestions = [replace(suggestion, rank=rank) for rank, (_, suggestion) in enumerate(ranked)]
+    # Within each group, clock-like suggestions after entity-based ones that do about as well, as the miner ranked them.
+    ordered: list[Suggestion] = []
+    for group in sorted({key[0] for key, _ in ranked}):
+        members = [suggestion for key, suggestion in ranked if key[0] == group]
+        ordered += prefer_entities(members, stats=lambda s: s.stats, candidate=lambda s: s.candidate)
+    suggestions = [replace(suggestion, rank=rank) for rank, suggestion in enumerate(ordered)]
     hints = _hints(search, labels.anchors, suggestions)
     return replace(result, suggestions=suggestions, hints=hints, warning=warning)

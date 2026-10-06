@@ -406,7 +406,7 @@ def ws_suggest_subscribe(
 ) -> None:
     """Suggest automations from labeled history, as a cancellable subscription (see `async_suggest`).
 
-    Acknowledged at once; then progress events `{stage: "loading" | "mining" | "validating", ...counts}`, and one final event: the result `{suggestions, hints, evaluated[, warning]}` or `{error: {code, message}}`. Newest wins per connection, as with `simulate/subscribe`: a newer suggest supersedes the one in flight (`superseded` error event), and unsubscribing or closing the connection stops the miner at its next check and kills the validation child.
+    Acknowledged at once; then progress events `{stage: "loading" | "mining" | "validating", ...counts}`, and one final event: the result `{suggestions, hints, evaluated, kind_counts[, warning]}` (each suggestion with `kinds`, `trigger_kinds`, `variants` and `helpers`, suggest/search.py) or `{error: {code, message}}`. Newest wins per connection, as with `simulate/subscribe`: a newer suggest supersedes the one in flight (`superseded` error event), and unsubscribing or closing the connection stops the miner at its next check and kills the validation child.
 
     Every field but `options` is required. The panel does not probe for the command (an empty request is logged as an error on every panel load); a backend without it answers `unknown_command` to the first real request.
     """

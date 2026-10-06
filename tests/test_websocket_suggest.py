@@ -6,6 +6,7 @@ End to end with the recorder: a door that opens at the same two times every day 
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -144,6 +145,12 @@ async def test_suggests_from_recorded_history_and_validates_exactly(
     assert best["config"]["description"] == best["explanation"]
     assert final["evaluated"] > 0
     assert all(s["exact"] is True for s in final["suggestions"])
+    # Kinds, folded variants (never replayed) and helpers ride along (#41).
+    assert final["kind_counts"] == dict(sorted(Counter(k for s in final["suggestions"] for k in s["kinds"]).items()))
+    for suggestion in final["suggestions"]:
+        assert suggestion["trigger_kinds"] and set(suggestion["trigger_kinds"]) <= set(suggestion["kinds"])
+        assert suggestion["helpers"] == []
+        assert all(v["exact"] is False for v in suggestion["variants"])
     # Three labels leave the other evenings to the hints ("peek outside"): fires of the top suggestions, or the door opening again.
     assert final["hints"]
 

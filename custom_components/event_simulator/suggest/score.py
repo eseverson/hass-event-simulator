@@ -1,13 +1,15 @@
 """How a candidate did on the labels, and the order suggestions are ranked in.
 
 Every fire is sorted into one bucket (see `Labels.classify`): matching an anchor, inside a must-not period (a hard failure), inside a should-fire period away from its anchors (neutral), or in unlabeled time (soft evidence against, and listed so the user can label it). The ranking follows the spec: anchor recall first (all anchors hit beats most), then `while` periods held, then fires inside must-not periods, then fires in unlabeled time within the labeled stretch, then simplicity (fewer conditions, no `for:`, round thresholds and times), then unlabeled fires beyond the stretch.
+
+Clock-like parts come last among near equals (#41): a time of day, a weekday or the sun fits almost any few labels, and says when rather than why. After the ranking, `prefer_entities` moves a candidate with fewer clock-like parts above one with more that it does `about_as_good` as. A clock time that nothing else explains about as well keeps its place.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 from .evaluate import Evaluator, Fire
 from .labels import Anchor, Labels
@@ -182,3 +184,59 @@ def rank_key(stats: Stats, candidate: Candidate) -> tuple[Any, ...]:
         stats.outside_nearby,
         simplicity(candidate),
     )
+
+
+SUN_ENTITIES = ("sun.sun", "sensor.sun_")  # the sun integration's entity and its sensors (next rising, next noon, ...): they move with the sun
+
+
+def _follows_the_sun(part: Any) -> bool:
+    entity_id = getattr(part, "entity_id", None)
+    return isinstance(entity_id, str) and (entity_id == SUN_ENTITIES[0] or entity_id.startswith(SUN_ENTITIES[1]))
+
+
+def clock_parts(candidate: Candidate) -> int:
+    """Clock-like triggers and conditions: a time of day, a weekday, the sun (which moves like a clock), or a part on the sun integration's entities (`sun.sun` above the horizon is sunrise). A time at any other entity and a calendar's events are not: they name what the time comes from."""
+    return sum(
+        isinstance(part, (TimeTrigger, TimeCondition, SunTrigger, SunCondition)) or _follows_the_sun(part)
+        for part in (*candidate.triggers, *candidate.conditions)
+    )
+
+
+def about_as_good(stats: Stats, clock: Stats) -> bool:
+    """Whether a candidate with these `stats` explains the labels about as well as one with `clock`'s, so it may rank above it for having fewer clock-like parts.
+
+    About as well: it hits as many anchors, or one fewer when there are ten or more (90 % of them); holds as many `while` periods; and fires no more often in must-not periods, nor in unlabeled time within the labeled stretch, and at most once more in unlabeled time overall (a camera's motion that happens to meet a sunrise label, and fires on a few more mornings, does not outrank the sunrise).
+    """
+    short = 1 if stats.anchors_total >= 10 else 0
+    return (
+        stats.anchors_hit >= clock.anchors_hit - short
+        and stats.while_held >= clock.while_held
+        and len(stats.no_fire_violations) <= len(clock.no_fire_violations)
+        and stats.outside_nearby <= clock.outside_nearby
+        and len(stats.outside_fires) <= len(clock.outside_fires) + 1
+    )
+
+
+T = TypeVar("T")
+PREFER_WINDOW = 200  # how far down a ranked list `prefer_entities` looks for a candidate to move up
+
+
+def prefer_entities(items: Sequence[T], *, stats: Callable[[T], Stats], candidate: Callable[[T], Candidate]) -> list[T]:
+    """`items` (ranked best first) with clock-like candidates after those with fewer clock-like parts that do `about_as_good`.
+
+    Greedy: the next item out is the first left, unless it has clock-like parts and one further down (within `PREFER_WINDOW`) with fewer does about as well and is no less simple (`simplicity`: no more conditions or extra triggers, `for:` options, or rough numbers; an entity part in place of a clock part, not two, and not "below 52.3" for "before 03:00"); then the first such goes out and the clock-like one is looked at again.
+    """
+    left = [(item, clock_parts(c := candidate(item)), simplicity(c)) for item in items]
+    out: list[T] = []
+    while left:
+        first, clocks, parts = left[0]
+        chosen = 0
+        if clocks:
+            first_stats = stats(first)
+            for n in range(1, min(len(left), PREFER_WINDOW)):
+                item, fewer, size = left[n]
+                if fewer < clocks and size <= parts and about_as_good(stats(item), first_stats):
+                    chosen = n
+                    break
+        out.append(left.pop(chosen)[0])
+    return out
