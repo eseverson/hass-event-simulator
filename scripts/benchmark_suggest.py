@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import bisect
+import concurrent.futures
 import json
 import re
 import shutil
@@ -512,11 +513,22 @@ def main() -> None:
         report = asyncio.run(sweep(args, config, port))
     finally:
         if not args.keep and created:
-            shutil.rmtree(work, ignore_errors=True)
-    args.out.write_text(json.dumps(report, indent=1, default=str))
-    if args.md:
-        args.md.write_text(markdown(report))
-    print(markdown(report).split("\n\n")[0])
+            _off_main_thread(lambda: shutil.rmtree(work, ignore_errors=True))
+    summary = markdown(report)
+
+    def write() -> None:
+        args.out.write_text(json.dumps(report, indent=1, default=str))
+        if args.md:
+            args.md.write_text(summary)
+
+    _off_main_thread(write)
+    print(summary.split("\n\n")[0])
+
+
+def _off_main_thread(job: Any) -> Any:
+    """Run `job` in a worker thread. Home Assistant's blocking-call detection, installed on this thread when it booted, stays after it stops: file I/O here would be logged as blocking the event loop, with the whole text written and a traceback (#46)."""
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        return pool.submit(job).result()
 
 
 if __name__ == "__main__":
