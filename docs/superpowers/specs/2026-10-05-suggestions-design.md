@@ -33,6 +33,8 @@ Two stages, so the search is fast and the answer is exact.
      - `numeric_state` — `above`/`below` crossings near anchors; the threshold is searched over observed values to maximize anchor hits and minimize fires elsewhere; `for:` as above.
      - `time` — when anchors cluster by clock time.
      - `sun` — `sunrise`/`sunset` with offset, when anchors cluster by sun event better than by clock.
+     - any change (#34) — a `state` trigger with no from/to on a numeric sensor or attribute (the blueprint controllers' "re-evaluate on every report"), when the anchors land on its reports more often than chance.
+     - OR of triggers (#33) — when no single trigger hits every anchor (of a side), up to 3 triggers on any entities and of any kinds, by greedy set cover over the anchors; a trigger joins only when it hits the missed anchors more often than chance, and each extra one costs as much simplicity as a condition. The parts keep their side's trigger id.
    - **Conditions** (to remove fires outside / inside must-not): `state` and `numeric_state` at fire time, `time` window (`after`/`before`), weekday, `sun` before/after. Greedy: start from each trigger, add the condition that removes the most bad fires while keeping all (or the most) anchor hits, up to N (default 2) conditions.
    - **Score**: anchor recall first (all anchors hit beats most), then fires inside must-not periods (hard), then fires in unlabeled time (soft), then simplicity (fewer conditions, round thresholds, no `for:`).
    - **Output**: top-K candidates as automation configs (`triggers`/`conditions` + placeholder action `logbook.log`-style no-op the user replaces), with approximate stats.
