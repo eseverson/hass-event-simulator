@@ -16,6 +16,7 @@ import {
   suggestionView,
   toYaml,
   triggerYaml,
+  warningLabel,
 } from "../../custom_components/event_simulator/panel/event-simulator-panel.js";
 
 const T0 = Date.parse("2026-10-04T00:00:00Z");
@@ -252,4 +253,10 @@ test("ranks count from 0 on the wire and from #1 on the cards, hints' references
   assert.equal(suggestionView({ rank: 0 }, 3).rank, 1, "the sent rank wins over the position");
   assert.deepEqual(hintView(RESULT.hints[0]).suggestions, [1]);
   assert.deepEqual(hintView({ at: iso(H), suggestions: [2, 0, "x"] }).suggestions, [3, 1]);
+});
+
+test("the suggest check's warnings have their own headings", () => {
+  // websocket.py: the sandbox could not check any suggestion, or only some of them.
+  assert.equal(warningLabel("validation_failed"), "The sandbox could not check the suggestions");
+  assert.equal(warningLabel("partly_validated"), "Some suggestions were not checked in the sandbox");
 });

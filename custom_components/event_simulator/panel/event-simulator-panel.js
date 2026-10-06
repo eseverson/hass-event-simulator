@@ -399,6 +399,9 @@ export const WARNING_LABELS = {
   unknown_service: "Service calls to services this instance does not have",
   log: "Home Assistant logged warnings or errors",
   log_truncated: "More log messages were left out",
+  // suggest/subscribe's own (websocket.py): the exact check of the suggestions.
+  validation_failed: "The sandbox could not check the suggestions",
+  partly_validated: "Some suggestions were not checked in the sandbox",
 };
 
 /* A heading for a warning code nobody listed: `some_code` -> "Some code". */
@@ -3808,7 +3811,7 @@ class EventSimulatorPanel extends Base {
     const stale = !st?.running && st?.stale && result ? `<span class="stale small">the inputs changed since these were suggested</span>` : "";
     const head = `<div class="sg-top"><h2>Suggestions</h2>${result?.evaluated ? `<span class="muted small">best of ${result.evaluated} candidate${result.evaluated === 1 ? "" : "s"}</span>` : ""}${running}${stale}</div>`;
     const error = st?.error ? `<div class="alert error" role="alert"><div><strong>${esc(st.error.title)}</strong>: ${esc(st.error.message)}</div></div>` : "";
-    const warnings = result?.warnings?.length ? this._warningsHtml(result.warnings) : "";
+    const warnings = result?.warnings?.length ? this._warningsHtml(result.warnings, "checking the suggestions") : "";
     const body = empty
       ? `<div class="empty sg-empty" data-empty="${empty.kind}">${esc(empty.text)}</div>`
       : `<ol class="sg-list">${result.suggestions.map((v) => this._suggestionHtml(v)).join("")}</ol>`;
@@ -4116,7 +4119,7 @@ class EventSimulatorPanel extends Base {
   }
 
   /* Result warnings, grouped by code, each with the virtual time it happened at. */
-  _warningsHtml(warnings) {
+  _warningsHtml(warnings, source = "the replay") {
     if (!warnings.length) return "";
     const LIMIT = 50;
     const groups = groupWarnings(warnings)
@@ -4133,7 +4136,7 @@ class EventSimulatorPanel extends Base {
           </details>`;
       })
       .join("");
-    return `<div class="alert warning"><div class="alert-body"><strong>${warnings.length} warning${warnings.length === 1 ? "" : "s"} from the replay</strong>${groups}</div></div>`;
+    return `<div class="alert warning"><div class="alert-body"><strong>${warnings.length} warning${warnings.length === 1 ? "" : "s"} from ${esc(source)}</strong>${groups}</div></div>`;
   }
 
   /* The inline editor for the selected event (or initial state) of a track. */
