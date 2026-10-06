@@ -719,6 +719,10 @@ def _walk(node: Any, path: str) -> Any:
             yield from _walk(value, f"{path}/{index}")
 
 
+async def _skip_dump() -> None:
+    """Stands in for `RestoreStateData.async_dump_states` in the sandbox: its config dir is thrown away."""
+
+
 def _warning(code: str, message: str, at: datetime | None = None) -> dict[str, Any]:
     return {"code": code, "message": message, "at": None if at is None else at.isoformat()}
 
@@ -974,6 +978,8 @@ class _Replay:
         await self._enable_preview_features(hass)
         await hass.async_start()
         await hass.async_block_till_done()
+        # Restore state is saved every 15 minutes (virtual), for a restart that never comes: thousands of file writes over a month, each an executor round trip.
+        restore_state.async_get(hass).async_dump_states = _skip_dump
 
     async def _enable_preview_features(self, hass: HomeAssistant) -> None:
         """Set up `labs` (live HA always has it) and turn on the scenario's preview features, before the automation is validated."""
@@ -1218,6 +1224,8 @@ class _Replay:
 def _run_record(trace: Any, traces: str = DEFAULT_TRACES) -> dict[str, Any]:
     """One run of the result from an automation trace, carrying what `traces` asks for."""
     short = trace.as_short_dict()
+    if traces == "none":
+        return _bare_run_record(trace, short)
     execution = short.get("script_execution")
     error = short.get("error")
     extended: dict[str, Any] | None = None
@@ -1226,18 +1234,78 @@ def _run_record(trace: Any, traces: str = DEFAULT_TRACES) -> dict[str, Any]:
         steps: dict[str, list[dict[str, Any]]] = extended.get("trace") or {}
     else:
         steps = _trigger_and_condition_steps(trace)
-    last_step = short.get("last_step")
 
+    outcome, stopped_by = _outcome(short)
+    if outcome == "not_triggered":
+        stopped_by = _not_triggered_reason(steps)
+    elif outcome == "condition_failed":
+        stopped_by = _failed_condition(steps)
+
+    timestamps = short.get("timestamp") or {}
+    finished = timestamps.get("finish") if outcome != "unfinished" else None
+    trigger = _trigger_summary(steps, short.get("trigger"))
+    record = {
+        "id": trace.run_id,
+        "started": timestamps.get("start"),
+        "finished": finished,
+        "trigger": trigger,
+        "outcome": outcome,
+        "stopped_by": stopped_by,
+        "script_execution": execution,
+        "error": error,
+    }
+    if extended is not None:
+        record["trace"] = extended
+    else:
+        record["conditions"] = {
+            path: (elements[-1].get("result") or {}).get("result") for path, elements in steps.items() if path.startswith("condition/") and path.count("/") == 1 and elements
+        }
+    return record
+
+
+def _bare_run_record(trace: Any, short: dict[str, Any]) -> dict[str, Any]:
+    """A run under `traces: none`: when, how it ended and which trigger, read straight off the trace without serializing any step (a month of a chatty trigger is hundreds of thousands of these)."""
+    outcome, _ = _outcome(short)
+    timestamps = short.get("timestamp") or {}
+    trigger = _first_trigger_variables(trace)
+    return {
+        "id": trace.run_id,
+        "started": timestamps.get("start"),
+        "finished": timestamps.get("finish") if outcome != "unfinished" else None,
+        "outcome": outcome,
+        "trigger": {"idx": trigger.get("idx"), "id": trigger.get("id")},
+    }
+
+
+def _first_trigger_variables(trace: Any) -> dict[str, Any]:
+    """The `trigger` variable the run started with (from its trigger step), as `_trigger_summary` reads it."""
+    elements = getattr(trace, "_trace", None)
+    if not isinstance(elements, dict):
+        return _trigger_variables(_trigger_and_condition_steps(trace))
+    for path, steps in elements.items():
+        if path == "trigger" or path.startswith("trigger/"):
+            if not steps:
+                return {}
+            variables = getattr(steps[0], "_variables", None)
+            if not isinstance(variables, dict):
+                variables = steps[0].as_dict().get("changed_variables") or {}
+            return variables.get("trigger") or {}
+    return {}
+
+
+def _outcome(short: dict[str, Any]) -> tuple[str, str | None]:
+    """The run's outcome and what stopped it, from the trace's short dict (the step that stopped a `not_triggered` or `condition_failed` run is left to the caller, which has the steps)."""
+    execution = short.get("script_execution")
+    error = short.get("error")
+    last_step = short.get("last_step")
     stopped_by: str | None = None
     if short.get("state") == "running":
         outcome = "unfinished"
     elif execution == "not_triggered":
         # HA 2026.9+: a trigger evaluated a change but did not fire; its step's result says why.
         outcome = "not_triggered"
-        stopped_by = _not_triggered_reason(steps)
     elif execution == "failed_conditions":
         outcome = "condition_failed"
-        stopped_by = _failed_condition(steps)
     elif execution in ("failed_single", "failed_max_runs", "disallowed_recursion_detected"):
         outcome = "dropped"
         stopped_by = {"failed_single": "mode_single", "failed_max_runs": "max_runs"}.get(execution, "recursion")
@@ -1260,29 +1328,7 @@ def _run_record(trace: Any, traces: str = DEFAULT_TRACES) -> dict[str, Any]:
     else:
         outcome = "error"
         stopped_by = last_step
-
-    timestamps = short.get("timestamp") or {}
-    finished = timestamps.get("finish") if outcome != "unfinished" else None
-    trigger = _trigger_summary(steps, short.get("trigger"))
-    if traces == "none":
-        return {"id": trace.run_id, "started": timestamps.get("start"), "finished": finished, "outcome": outcome, "trigger": {"idx": trigger["idx"], "id": trigger["id"]}}
-    record = {
-        "id": trace.run_id,
-        "started": timestamps.get("start"),
-        "finished": finished,
-        "trigger": trigger,
-        "outcome": outcome,
-        "stopped_by": stopped_by,
-        "script_execution": execution,
-        "error": error,
-    }
-    if extended is not None:
-        record["trace"] = extended
-    else:
-        record["conditions"] = {
-            path: (elements[-1].get("result") or {}).get("result") for path, elements in steps.items() if path.startswith("condition/") and path.count("/") == 1 and elements
-        }
-    return record
+    return outcome, stopped_by
 
 
 def _trigger_and_condition_steps(trace: Any) -> dict[str, list[dict[str, Any]]]:
@@ -1322,12 +1368,7 @@ def _failed_condition(steps: dict[str, list[dict[str, Any]]]) -> str | None:
 
 def _trigger_summary(steps: dict[str, list[dict[str, Any]]], description: str | None) -> dict[str, Any]:
     """The firing trigger's essentials; the full trigger variables stay in the trace."""
-    trigger: dict[str, Any] = {}
-    for path, elements in steps.items():
-        if path == "trigger" or path.startswith("trigger/"):
-            if elements:
-                trigger = (elements[0].get("changed_variables") or {}).get("trigger") or {}
-            break
+    trigger = _trigger_variables(steps)
     summary = {
         "idx": trigger.get("idx"),
         "id": trigger.get("id"),
@@ -1340,6 +1381,14 @@ def _trigger_summary(steps: dict[str, list[dict[str, Any]]], description: str | 
         state = trigger.get(key)
         summary[key] = getattr(state, "state", None) if state is not None and not isinstance(state, dict) else (state or {}).get("state")
     return summary
+
+
+def _trigger_variables(steps: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    """The `trigger` variable of the first trigger step, from serialized steps."""
+    for path, elements in steps.items():
+        if path == "trigger" or path.startswith("trigger/"):
+            return ((elements[0].get("changed_variables") or {}).get("trigger") or {}) if elements else {}
+    return {}
 
 
 def _json_safe(value: Any) -> Any:
