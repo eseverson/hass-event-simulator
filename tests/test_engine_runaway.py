@@ -1,6 +1,6 @@
 """#30: a replay whose runs keep going without virtual time moving on ends, with the runs so far and a warning saying why.
 
-An automation that re-triggers itself (it fires an event, or makes a service call, its own trigger listens for) starts run after run at one virtual instant: recorded service calls take no time, so nothing ever lets the clock move. Live Home Assistant would loop too, but the replay must end and explain. The engine turns such an automation off after `MAX_RUNS_PER_INSTANT` runs at one instant (`runaway_loop`), and a wall-clock watchdog stops a replay that still runs at `time_limit_seconds` (`time_limit`), even one stuck in code that never yields to the loop.
+An automation that re-triggers itself (it fires an event, or makes a service call, its own trigger listens for) can start run after run at one virtual instant: recorded service calls take no virtual time, so nothing ever lets the clock move. Where live Home Assistant loops too (`queued`, `restart`, or no call left in flight when the next run starts), the replay must end and explain. Where it ends the loop itself (`single` and `parallel` meet their re-triggered run while it waits on a device call, see test_engine_interleave.py), so does the replay. The engine turns such an automation off after `MAX_RUNS_PER_INSTANT` runs at one instant (`runaway_loop`), and a wall-clock watchdog stops a replay that still runs at `time_limit_seconds` (`time_limit`), even one stuck in code that never yields to the loop.
 
 Same harness as test_engine.py: every scenario runs through a real child process.
 """
@@ -23,6 +23,8 @@ WINDOW = "2026-10-04T{}:00+00:00"
 DOOR = "binary_sensor.door"
 OWN = "automation.fidelity"
 LIGHT = {"action": "light.turn_on", "target": {"entity_id": "light.hall"}}
+# A call whose live handler never suspends, so the run never yields to the loop on it.
+HELPER = {"action": "input_boolean.turn_on", "target": {"entity_id": "input_boolean.hall"}}
 PING = {"event": "ping"}
 OPENED = {"trigger": "state", "entity_id": DOOR, "to": "on"}
 PINGED = {"trigger": "event", "event_type": "ping"}
@@ -54,6 +56,7 @@ SCENARIOS: dict[str, Any] = {
     ),
     # Its own recorded `on` at 02:30 would switch it back on; a runaway automation stays off.
     "own_entity_on": lambda: looping(
+        "queued",
         initial_states={DOOR: {"state": "off"}, OWN: {"state": "on"}},
         events=sorted(
             [*toggles(DOOR, "01:00", "03:00"), {"at": WINDOW.format("02:00"), "entity_id": OWN, "state": "off"}, {"at": WINDOW.format("02:30"), "entity_id": OWN, "state": "on"}],
@@ -64,7 +67,7 @@ SCENARIOS: dict[str, Any] = {
         **multi(
             [
                 {"alias": "Door light", "triggers": [OPENED], "actions": [LIGHT]},
-                {"alias": "Ping loop", "triggers": [OPENED, PINGED], "actions": [PING, LIGHT]},
+                {"alias": "Ping loop", "mode": "queued", "triggers": [OPENED, PINGED], "actions": [PING, LIGHT]},
             ],
             initial_states={DOOR: {"state": "off"}},
             events=toggles(DOOR, "01:00", "03:00"),
@@ -81,9 +84,9 @@ SCENARIOS: dict[str, Any] = {
         "traces": "none",
         "time_limit_seconds": 3,
     },
-    # A run that never yields to the event loop (Home Assistant puts no cap on a repeat count, and a recorded call takes no time): only the watchdog's hard stop reaches it. Started by a time trigger: inside a state change's dispatch, HA 2026.9 would end it itself once it had queued 10000 events.
+    # A run that never yields to the event loop (Home Assistant puts no cap on a repeat count, and a helper's call never suspends): only the watchdog's hard stop reaches it. Started by a time trigger: inside a state change's dispatch, HA 2026.9 would end it itself once it had queued 10000 events.
     "time_limit_stuck": lambda: {
-        **looping(triggers=[{"trigger": "time", "at": "01:00:00"}], actions=[{"repeat": {"count": 100_000_000, "sequence": [LIGHT]}}]),
+        **looping(triggers=[{"trigger": "time", "at": "01:00:00"}], actions=[{"repeat": {"count": 100_000_000, "sequence": [HELPER]}}]),
         "time_limit_seconds": 3,
     },
 }
@@ -107,7 +110,7 @@ def warnings_of(result: dict[str, Any], code: str) -> list[dict[str, Any]]:
     return [warning for warning in result["warnings"] if warning["code"] == code]
 
 
-@pytest.mark.parametrize("name", ["event_single", "event_queued", "event_restart", "event_parallel", "event_only", "service_call"])
+@pytest.mark.parametrize("name", ["event_queued", "event_restart", "event_only", "service_call"])
 def test_a_self_triggering_automation_is_stopped_at_the_instant_it_loops(results, name):
     elapsed, result = results[name]
     assert elapsed < QUICK
@@ -120,6 +123,15 @@ def test_a_self_triggering_automation_is_stopped_at_the_instant_it_loops(results
     assert started == {at("01:00")}
     assert MAX_RUNS_PER_INSTANT <= len(result["runs"]) <= MAX_RUNS_PER_INSTANT + 5
     assert result["runs"][0]["trigger"]["idx"] == "0"
+
+
+@pytest.mark.parametrize(("name", "running"), [("event_single", 1), ("event_parallel", 10)])
+def test_single_and_parallel_end_their_own_loop_as_live(results, name, running):
+    """Each run fires `ping` and then waits on its light call: the run `ping` starts finds the caller still in flight. `single` drops it at once; `parallel` drops the one past its `max` (10). Nothing re-triggers after a dropped run, so the loop ends there, at each door opening."""
+    _, result = results[name]
+    assert not warnings_of(result, "runaway_loop")
+    expected = [*[(at("01:00"), "fired")] * running, (at("01:00"), "dropped"), *[(at("03:00"), "fired")] * running, (at("03:00"), "dropped")]
+    assert [(ts(run["started"]), run["outcome"]) for run in result["runs"]] == expected
 
 
 def test_a_runaway_automation_is_not_switched_back_on_by_its_own_track(results):

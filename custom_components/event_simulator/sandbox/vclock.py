@@ -4,7 +4,7 @@ Standard library only; Home Assistant is imported lazily inside `patch_homeassis
 
 How time works here
 -------------------
-`VirtualTimeEventLoop.time()` returns a virtual clock that never moves on its own. Each loop iteration the stock asyncio machinery asks the selector to wait until the next timer is due; our selector first polls real I/O without blocking, and if nothing is ready it jumps virtual time straight to the earliest scheduled `TimerHandle` instead of sleeping. Timers therefore fire in order, at exactly their scheduled virtual time, and a day of timers takes milliseconds. `call_soon` callbacks run before any jump, so interleaving is unchanged.
+`VirtualTimeEventLoop.time()` returns a virtual clock that never moves on its own. Each loop iteration the stock asyncio machinery asks the selector to wait until the next timer is due; our selector first polls real I/O without blocking, and if nothing is ready it jumps virtual time straight to the earliest scheduled `TimerHandle` instead of sleeping. Timers therefore fire in order, at exactly their scheduled virtual time, and a day of timers takes milliseconds. `call_soon` callbacks run before any jump, so interleaving is unchanged. `when_idle()` futures are resolved at that point instead of a jump, while time stands still: an awaiter resumes once everything else due at this instant has run.
 
 Real work is never skipped over: while a job submitted through `loop.run_in_executor` (which is how `hass.async_add_executor_job` and the import executor dispatch) is outstanding, the selector blocks on real I/O until the job's completion wakes the loop. Virtual time stands still meanwhile, so executor work takes zero virtual time and the replay stays deterministic. Registered sockets/pipes do not hold time back (they are polled every iteration but may be idle forever); a thread that calls `call_soon_threadsafe` unprompted lands at whatever virtual time the loop has reached. With nothing scheduled and nothing outstanding the loop blocks on real I/O exactly like a stock loop.
 
@@ -71,12 +71,15 @@ class _VirtualSelector(selectors.DefaultSelector):
         loop = self.loop
         if loop is None or (timeout is not None and timeout <= 0):
             return super().select(timeout)
-        if timeout is None or loop.pending_real_work:
-            # Nothing scheduled, or an executor job is in flight: wait for real I/O. A finished job wakes us through the loop's self-pipe; virtual time stands still meanwhile.
+        if loop.pending_real_work:
+            # An executor job is in flight: wait for real I/O. A finished job wakes us through the loop's self-pipe; virtual time stands still meanwhile.
             return super().select(None)
         ready = super().select(0)
-        if ready:
+        if ready or loop._release_idle_waiters():
             return ready
+        if timeout is None:
+            # Nothing scheduled: wait for real I/O, as a stock loop does.
+            return super().select(None)
         loop._jump(timeout)
         return []
 
@@ -93,6 +96,7 @@ class VirtualTimeEventLoop(asyncio.SelectorEventLoop):
         self._real_work = 0
         self._real_work_lock = threading.Lock()
         self._vt_default_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._idle_waiters: list[asyncio.Future[None]] = []
 
     def time(self) -> float:
         """Return the current virtual time."""
@@ -102,6 +106,25 @@ class VirtualTimeEventLoop(asyncio.SelectorEventLoop):
     def pending_real_work(self) -> int:
         """Number of executor jobs submitted through this loop and not yet finished."""
         return self._real_work
+
+    def when_idle(self) -> asyncio.Future[None]:
+        """A future resolved once nothing else is left to run at the current virtual instant, just before time would move on (or the loop would wait on real I/O).
+
+        Stands in for a short real wait, such as a device's I/O round trip: everything already started at this instant gets to run first, and no virtual time passes.
+        """
+        future = self.create_future()
+        self._idle_waiters.append(future)
+        return future
+
+    def _release_idle_waiters(self) -> bool:
+        """Resolve the futures waiting for this instant to go idle; true if that scheduled anything to run."""
+        waiters, self._idle_waiters = self._idle_waiters, []
+        released = False
+        for future in waiters:
+            if not future.done():
+                future.set_result(None)
+                released = True
+        return released
 
     def _jump(self, timeout: float) -> None:
         """Advance virtual time to the earliest scheduled timer (or by `timeout`)."""

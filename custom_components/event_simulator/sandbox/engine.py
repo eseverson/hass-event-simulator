@@ -13,7 +13,7 @@ Timeline of a replay (all virtual time, see `vclock.py`)
 
 Runs that never let time move on
 --------------------------------
-Recorded service calls take no time, so an automation that re-triggers itself (it fires an event, or makes a service call, that one of its own triggers listens for) starts run after run at one virtual instant and the clock never moves again. Live Home Assistant would loop too, so the replay ends it and says so: an automation that starts `MAX_RUNS_PER_INSTANT` runs at one instant is turned off there, as `automation.turn_off` would (its runs in flight are stopped and its own recorded `on` no longer turns it back on), with a `runaway_loop` warning naming it, the instant and the count; its runs so far are kept and the rest of the scenario replays on. Independently, a wall-clock watchdog (scenario `time_limit_seconds`, default `DEFAULT_TIME_LIMIT`; the runner sets it under its own timeout) ends a replay still going at the limit, wherever virtual time stands: the window ends there, runs in flight are stopped, and a `time_limit` warning names each automation still running. A run stuck in code that never yields to the loop (a huge `repeat: count`) is cancelled to get there (see `_Watchdog`). Both are answers with the runs so far, not errors. `repeat: while` / `until` without a delay need neither: Home Assistant itself aborts them after 10000 iterations.
+Recorded service calls take no virtual time, so an automation that re-triggers itself (it fires an event, or makes a service call, that one of its own triggers listens for) can start run after run at one virtual instant and the clock never moves again. Where live Home Assistant stops such a loop itself the replay does too: a recorded call suspends its run as a live device call does (see `RecordingServiceRegistry`), so in `mode: single` the re-triggered run meets the first still running and is dropped. Where live Home Assistant would loop without end (`queued`, `restart`, or a run that re-triggers itself after its last call), the replay ends it and says so: an automation that starts `MAX_RUNS_PER_INSTANT` runs at one instant is turned off there, as `automation.turn_off` would (its runs in flight are stopped and its own recorded `on` no longer turns it back on), with a `runaway_loop` warning naming it, the instant and the count; its runs so far are kept and the rest of the scenario replays on. Independently, a wall-clock watchdog (scenario `time_limit_seconds`, default `DEFAULT_TIME_LIMIT`; the runner sets it under its own timeout) ends a replay still going at the limit, wherever virtual time stands: the window ends there, runs in flight are stopped, and a `time_limit` warning names each automation still running. A run stuck in code that never yields to the loop (a huge `repeat: count`) is cancelled to get there (see `_Watchdog`). Both are answers with the runs so far, not errors. `repeat: while` / `until` without a delay need neither: Home Assistant itself aborts them after 10000 iterations.
 
 Runs are read from HA's own automation traces (captured as `trace_automation` stores them, so the stored-traces limit never drops one) and serialized with `as_extended_dict()`.
 
@@ -142,6 +142,11 @@ MAX_REGISTRY_ITEMS = 10_000
 _GENERIC_DEVICE_AUTOMATION_TYPE = "entity"
 # Services that act on an automation entity; an automation calling one on itself gets a warning, since the call is only recorded.
 _SELF_SERVICES = frozenset({"turn_on", "turn_off", "toggle", "trigger"})
+# Services whose live handlers finish without ever suspending (they only change in-memory state), measured on Home Assistant 2026.2.3 and 2026.9.4: an automation calling one runs straight on. Every other call (a device's, which waits on I/O; `scene` / `homeassistant.*`, which call those; a script run) suspends its run until the answer comes back, so the recorded call waits too (see `RecordingServiceRegistry.async_call`).
+_INSTANT_DOMAINS = frozenset(
+    {"input_boolean", "input_button", "input_datetime", "input_number", "input_select", "input_text", "counter", "timer", "group", "persistent_notification", "logbook", "system_log"}
+)
+_INSTANT_SERVICES = frozenset({"automation.turn_on", "automation.turn_off", "automation.toggle", "automation.trigger", "script.turn_on", "notify.persistent_notification"})
 # Config keys never searched for triggers/conditions: service-call payloads and variables.
 _PAYLOAD_KEYS = frozenset({"data", "data_template", "target", "variables", "event_data", "event_data_template", "response_variable", "metadata", "for_each"})
 
@@ -1169,7 +1174,8 @@ def _run_record(trace: Any, traces: str = DEFAULT_TRACES) -> dict[str, Any]:
     elif execution == "aborted":
         outcome = "aborted"
         stopped_by = last_step
-    elif execution == "cancelled":
+    elif execution == "cancelled" or (execution is None and error is None):
+        # A run stopped while it waits on a service call (`restart`, turned off) ends with no `script_execution` at all; one stopped between steps or in a delay says `cancelled`.
         outcome = "cancelled"
         stopped_by = last_step
     elif execution == "finished":
@@ -1275,6 +1281,8 @@ class RecordingServiceRegistry(ServiceRegistry):
     """Service registry that records calls instead of executing them.
 
     Until `intercepting` is set (once the automation under test is loaded) it behaves like the stock registry, so boot is unchanged. After that every service exists, every call is recorded and answered with success (an empty dict when a response is requested), and `call_service` is still fired on the bus so event triggers on it behave.
+
+    A blocking call, after firing `call_service`, waits as a live call to a device does for its I/O round trip: until nothing else is left to run at this virtual instant (`VirtualTimeEventLoop.when_idle`; no virtual time passes). Services whose live handler never suspends (`_INSTANT_DOMAINS` / `_INSTANT_SERVICES`) answer at once. The calling run is thus still in flight while everything already started at this instant runs: a run its own `event` step or `call_service` re-triggered, or the next of several changes recorded at one instant, meets it running, so `mode: single` drops that run (`failed_single`), `restart` stops the caller and `max` runs fill up, as they do live.
     """
 
     __slots__ = ("_on_call", "intercepting")
@@ -1315,4 +1323,7 @@ class RecordingServiceRegistry(ServiceRegistry):
             {ATTR_DOMAIN: domain, ATTR_SERVICE: service, ATTR_SERVICE_DATA: {**data, **(target or {})}},
             context=context,
         )
+        if blocking and domain not in _INSTANT_DOMAINS and f"{domain}.{service}" not in _INSTANT_SERVICES:
+            when_idle = getattr(self._hass.loop, "when_idle", None)
+            await (when_idle() if when_idle is not None else asyncio.sleep(0))
         return {} if return_response else None

@@ -43,6 +43,41 @@ def test_long_sleep_completes_instantly_in_wall_time(loop):
     assert time.monotonic() - wall < 0.5
 
 
+def test_when_idle_resumes_after_everything_due_now_and_before_time_moves(loop):
+    """#31: what a recorded device call waits on: every callback chain already going at this instant runs first, then the waiter, and only then the next timer."""
+    order = []
+
+    async def chain(name, steps):
+        for step in range(steps):
+            order.append((name, step, loop.time()))
+            await asyncio.sleep(0)
+
+    async def waiter():
+        await loop.when_idle()
+        order.append(("idle", 0, loop.time()))
+
+    async def main():
+        loop.call_later(1, order.append, ("timer", 0, START + 1))
+        tasks = [loop.create_task(waiter()), loop.create_task(chain("a", 3)), loop.create_task(chain("b", 2))]
+        await asyncio.gather(*tasks)
+        await asyncio.sleep(2)
+
+    loop.run_until_complete(main())
+    assert order[-2:] == [("idle", 0, START), ("timer", 0, START + 1)]
+    assert sorted(order[:-2]) == [("a", 0, START), ("a", 1, START), ("a", 2, START), ("b", 0, START), ("b", 1, START)]
+
+
+def test_when_idle_with_nothing_scheduled_does_not_block(loop):
+    async def main():
+        await loop.when_idle()
+        cancelled = loop.when_idle()
+        cancelled.cancel()
+        await loop.when_idle()
+
+    loop.run_until_complete(asyncio.wait_for(main(), 5))
+    assert loop.time() == START
+
+
 def test_timers_fire_in_order_at_exact_virtual_times(loop):
     fired = []
 
