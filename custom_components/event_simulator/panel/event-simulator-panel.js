@@ -1116,6 +1116,129 @@ export function snapDelta(dt, step) {
   return step ? Math.round(dt / step) * step : Math.round(dt);
 }
 
+// ---- config line diff (pure) ---------------------------------------------------
+//
+// The config editor marks the lines that differ from the saved automation: added and
+// changed lines get a bar, and a marker shows where saved lines were removed.
+
+/* The edit script turning `a` into `b` (arrays of lines) as runs of
+ * {op: "equal" | "delete" | "insert", a, b, count}: positions in each array. Common
+ * head and tail are matched first, so a local edit to a long config costs only the
+ * changed middle; the middle is an LCS table, given up past `maxCells` for one
+ * delete-all, insert-all hunk. */
+export function lineDiff(a, b, maxCells = 4e6) {
+  let head = 0;
+  while (head < a.length && head < b.length && a[head] === b[head]) head++;
+  let tail = 0;
+  while (tail < a.length - head && tail < b.length - head && a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail++;
+  const ops = [];
+  const push = (op, ai, bi) => {
+    const last = ops[ops.length - 1];
+    if (last && last.op === op) last.count++;
+    else ops.push({ op, a: ai, b: bi, count: 1 });
+  };
+  for (let i = 0; i < head; i++) push("equal", i, i);
+  const n = a.length - head - tail;
+  const m = b.length - head - tail;
+  if (n * m > maxCells) {
+    for (let i = 0; i < n; i++) push("delete", head + i, head);
+    for (let j = 0; j < m; j++) push("insert", head + n, head + j);
+  } else if (n || m) {
+    // lcs[i][j]: the longest common run of a[head+i..] and b[head+j..].
+    const w = m + 1;
+    const lcs = new Uint32Array((n + 1) * w);
+    for (let i = n - 1; i >= 0; i--) {
+      for (let j = m - 1; j >= 0; j--) {
+        lcs[i * w + j] = a[head + i] === b[head + j] ? lcs[(i + 1) * w + j + 1] + 1 : Math.max(lcs[(i + 1) * w + j], lcs[i * w + j + 1]);
+      }
+    }
+    let i = 0;
+    let j = 0;
+    while (i < n || j < m) {
+      if (i < n && j < m && a[head + i] === b[head + j]) push("equal", head + i++, head + j++);
+      // Deletes before inserts, so a changed line reads old then new.
+      else if (i < n && (j >= m || lcs[(i + 1) * w + j] >= lcs[i * w + j + 1])) push("delete", head + i++, head + j);
+      else push("insert", head + i, head + j++);
+    }
+  }
+  for (let k = 0; k < tail; k++) push("equal", a.length - tail + k, b.length - tail + k);
+  return ops;
+}
+
+/* Lines for comparison: split, trailing whitespace dropped, a final empty line ignored. */
+export function configLines(text) {
+  const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n").map((l) => l.trimEnd());
+  while (lines.length && lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+/* What the editor marks, from the saved text and the edited one:
+ * {lines: [kind per edited line: "added" | "changed" | null], removed: [{before, lines}],
+ *  counts: {added, changed, removed}}. In each hunk the first deleted lines pair with
+ * the first inserted ones as changed; the rest are added, or removed (`before` is the
+ * edited line they were removed above, lines.length for the end). */
+export function configLineMarks(savedText, text) {
+  const a = configLines(savedText);
+  const b = configLines(text);
+  const lines = new Array(b.length).fill(null);
+  const removed = [];
+  const counts = { added: 0, changed: 0, removed: 0 };
+  const ops = lineDiff(a, b);
+  for (let k = 0; k < ops.length; k++) {
+    if (ops[k].op === "equal") continue;
+    // One hunk: the deletes and inserts up to the next equal run.
+    let del = null;
+    let ins = null;
+    for (; k < ops.length && ops[k].op !== "equal"; k++) {
+      if (ops[k].op === "delete") del = del ? { ...del, count: del.count + ops[k].count } : { ...ops[k] };
+      else ins = ins ? { ...ins, count: ins.count + ops[k].count } : { ...ops[k] };
+    }
+    k--;
+    const changed = Math.min(del?.count ?? 0, ins?.count ?? 0);
+    for (let j = 0; j < (ins?.count ?? 0); j++) lines[ins.b + j] = j < changed ? "changed" : "added";
+    counts.changed += changed;
+    counts.added += (ins?.count ?? 0) - changed;
+    const gone = (del?.count ?? 0) - changed;
+    if (gone > 0) {
+      counts.removed += gone;
+      removed.push({ before: ins ? ins.b + ins.count : del.b, lines: a.slice(del.a + changed, del.a + del.count) });
+    }
+  }
+  return { lines, removed, counts };
+}
+
+/* A unified diff for the compact view under the editor: hunks of rows
+ * {kind: " " | "+" | "-", text, n} (n = the edited line number, 1-based, for " " and "+"),
+ * with `context` unchanged lines around each change. */
+export function configDiffHunks(savedText, text, context = 2) {
+  const a = configLines(savedText);
+  const b = configLines(text);
+  const rows = [];
+  for (const op of lineDiff(a, b)) {
+    for (let i = 0; i < op.count; i++) {
+      if (op.op === "equal") rows.push({ kind: " ", text: b[op.b + i], n: op.b + i + 1 });
+      else if (op.op === "insert") rows.push({ kind: "+", text: b[op.b + i], n: op.b + i + 1 });
+      else rows.push({ kind: "-", text: a[op.a + i], n: null });
+    }
+  }
+  const keep = rows.map(() => false);
+  rows.forEach((row, i) => {
+    if (row.kind === " ") return;
+    for (let j = Math.max(0, i - context); j <= Math.min(rows.length - 1, i + context); j++) keep[j] = true;
+  });
+  const hunks = [];
+  let cur = null;
+  rows.forEach((row, i) => {
+    if (!keep[i]) {
+      cur = null;
+      return;
+    }
+    if (!cur) hunks.push((cur = []));
+    cur.push(row);
+  });
+  return hunks;
+}
+
 /* JSON with object keys sorted, so equal data compares equal whatever its key order. */
 export function stableStringify(value) {
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
@@ -1412,6 +1535,8 @@ class EventSimulatorPanel extends Base {
     this._cfgEl = null; // the ha-yaml-editor or textarea
     this._cfgDraft = null;
     this._cfgError = null;
+    this._cfgMarks = null; // configLineMarks of the editor's text, while it differs
+    this._savedText = null; // {config, yaml, text}: _savedConfigText's cache
     // Saved scenarios. `_scenario` is the one loaded or last saved ({scenario_id, name});
     // `_savedPrint` the scenarioFingerprint of the panel state it was saved or loaded as.
     this._scenarios = null; // summaries from scenarios/list, once loaded
@@ -1849,6 +1974,7 @@ class EventSimulatorPanel extends Base {
     }
     this._markStale();
     this._updateConfigStatus();
+    this._updateConfigDiff();
     this._updateDirty();
     // Run's enabled state and hint live in the main area; redraw it only on a change of state.
     if (before[0] !== (this._cfgDraft !== null) || before[1] !== !!this._cfgError) this._render();
@@ -1889,8 +2015,9 @@ class EventSimulatorPanel extends Base {
           </div>
           <div class="alert info"><div><strong>For what-ifs only.</strong> Edits here change what the simulator runs and nothing else. They are never saved to Home Assistant; the real automation stays as it is.</div></div>
           <div class="muted small cfg-mode">${esc(mode)}</div>
-          <div id="cfg-editor"></div>
+          <div id="cfg-editor"><div id="cfg-marks" aria-hidden="true"></div></div>
           <div id="cfg-error" class="err small" hidden></div>
+          <div id="cfg-diff"></div>
           <div class="cfg-actions">
             <button data-action="cfg-revert" id="cfg-revert">Revert to saved automation</button>
             <span class="muted small" id="cfg-status"></span>
@@ -1908,6 +2035,7 @@ class EventSimulatorPanel extends Base {
       });
       slot.appendChild(el);
       this._cfgEl = el;
+      this._watchConfigEditor(el);
     } else if (this._yamlState === "unavailable") {
       const el = document.createElement("textarea");
       el.id = "cfg-text";
@@ -1928,6 +2056,140 @@ class EventSimulatorPanel extends Base {
       this._cfgEl = el;
     }
     this._updateConfigStatus();
+    this._updateConfigDiff();
+  }
+
+  /* The saved automation's config as the editor would show it: dumped by a detached
+   * ha-yaml-editor (the same js-yaml dump and schema the visible one used for its text),
+   * or as the fallback textarea's JSON. Cached per config. */
+  _savedConfigText() {
+    const saved = this._savedConfig();
+    const yaml = this._yamlState === "ready";
+    if (this._savedText?.config === saved && this._savedText.yaml === yaml) return this._savedText.text;
+    let text = null;
+    if (yaml) {
+      try {
+        const dumper = document.createElement("ha-yaml-editor");
+        dumper.setValue(saved);
+        text = typeof dumper.yaml === "string" ? dumper.yaml : null;
+      } catch (e) {
+        console.debug("event-simulator: could not dump the saved config as YAML", e);
+      }
+    }
+    if (text === null) text = JSON.stringify(saved, null, 2);
+    this._savedText = { config: saved, yaml, text };
+    return text;
+  }
+
+  /* The editor's text as typed. */
+  _configText() {
+    const el = this._cfgEl;
+    if (!el) return null;
+    if (el.tagName === "TEXTAREA") return el.value;
+    if (typeof el.yaml === "string") return el.yaml;
+    return this._codeMirror()?.state.doc.toString() ?? null;
+  }
+
+  /* The CodeMirror view inside ha-yaml-editor's ha-code-editor (its public `codemirror`),
+   * or null where this frontend does not have one to give. */
+  _codeMirror() {
+    const view = this._cfgEl?.shadowRoot?.querySelector("ha-code-editor")?.codemirror;
+    return view && typeof view.lineBlockAt === "function" && view.state?.doc ? view : null;
+  }
+
+  /* Keep the line marks on the editor's lines as it lays out, resizes and scrolls. */
+  _watchConfigEditor(el) {
+    this._cfgObserver?.disconnect();
+    if (globalThis.ResizeObserver) {
+      this._cfgObserver = new ResizeObserver(() => this._placeConfigMarks());
+      this._cfgObserver.observe(el);
+    }
+    // The code editor renders a moment after it is attached.
+    let tries = 0;
+    const hook = () => {
+      if (this._cfgEl !== el) return;
+      const view = this._codeMirror();
+      if (!view) {
+        if (tries++ < 40) setTimeout(hook, 100);
+        return;
+      }
+      view.scrollDOM.addEventListener("scroll", () => this._placeConfigMarks(), { passive: true });
+      this._updateConfigDiff();
+    };
+    hook();
+  }
+
+  /* The lines the edited config adds or changes against the saved one, and where saved
+   * lines were removed: the summary and compact diff under the editor, and the marks on
+   * the editor's own lines. A config that parses to the saved one marks nothing, however
+   * it is laid out (keys reordered, comments added). */
+  _updateConfigDiff() {
+    const host = this.shadowRoot.getElementById("cfg-diff");
+    if (!host) return;
+    const text = this._configText();
+    const differs = this._cfgDraft !== null || !!this._cfgError;
+    const savedText = this._savedConfigText();
+    const marks = differs && text !== null ? configLineMarks(savedText, text) : null;
+    this._cfgMarks = marks;
+    const { added = 0, changed = 0, removed = 0 } = marks?.counts || {};
+    if (!added && !changed && !removed) {
+      host.innerHTML = "";
+      this._placeConfigMarks();
+      return;
+    }
+    const lines = (n, what) => `${n} line${n === 1 ? "" : "s"} ${what}`;
+    const summary = [changed && lines(changed, "changed"), added && lines(added, "added"), removed && lines(removed, "removed")].filter(Boolean).join(" · ");
+    const hunks = configDiffHunks(savedText, text);
+    const rows = hunks
+      .map((hunk) =>
+        hunk
+          .map((r) => `<div class="d-row d-${r.kind === "+" ? "add" : r.kind === "-" ? "del" : "ctx"}"><span class="d-n">${r.n ?? ""}</span><span class="d-k">${r.kind}</span><span class="d-t">${esc(r.text) || " "}</span></div>`)
+          .join("")
+      )
+      .join(`<div class="d-gap">⋯</div>`);
+    host.innerHTML = `<details class="cfg-diff" data-key="cfg-diff" ${this._openAttr("cfg-diff")}>
+        <summary><span class="d-legend"><i class="d-bar changed"></i><i class="d-bar added"></i></span>${esc(summary)} against the saved automation</summary>
+        <div class="d-body mono">${rows}</div>
+      </details>`;
+    this._placeConfigMarks();
+  }
+
+  /* Bars beside the editor's added and changed lines and a marker where lines were
+   * removed, laid over the editor (CodeMirror owns its own DOM, and this frontend hands
+   * out no way to decorate it from outside). Positions come from the view's own line
+   * geometry, clipped to its scroller. */
+  _placeConfigMarks() {
+    const layer = this.shadowRoot.getElementById("cfg-marks");
+    if (!layer) return;
+    const marks = this._cfgMarks;
+    const view = marks && this._codeMirror();
+    if (!view) {
+      layer.innerHTML = "";
+      return;
+    }
+    cancelAnimationFrame(this._cfgFrame);
+    // After CodeMirror has measured the change that triggered this.
+    this._cfgFrame = requestAnimationFrame(() => {
+      const host = layer.parentElement.getBoundingClientRect();
+      const scroller = view.scrollDOM.getBoundingClientRect();
+      const doc = view.state.doc;
+      const top = view.documentTop - scroller.top;
+      const out = [];
+      marks.lines.forEach((kind, i) => {
+        if (!kind || i + 1 > doc.lines) return;
+        const block = view.lineBlockAt(doc.line(i + 1).from);
+        out.push(`<div class="m-line ${kind}" style="top:${top + block.top}px;height:${block.height}px"></div>`);
+      });
+      for (const { before, lines } of marks.removed) {
+        const y =
+          before + 1 <= doc.lines
+            ? view.lineBlockAt(doc.line(before + 1).from).top
+            : view.lineBlockAt(doc.line(doc.lines).from).bottom;
+        out.push(`<div class="m-removed" style="top:${top + y}px" title="${lines.length} line${lines.length === 1 ? "" : "s"} removed"></div>`);
+      }
+      layer.style.cssText = `left:${scroller.left - host.left}px;top:${scroller.top - host.top}px;width:${scroller.width}px;height:${scroller.height}px`;
+      layer.innerHTML = out.join("");
+    });
   }
 
   _updateConfigStatus() {
@@ -3645,7 +3907,26 @@ class EventSimulatorPanel extends Base {
       .cfg-head h2 { margin: 0; }
       .cfg-head { margin-bottom: 12px; }
       .cfg-mode { margin-bottom: 6px; }
+      #cfg-editor { position: relative; }
       #cfg-editor ha-yaml-editor { display: block; }
+      #cfg-marks { position: absolute; left: 0; top: 0; width: 0; height: 0; overflow: hidden; pointer-events: none; z-index: 1; }
+      .m-line { position: absolute; left: 0; right: 0; border-left: 3px solid; }
+      .m-line.changed { border-color: var(--accent-color, #ff9800); background: rgba(255,152,0,.10); }
+      .m-line.added { border-color: var(--success-color, #43a047); background: rgba(67,160,71,.12); }
+      .m-removed { position: absolute; left: 0; width: 0; height: 0; margin-top: -5px; border-style: solid; border-width: 5px 0 5px 7px; border-color: transparent transparent transparent var(--error-color, #db4437); }
+      .cfg-diff { margin-top: 8px; font-size: 0.85em; }
+      .cfg-diff summary { cursor: pointer; color: var(--secondary-text-color); }
+      .d-legend { display: inline-flex; gap: 2px; margin-right: 6px; vertical-align: -1px; }
+      .d-bar { display: inline-block; width: 3px; height: 11px; }
+      .d-bar.changed { background: var(--accent-color, #ff9800); }
+      .d-bar.added { background: var(--success-color, #43a047); }
+      .d-body { margin-top: 6px; border: 1px solid var(--divider-color); border-radius: 6px; overflow: auto; max-height: 320px; font-size: 0.95em; }
+      .d-row { display: flex; white-space: pre; line-height: 1.45; }
+      .d-row.d-add { background: rgba(67,160,71,.14); }
+      .d-row.d-del { background: rgba(219,68,55,.14); }
+      .d-n { flex: none; width: 3.5em; text-align: right; padding-right: 6px; color: var(--secondary-text-color); user-select: none; }
+      .d-k { flex: none; width: 1.2em; color: var(--secondary-text-color); user-select: none; }
+      .d-gap { color: var(--secondary-text-color); padding-left: 3.5em; border-top: 1px dashed var(--divider-color); border-bottom: 1px dashed var(--divider-color); }
       #cfg-error { margin-top: 6px; white-space: pre-wrap; }
       .cfg-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 10px; }
       #tl svg { display: block; touch-action: pan-y; overflow: hidden; }
