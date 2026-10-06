@@ -105,3 +105,25 @@ def test_labels_from_dicts_with_tolerance_and_lookup_on_many_anchors():
     assert len(labels.anchors) == 30
     assert labels.anchors_matching(T0 + 17 * 86_400 + 7 * H + 30)[0].label == 17
     assert labels.anchors_matching(T0 + 17 * 86_400 + 7 * H - 1) == []
+
+
+def test_classify_on_many_overlapping_periods_agrees_with_a_scan():
+    """`classify` looks periods up by binary search (the benchmark labels 500 fires, and candidates fire 30 000 times); overlapping and nested periods must still be found."""
+    import random
+
+    rng = random.Random(5)
+    raw = []
+    for _ in range(300):
+        start = rng.uniform(0, 48) * H
+        raw.append(Label(T0 + start, T0 + start + rng.choice((1, 60, 600, 3 * H)), rng.choice(("fire", "no_fire")), "start"))
+    labels = Labels(raw)
+
+    def scan(t):
+        if any(p.contains(t) for p in labels.no_fire_periods):
+            return "no_fire"
+        if labels.anchors_matching(t):
+            return "anchor"
+        return "inside" if any(p.contains(t) for p in labels.fire_periods) else "unlabeled"
+
+    probes = [T0 + rng.uniform(-H, 52 * H) for _ in range(2000)] + [p.start for p in raw] + [p.end for p in raw]
+    assert [labels.classify(t) for t in probes] == [scan(t) for t in probes]

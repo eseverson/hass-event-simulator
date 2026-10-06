@@ -73,6 +73,23 @@ class Anchor:
         return self.at - tolerance.before <= t <= self.at + tolerance.after
 
 
+class _PeriodLookup:
+    """Whether any of many (possibly overlapping) periods contains `t`, by binary search: the periods sorted by start, with the latest end among each prefix."""
+
+    def __init__(self, periods: Iterable[Label]) -> None:
+        ordered = sorted((p.start, p.end) for p in periods)
+        self._starts = [start for start, _ in ordered]
+        self._reach: list[float] = []
+        reach = float("-inf")
+        for _, end in ordered:
+            reach = max(reach, end)
+            self._reach.append(reach)
+
+    def covers(self, t: float) -> bool:
+        i = bisect_right(self._starts, t)
+        return i > 0 and self._reach[i - 1] > t
+
+
 class Labels:
     """A set of labels with lookups by time."""
 
@@ -92,6 +109,8 @@ class Labels:
         self.fire_periods = [label for label in self.labels if label.kind == "fire"]
         self.no_fire_periods = [label for label in self.labels if label.kind == "no_fire"]
         self.while_periods = [label for label in self.fire_periods if label.anchor == "while"]
+        self._fire_lookup = _PeriodLookup(self.fire_periods)
+        self._no_fire_lookup = _PeriodLookup(self.no_fire_periods)
         # The labeled stretch: from the first labeled moment to the last (anchors with their tolerance, and every period).
         edges = [(label.start, label.end) for label in self.labels] + [
             (a.at - self.tolerance.before, a.at + self.tolerance.after) for a in self.anchors
@@ -120,11 +139,11 @@ class Labels:
 
     def classify(self, t: float, trigger_id: str | None = None) -> Classification:
         """What a fire at `t` counts as: inside a must-not period, matching an anchor, inside a should-fire period away from its anchors, or in unlabeled time."""
-        if any(label.contains(t) for label in self.no_fire_periods):
+        if self._no_fire_lookup.covers(t):
             return "no_fire"
         if self.anchors_matching(t, trigger_id):
             return "anchor"
-        if any(label.contains(t) for label in self.fire_periods):
+        if self._fire_lookup.covers(t):
             return "inside"
         return "unlabeled"
 

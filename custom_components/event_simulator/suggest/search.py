@@ -1236,6 +1236,13 @@ class _Search:
 # Similarity, for hints
 
 
+def _neighbors(ordered: Sequence[float], x: float, *, circular: bool = False) -> list[float]:
+    """The values of sorted `ordered` that can be nearest to `x`: its neighbors, and on a circle (the clock) the first and last too."""
+    i = bisect_left(ordered, x)
+    picks = {i - 1, i} | ({0, len(ordered) - 1} if circular else set())
+    return [ordered[j] for j in picks if 0 <= j < len(ordered)]
+
+
 class _Similarity:
     """How much a moment looks like the labeled ones: the referenced entities' states, the clock time and the sun offset."""
 
@@ -1243,9 +1250,9 @@ class _Similarity:
         self.search = search
         self.ev = search.ev
         times = [a.at for a in anchors]
-        self.clocks = [search._local_clock(t)[0] for t in times]  # noqa: SLF001
+        self.clocks = sorted(search._local_clock(t)[0] for t in times)  # noqa: SLF001
         self.sun = self.ev._sun_events is not None  # noqa: SLF001
-        self.offsets = [[o for t in times if (o := _sun_offset(self.ev, t, index)) is not None] for index in (0, 1)] if self.sun else []
+        self.offsets = [sorted(o for t in times if (o := _sun_offset(self.ev, t, index)) is not None) for index in (0, 1)] if self.sun else []
         self.entities: list[tuple[str, Any]] = []
         for entity_id in sorted(entity_ids):
             step = search.timeline.get(entity_id)
@@ -1264,14 +1271,14 @@ class _Similarity:
         terms = []
         clock = self.search._local_clock(t)[0]  # noqa: SLF001
         if self.clocks:
-            distance = min(min(abs(clock - c) % DAY, DAY - abs(clock - c) % DAY) for c in self.clocks)
+            distance = min(min(abs(clock - c) % DAY, DAY - abs(clock - c) % DAY) for c in _neighbors(self.clocks, clock, circular=True))
             terms.append(1 - min(1.0, distance / 7200))
         if self.sun:
             best = 0.0
             for index, offsets in enumerate(self.offsets):
                 offset = _sun_offset(self.ev, t, index)
                 if offsets and offset is not None:
-                    best = max(best, 1 - min(1.0, min(abs(offset - o) for o in offsets) / 7200))
+                    best = max(best, 1 - min(1.0, min(abs(offset - o) for o in _neighbors(offsets, offset)) / 7200))
             terms.append(best)
         if self.entities:
             parts = []
