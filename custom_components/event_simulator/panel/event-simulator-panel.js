@@ -57,6 +57,171 @@ export function parseTime(value) {
   return Date.parse(value);
 }
 
+// ---- display time zone and clock --------------------------------------------
+//
+// Times follow Home Assistant's own convention (its frontend's resolve-time-zone.ts and
+// use_am_pm.ts): the user profile's time zone option picks the browser's zone ("local")
+// or the server's (`hass.config.time_zone`, "server"), and its time format picks 12 or
+// 24 hours. Every time the panel shows, and every time typed into its inputs, is in
+// that one display zone. A zone is an IANA name; `undefined` means the browser's own.
+
+/* The browser's IANA zone, or undefined when Intl cannot say. */
+export const BROWSER_TIME_ZONE = (() => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || undefined;
+  } catch {
+    return undefined;
+  }
+})();
+
+/* The zone a profile option resolves to: the browser's for "local" (when known),
+ * otherwise the server's (or the browser's, when the server's is unknown too). */
+export function resolveTimeZone(option, serverTimeZone, localTimeZone = BROWSER_TIME_ZONE) {
+  if (option === "local" && localTimeZone) return localTimeZone;
+  return serverTimeZone || localTimeZone || "UTC";
+}
+
+/* Whether a frontend locale ({language, time_format}) shows a 12-hour clock: "12"/"24"
+ * say so, "language"/"system" ask Intl how that language (or the browser) writes 22:00. */
+export function useAmPm(locale) {
+  const format = locale?.time_format;
+  if (format === "12") return true;
+  if (format === "24") return false;
+  const language = format === "language" ? locale?.language : undefined;
+  try {
+    return new Date("January 1, 2023 22:00:00").toLocaleString(language).includes("10");
+  } catch {
+    return new Date("January 1, 2023 22:00:00").toLocaleString().includes("10");
+  }
+}
+
+/* The panel's display settings from `hass`: {timeZone, serverTimeZone, hour12, language}.
+ * Without a locale (old cores, tests) the profile default applies: the browser's zone and
+ * the language's own clock. */
+export function displaySettings(hass, localTimeZone = BROWSER_TIME_ZONE) {
+  const locale = hass?.locale;
+  const serverTimeZone = hass?.config?.time_zone || undefined;
+  return {
+    timeZone: resolveTimeZone(locale?.time_zone ?? "local", serverTimeZone, localTimeZone),
+    serverTimeZone,
+    hour12: locale ? useAmPm(locale) : undefined,
+    language: locale?.language || undefined,
+  };
+}
+
+/* A zone name as Intl canonicalizes it (so "US/Pacific" and "America/Los_Angeles"
+ * compare equal), or the name itself when Intl rejects it. */
+export function canonicalZone(tz) {
+  try {
+    return new Intl.DateTimeFormat("en-US", { timeZone: tz }).resolvedOptions().timeZone;
+  } catch {
+    return tz;
+  }
+}
+
+const partsFormats = new Map();
+const offsetCache = new Map();
+
+/* Wall-clock fields of instant t in zone tz: {year, month (1-12), day, hour, minute,
+ * second, weekday (0 = Sunday)}. */
+export function wallParts(t, tz) {
+  const key = tz ?? "";
+  let fmt = partsFormats.get(key);
+  if (!fmt) {
+    fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz, hourCycle: "h23", weekday: "short",
+      year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric",
+    });
+    partsFormats.set(key, fmt);
+  }
+  const p = {};
+  for (const { type, value } of fmt.formatToParts(new Date(t))) p[type] = value;
+  return {
+    year: Number(p.year), month: Number(p.month), day: Number(p.day),
+    hour: Number(p.hour) % 24, minute: Number(p.minute), second: Number(p.second),
+    weekday: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(p.weekday),
+  };
+}
+
+/* Zone tz's UTC offset at instant t, in minutes (east positive). */
+export function zoneOffset(t, tz) {
+  // Real offset changes fall on whole quarter hours of UTC, so one lookup per quarter.
+  const q = Math.floor(t / 900e3);
+  const key = `${tz ?? ""}|${q}`;
+  let off = offsetCache.get(key);
+  if (off === undefined) {
+    const at = q * 900e3;
+    const w = wallParts(at, tz);
+    off = Math.round((Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, w.second) - at) / 60e3);
+    if (offsetCache.size > 20000) offsetCache.clear();
+    offsetCache.set(key, off);
+  }
+  return off;
+}
+
+/* An `offsetMinutes(t)` function for zone tz, the form the snapping helpers take. */
+export const offsetIn = (tz) => (t) => zoneOffset(t, tz);
+
+/* The instant whose wall clock reads `wall` (wall-clock fields as UTC epoch ms) under
+ * `offsetMinutes`. Like the browser for local time: a wall time skipped by a forward
+ * shift lands after it (02:30 -> 03:30), and one repeated by a backward shift is its
+ * first occurrence. */
+export function wallToTime(wall, offsetMinutes) {
+  const before = wall - offsetMinutes(wall - DAY_MS) * 60e3;
+  const after = wall - offsetMinutes(wall + DAY_MS) * 60e3;
+  const fits = (t) => t + offsetMinutes(t) * 60e3 === wall;
+  const ok = [before, after].filter(fits);
+  return ok.length ? Math.min(...ok) : before;
+}
+const DAY_MS = 864e5;
+
+/* Local midnight (in zone tz) of the day instant t falls on. */
+export function startOfDay(t, tz) {
+  const w = wallParts(t, tz);
+  return wallToTime(Date.UTC(w.year, w.month - 1, w.day), offsetIn(tz));
+}
+
+/* The panel's clock: formats instants and reads typed times in one display zone, with
+ * a 12- or 24-hour clock (`hour12` undefined: the language's own). */
+export function makeClock({ timeZone, serverTimeZone, hour12, language } = {}) {
+  const make = (opts) => {
+    const o = { ...opts, timeZone };
+    if (o.hour && hour12 != null) {
+      o.hourCycle = hour12 ? "h12" : "h23";
+      o.hour = hour12 ? "numeric" : "2-digit";
+    }
+    try {
+      return new Intl.DateTimeFormat(language, o);
+    } catch {
+      return new Intl.DateTimeFormat(undefined, o);
+    }
+  };
+  const fmt = {
+    hm: make({ hour: "2-digit", minute: "2-digit" }),
+    hms: make({ hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+    date: make({ month: "short", day: "numeric" }),
+    full: make({ month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+  };
+  const shown = canonicalZone(timeZone ?? BROWSER_TIME_ZONE);
+  const server = serverTimeZone ? canonicalZone(serverTimeZone) : undefined;
+  return {
+    timeZone,
+    serverTimeZone,
+    hour12,
+    /* True when the panel shows times in a zone other than Home Assistant's, so clock
+     * conditions (evaluated in Home Assistant's zone) need saying which zone they are. */
+    foreign: !!server && shown !== server,
+    offset: offsetIn(timeZone),
+    time: (t, seconds = true) => (Number.isFinite(t) ? (seconds ? fmt.hms : fmt.hm).format(new Date(t)) : "?"),
+    date: (t) => (Number.isFinite(t) ? fmt.date.format(new Date(t)) : "?"),
+    full: (t) => (Number.isFinite(t) ? fmt.full.format(new Date(t)) : "?"),
+    wall: (t) => wallParts(t, timeZone),
+    startOfDay: (t) => startOfDay(t, timeZone),
+    toInput: (t, seconds = false) => (seconds ? toLocalInputSeconds : toLocalInput)(t, timeZone),
+    fromInput: (value) => fromLocalInput(value, timeZone),
+  };
+}
+
 /* Linear mapping between time [t0, t1] and pixels [0, width]. */
 export function makeScale(t0, t1, width) {
   const k = width / Math.max(1, t1 - t0);
@@ -168,13 +333,17 @@ export function chooseStep(span, width, minPx = 90) {
 
 const localOffsetMinutes = (t) => -new Date(t).getTimezoneOffset();
 
-/* Tick times in [t0, t1], aligned to whole steps of local time (so hourly ticks land on
- * the hour and daily ticks at midnight). `offsetMinutes(t)` is the zone's UTC offset. */
+/* Tick times in [t0, t1], aligned to whole steps of wall time in the display zone (so
+ * hourly ticks land on the hour and daily ticks at midnight, on both sides of a DST
+ * change). `offsetMinutes(t)` is the zone's UTC offset. */
 export function timeTicks(t0, t1, width, offsetMinutes = localOffsetMinutes) {
   const step = chooseStep(t1 - t0, width);
-  const off = offsetMinutes(t0) * 60e3;
   const ticks = [];
-  for (let t = Math.ceil((t0 + off) / step) * step - off; t <= t1 && ticks.length < 500; t += step) ticks.push(t);
+  for (let w = Math.ceil((t0 + offsetMinutes(t0) * 60e3) / step) * step; ticks.length < 500; w += step) {
+    const t = wallToTime(w, offsetMinutes);
+    if (t > t1) break;
+    if (t >= t0 && t !== ticks[ticks.length - 1]) ticks.push(t);
+  }
   return { step, ticks };
 }
 
@@ -815,15 +984,26 @@ export class ReplayScheduler {
   }
 }
 
-/* `YYYY-MM-DDTHH:MM` in local time, the value format of <input type="datetime-local">. */
-export function toLocalInput(ms) {
-  const d = new Date(ms);
-  const p = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+const pad2 = (n) => String(n).padStart(2, "0");
+
+/* `YYYY-MM-DDTHH:MM` in zone tz (default: the browser's), the value format of
+ * <input type="datetime-local">. */
+export function toLocalInput(ms, tz) {
+  if (!Number.isFinite(ms)) return "";
+  const w = wallParts(ms, tz);
+  return `${String(w.year).padStart(4, "0")}-${pad2(w.month)}-${pad2(w.day)}T${pad2(w.hour)}:${pad2(w.minute)}`;
 }
 
-export function fromLocalInput(value) {
-  return value ? new Date(value).getTime() : NaN;
+/* The instant a datetime-local value (`YYYY-MM-DDTHH:MM[:SS[.sss]]`) names in zone tz;
+ * NaN when it is empty or not that shape. */
+export function fromLocalInput(value, tz) {
+  const m = /^(\d{4,})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/.exec(String(value ?? "").trim());
+  if (!m) return NaN;
+  const [y, mo, d, h, mi, s = 0, ms = "0"] = m.slice(1);
+  const wall = Date.UTC(+y, +mo - 1, +d, +h, +mi, +s, Number(ms.padEnd(3, "0")));
+  const check = new Date(wall);
+  if (check.getUTCMonth() !== +mo - 1 || check.getUTCDate() !== +d || +h > 23 || +mi > 59 || +s > 59) return NaN;
+  return wallToTime(wall, offsetIn(tz));
 }
 
 export const esc = (s) =>
@@ -843,10 +1023,10 @@ export function formatDuration(ms) {
   return h % 24 ? `${d} d ${h % 24} h` : `${d} d`;
 }
 
-/* `YYYY-MM-DDTHH:MM:SS` in local time, for <input type="datetime-local" step="1">. */
-export function toLocalInputSeconds(ms) {
-  const d = new Date(ms);
-  return `${toLocalInput(ms)}:${String(d.getSeconds()).padStart(2, "0")}`;
+/* `YYYY-MM-DDTHH:MM:SS` in zone tz, for <input type="datetime-local" step="1">. */
+export function toLocalInputSeconds(ms, tz) {
+  if (!Number.isFinite(ms)) return "";
+  return `${toLocalInput(ms, tz)}:${pad2(wallParts(ms, tz).second)}`;
 }
 
 // ---- timeline editing (pure) ------------------------------------------------
@@ -1746,6 +1926,28 @@ export function toYaml(value, indent = 0) {
 
 /* The part of a suggested config a card shows up front: its triggers and conditions
  * (either key spelling), as YAML. */
+/* Whether an automation config depends on the clock: a time or time-pattern trigger, or a
+ * time condition (clock window or weekdays). Home Assistant evaluates those in its own
+ * zone, whatever zone the panel shows times in. */
+export function hasClockTerms(value) {
+  if (Array.isArray(value)) return value.some(hasClockTerms);
+  if (!value || typeof value !== "object") return false;
+  const kind = value.trigger ?? value.platform;
+  if (kind === "time" || kind === "time_pattern" || value.condition === "time") return true;
+  return Object.values(value).some(hasClockTerms);
+}
+
+/* YAML text with `# <note>` after each clock time (`after:`/`before:`/`at:` HH:MM[:SS]) and
+ * `weekday:` key, to say which zone they are in. Display only: copied YAML stays clean. */
+export function annotateClockYaml(text, note) {
+  return String(text)
+    .split("\n")
+    .map((line) =>
+      /^\s*(?:- )?(?:(?:after|before|at): ("?)\d{1,2}:\d{2}(?::\d{2})?\1|weekday:(?: .*)?)\s*$/.test(line) ? `${line}  # ${note}` : line
+    )
+    .join("\n");
+}
+
 export function triggerYaml(config) {
   const c = isObject(config) ? config : {};
   const part = {};
@@ -1985,16 +2187,15 @@ function fireMarker(m, x, y) {
   }
 }
 
-function presetWindow(id, now = Date.now()) {
+/* The window a preset names at `now`; Today and Yesterday are calendar days in zone tz. */
+export function presetWindow(id, now = Date.now(), tz) {
   const end = Math.ceil(now / 60e3) * 60e3;
   const preset = PRESETS.find((p) => p.id === id);
   if (preset?.span) return { start: end - preset.span, end };
-  const midnight = new Date(now);
-  midnight.setHours(0, 0, 0, 0);
-  if (id === "today") return { start: midnight.getTime(), end };
-  const before = new Date(midnight);
-  before.setDate(before.getDate() - 1);
-  return { start: before.getTime(), end: midnight.getTime() };
+  const midnight = startOfDay(now, tz);
+  if (id === "today") return { start: midnight, end };
+  // Noon of the day before is safely inside it whatever the DST shift.
+  return { start: startOfDay(midnight - 12 * HOUR, tz), end: midnight };
 }
 
 /* Make Home Assistant's own `ha-yaml-editor` available, resolving true once it is.
@@ -2040,6 +2241,7 @@ class EventSimulatorPanel extends Base {
     this._entityId = ""; // selected automation
     this._automation = null; // {config, referenced_entities}
     this._preset = "24h";
+    this._clock = makeClock(displaySettings(null)); // the display zone and clock (set from hass)
     this._window = presetWindow("24h");
     this._view = [this._window.start, this._window.end];
     this._tracks = []; // [{entity_id, initial, events, segments, merged, numeric, range}]
@@ -2136,6 +2338,13 @@ class EventSimulatorPanel extends Base {
   set hass(hass) {
     const first = !this._hass;
     this._hass = hass;
+    const settings = displaySettings(hass);
+    const key = JSON.stringify(settings);
+    if (key !== this._clockKey) {
+      this._clockKey = key;
+      this._clock = makeClock(settings);
+      if (!first) this._render();
+    }
     const menu = this.shadowRoot.querySelector("ha-menu-button");
     if (menu) menu.hass = hass;
     if (this._cfgEl && this._yamlState === "ready") this._cfgEl.hass = hass;
@@ -2553,7 +2762,7 @@ class EventSimulatorPanel extends Base {
   }
 
   _editOpts() {
-    return { start: this._window.start, end: this._window.end };
+    return { start: this._window.start, end: this._window.end, offsetMinutes: this._clock.offset };
   }
 
   _addChange(entityId, t) {
@@ -2595,9 +2804,9 @@ class EventSimulatorPanel extends Base {
     let index = sel.index;
     const timeInput = root.getElementById("ed-time");
     // The field shows whole seconds; only a changed value moves the event.
-    if (timeInput && timeInput.value !== toLocalInputSeconds(parseTime(ev.at))) {
+    if (timeInput && timeInput.value !== this._clock.toInput(parseTime(ev.at), true)) {
       try {
-        ({ timeline, index } = moveEvent(timeline, index, fromLocalInput(timeInput.value), this._editOpts()));
+        ({ timeline, index } = moveEvent(timeline, index, this._clock.fromInput(timeInput.value), this._editOpts()));
       } catch (e) {
         return fail(`${e.message} (${this._fullTime(this._window.start)} to ${this._fullTime(this._window.end)}).`);
       }
@@ -2701,8 +2910,8 @@ class EventSimulatorPanel extends Base {
     const root = this.shadowRoot;
     const startText = root.getElementById("lb-start")?.value;
     const endText = root.getElementById("lb-end")?.value;
-    const start = startText === toLocalInputSeconds(label.start) ? label.start : fromLocalInput(startText);
-    const end = endText === toLocalInputSeconds(label.end) ? label.end : fromLocalInput(endText);
+    const start = startText === this._clock.toInput(label.start, true) ? label.start : this._clock.fromInput(startText);
+    const end = endText === this._clock.toInput(label.end, true) ? label.end : this._clock.fromInput(endText);
     const fail = (message) => {
       this._labelError = message;
       this._render();
@@ -3408,8 +3617,7 @@ class EventSimulatorPanel extends Base {
 
   _defaultName() {
     const alias = this._automation?.config?.alias || this._entityId || (this._mode === "suggest" ? "Suggest" : "Scenario");
-    const d = new Date(this._window.start);
-    return `${alias} — ${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })}`.slice(0, MAX_SCENARIO_NAME);
+    return `${alias} — ${this._clock.date(this._window.start)}`.slice(0, MAX_SCENARIO_NAME);
   }
 
   /* Save: overwrite the loaded scenario, or ask for a name when there is none. */
@@ -3724,11 +3932,12 @@ class EventSimulatorPanel extends Base {
           <div class="field">
             <span class="label">Window</span>
             <div class="window">
-              <input id="win-start" type="datetime-local" value="${toLocalInput(w.start)}" aria-label="Window start">
+              <input id="win-start" type="datetime-local" value="${this._clock.toInput(w.start)}" aria-label="Window start">
               <span class="muted">to</span>
-              <input id="win-end" type="datetime-local" value="${toLocalInput(w.end)}" aria-label="Window end">
+              <input id="win-end" type="datetime-local" value="${this._clock.toInput(w.end)}" aria-label="Window end">
             </div>
             <div class="segmented">${presets}</div>
+            ${this._clock.foreign ? `<span class="muted small zone-note" title="Settings › Profile › Time zone picks the browser's zone or the server's">Times are ${esc(this._zoneName())}; Home Assistant's zone is ${esc(this._clock.serverTimeZone)}.</span>` : ""}
           </div>
           ${suggest ? this._suggestRowHtml() : `<div class="run-row">
             <label class="auto-run" title="Replay automatically after each change">
@@ -3835,6 +4044,9 @@ class EventSimulatorPanel extends Base {
           : "",
     ].filter(Boolean).join("");
     const key = `sg-yaml-${v.rank}`;
+    // Shown in another zone than Home Assistant's, its clock conditions say whose clock.
+    const zoned = this._clock.foreign && hasClockTerms(v.config);
+    const yaml = (text) => (zoned ? annotateClockYaml(text, `${this._clock.serverTimeZone} time`) : text);
     return `
       <li class="sg${sel ? " sel" : ""}" data-rank="${v.rank}">
         <div class="sg-head">
@@ -3844,11 +4056,12 @@ class EventSimulatorPanel extends Base {
           <span class="muted small sg-fires">${v.fires} fire${v.fires === 1 ? "" : "s"} in the window</span>
         </div>
         <p class="sg-expl">${esc(v.explanation || "No explanation was sent for this one.")}</p>
+        ${zoned ? `<p class="small sg-zone">Its clock times and weekdays are Home Assistant's time (${esc(this._clock.serverTimeZone)}); the times on this page are ${esc(this._zoneName())}.</p>` : ""}
         <ul class="sg-stats">${stats}</ul>
-        <pre class="mono sg-yaml">${esc(triggerYaml(v.config))}</pre>
+        <pre class="mono sg-yaml">${esc(yaml(triggerYaml(v.config)))}</pre>
         <details class="sg-full" data-key="${key}" ${this._openAttr(key)}>
           <summary>Full automation YAML</summary>
-          <pre class="mono sg-yaml">${esc(toYaml(v.config))}</pre>
+          <pre class="mono sg-yaml">${esc(yaml(toYaml(v.config)))}</pre>
         </details>
         <div class="sg-actions">
           <button data-action="sg-copy" data-rank="${v.rank}">${this._copied === v.rank ? "Copied" : "Copy YAML"}</button>
@@ -4062,8 +4275,8 @@ class EventSimulatorPanel extends Base {
             <select id="lb-kind"><option value="fire" ${fire ? "selected" : ""}>Should fire</option><option value="no_fire" ${fire ? "" : "selected"}>Must not fire</option></select></label>
           <label class="fld"><span class="label">Anchor</span>
             <select id="lb-anchor" ${fire ? "" : "disabled"} title="${fire ? "Where in the period the automation should fire; while: its conditions should hold throughout" : "A must-not-fire period has no anchor"}">${anchors}</select></label>
-          <label class="fld"><span class="label">Start</span><input id="lb-start" type="datetime-local" step="1" value="${esc(draft?.start ?? toLocalInputSeconds(label.start))}"></label>
-          <label class="fld"><span class="label">End</span><input id="lb-end" type="datetime-local" step="1" value="${esc(draft?.end ?? toLocalInputSeconds(label.end))}"></label>
+          <label class="fld"><span class="label">Start</span><input id="lb-start" type="datetime-local" step="1" value="${esc(draft?.start ?? this._clock.toInput(label.start, true))}"></label>
+          <label class="fld"><span class="label">End</span><input id="lb-end" type="datetime-local" step="1" value="${esc(draft?.end ?? this._clock.toInput(label.end, true))}"></label>
         </div>
         ${this._labelError ? `<div class="err small" role="alert">${esc(this._labelError)}</div>` : ""}
         <div class="editor-actions">
@@ -4133,7 +4346,7 @@ class EventSimulatorPanel extends Base {
     const key = `${sel.entity_id}#${sel.index}`;
     const draft = this._edDraft?.key === key ? this._edDraft : null;
     const t = isInitial ? this._window.start : parseTime(item.at);
-    const timeValue = draft?.time ?? (isInitial ? "" : toLocalInputSeconds(t));
+    const timeValue = draft?.time ?? (isInitial ? "" : this._clock.toInput(t, true));
     const stateValue = draft?.state ?? (item ? String(item.state) : "");
     const attrsValue = draft?.attrs ?? (item && Object.keys(item.attributes || {}).length ? JSON.stringify(item.attributes, null, 2) : "");
     const known = [...new Set([track.initial, ...track.events].filter(Boolean).map((e) => String(e.state)))].slice(0, 200);
@@ -4173,8 +4386,13 @@ class EventSimulatorPanel extends Base {
       </div>`;
   }
 
+  /* The display zone's name, as the profile's Time zone setting picked it. */
+  _zoneName() {
+    return this._clock.timeZone || BROWSER_TIME_ZONE || "this browser's time";
+  }
+
   _clockTime(t) {
-    return new Date(t).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    return this._clock.time(t);
   }
 
   _friendlyName(entityId) {
@@ -4416,7 +4634,7 @@ class EventSimulatorPanel extends Base {
   }
 
   _axisSvg(scale) {
-    const { step, ticks } = timeTicks(scale.t0, scale.t1, scale.width);
+    const { step, ticks } = timeTicks(scale.t0, scale.t1, scale.width, this._clock.offset);
     const marks = ticks
       .map((t) => {
         const x = scale.toX(t);
@@ -4441,16 +4659,14 @@ class EventSimulatorPanel extends Base {
   }
 
   _tickLabel(t, step) {
-    const d = new Date(t);
-    const midnight = d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0;
-    if (step >= DAY || (midnight && step >= HOUR)) return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-    const opts = { hour: "2-digit", minute: "2-digit" };
-    if (step < 60e3) opts.second = "2-digit";
-    return d.toLocaleTimeString(undefined, opts);
+    const w = this._clock.wall(t);
+    const midnight = w.hour === 0 && w.minute === 0 && w.second === 0;
+    if (step >= DAY || (midnight && step >= HOUR)) return this._clock.date(t);
+    return this._clock.time(t, step < 60e3);
   }
 
   _gridLines(scale, height) {
-    const { ticks } = timeTicks(scale.t0, scale.t1, scale.width);
+    const { ticks } = timeTicks(scale.t0, scale.t1, scale.width, this._clock.offset);
     return ticks.map((t) => `<line x1="${scale.toX(t)}" x2="${scale.toX(t)}" y1="0" y2="${height}" class="grid"/>`).join("");
   }
 
@@ -4706,10 +4922,7 @@ class EventSimulatorPanel extends Base {
   }
 
   _fullTime(t) {
-    if (!Number.isFinite(t)) return "?";
-    return new Date(t).toLocaleString(undefined, {
-      month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit",
-    });
+    return this._clock.full(t);
   }
 
   // ---- interaction ----------------------------------------------------------
@@ -4911,7 +5124,7 @@ class EventSimulatorPanel extends Base {
     d.preview =
       d.part === "body"
         ? moveLabel(d.orig, snapDelta(dt, step), this._editOpts())
-        : resizeLabel(d.orig, d.part, snapTime(d.orig[d.part] + dt, step), this._editOpts(), Math.max(step, MIN_LABEL_SPAN));
+        : resizeLabel(d.orig, d.part, snapTime(d.orig[d.part] + dt, step, this._clock.offset), this._editOpts(), Math.max(step, MIN_LABEL_SPAN));
     this._showBrushTip(ev.clientX, ev.clientY, d.preview, d.part === "body" ? "move" : "resize");
     this._scheduleTimeline();
   }
@@ -5084,7 +5297,7 @@ class EventSimulatorPanel extends Base {
     const at = this._trackAt(ev);
     if (at) {
       const msPerPx = (this._view[1] - this._view[0]) / this._width;
-      const t = Math.min(this._window.end - 1, Math.max(this._window.start, snapTime(at.t, snapStep(msPerPx))));
+      const t = Math.min(this._window.end - 1, Math.max(this._window.start, snapTime(at.t, snapStep(msPerPx), this._clock.offset)));
       const last = this._lastTap;
       const now = ev.timeStamp;
       this._lastTap = { entity_id: at.track.entity_id, x: ev.clientX, y: ev.clientY, at: now };
@@ -5297,7 +5510,7 @@ class EventSimulatorPanel extends Base {
     const span = this._view[1] - this._view[0];
     const mid = this._view[0] + span / 2;
     if (action === "preset") {
-      const { start, end } = presetWindow(el.dataset.preset);
+      const { start, end } = presetWindow(el.dataset.preset, Date.now(), this._clock.timeZone);
       this._setWindow(start, end, el.dataset.preset);
     } else if (action === "run") this._run();
     else if (action === "zoom-in") this._setView(zoomView(this._view, mid, 0.5, this._bounds()));
@@ -5387,8 +5600,8 @@ class EventSimulatorPanel extends Base {
     else if (id === "lb-anchor" && this._labelSel) this._updateLabel(this._labelSel, { anchor: ev.target.value });
     else if (id === "tol-before" || id === "tol-after") this._setTolerance(id === "tol-before" ? "before" : "after", ev.target.value);
     else if (id === "win-start" || id === "win-end") {
-      const start = fromLocalInput(this.shadowRoot.getElementById("win-start").value);
-      const end = fromLocalInput(this.shadowRoot.getElementById("win-end").value);
+      const start = this._clock.fromInput(this.shadowRoot.getElementById("win-start").value);
+      const end = this._clock.fromInput(this.shadowRoot.getElementById("win-end").value);
       this._setWindow(start, end, null);
     }
   }
@@ -5733,6 +5946,8 @@ class EventSimulatorPanel extends Base {
       .sg-fires { margin-left: auto; }
       .chip.on-tl { background: rgba(3,155,229,.15); color: var(--info-color, #039be5); }
       .sg-expl { margin: 8px 0 6px; font-size: 1.02em; line-height: 1.4; }
+      .sg-zone { margin: 0 0 6px; color: var(--secondary-text-color); }
+      .zone-note { display: block; margin-top: 4px; }
       .sg-stats { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 3px; font-size: 0.9em; }
       .sg-stats .jump { font-family: var(--code-font-family, monospace); font-size: 0.95em; }
       .sg-stats .jump.err { color: var(--error-color, #db4437); }
