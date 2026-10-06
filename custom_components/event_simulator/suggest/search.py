@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from datetime import timedelta, tzinfo
 from statistics import median
@@ -89,9 +89,20 @@ class Suggestion:
     stats: Stats
     config: dict[str, Any]
     explanation: str
+    # Set by exact validation (exact.py): whether `stats` are the sandbox's, the miner's stats when they differ, and whether the two disagree badly.
+    exact: bool | None = None
+    approx_stats: Stats | None = None
+    diverged: bool = False
 
     def as_dict(self) -> dict[str, Any]:
-        return {"rank": self.rank, "config": self.config, "stats": self.stats.as_dict(), "explanation": self.explanation}
+        out = {"rank": self.rank, "config": self.config, "stats": self.stats.as_dict(), "explanation": self.explanation}
+        if self.exact is not None:
+            out["exact"] = self.exact
+        if self.approx_stats is not None:
+            out["approx_stats"] = self.approx_stats.as_dict()
+        if self.diverged:
+            out["diverged"] = True
+        return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,13 +136,23 @@ class SuggestResult:
     suggestions: list[Suggestion] = field(default_factory=list)
     hints: list[Hint] = field(default_factory=list)
     evaluated: int = 0  # candidates scored
+    warning: dict[str, str] | None = None  # {code, message}: exact validation fell back to the miner's stats
+    # What the search knew (its labels, evaluator, anchors), so exact validation can re-score and re-hint; not serialized.
+    context: SearchContext | None = field(default=None, repr=False, compare=False)
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "suggestions": [s.as_dict() for s in self.suggestions],
             "hints": [h.as_dict() for h in self.hints],
             "evaluated": self.evaluated,
         }
+        if self.warning is not None:
+            out["warning"] = self.warning
+        return out
+
+
+class SuggestCancelled(Exception):
+    """`suggest`'s `should_stop` said to stop."""
 
 
 # Rounding and quantizing
@@ -1095,6 +1116,12 @@ def _hints(search: _Search, anchors: Sequence[Anchor], suggestions: Sequence[Sug
 # Entry point
 
 
+@dataclass(frozen=True, slots=True)
+class SearchContext:
+    search: _Search
+    anchor_words: str  # how explanations name the anchors ("marked starts", ...)
+
+
 def suggest(
     timeline: Timeline,
     labels: Labels,
@@ -1102,9 +1129,18 @@ def suggest(
     time_zone: str | tzinfo,
     sun_events: SunEvents | None = None,
     options: SuggestOptions | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> SuggestResult:
-    """Search candidate automations that fire at the labeled anchors and nowhere they should not; see the module docstring."""
+    """Search candidate automations that fire at the labeled anchors and nowhere they should not; see the module docstring.
+
+    `should_stop` is polled between trigger searches; when it returns True the search raises `SuggestCancelled` (it runs in an executor thread, which cannot be cancelled from outside).
+    """
     options = options or SuggestOptions()
+
+    def check() -> None:
+        if should_stop is not None and should_stop():
+            raise SuggestCancelled
+
     while_only = not labels.anchors and bool(labels.while_periods)
     if while_only:
         starts = [Label(p.start, p.end, "fire", "start") for p in labels.while_periods]
@@ -1117,6 +1153,7 @@ def suggest(
     paired = any(label.anchor == "both" for label in labels.fire_periods)
     starts = [a for a in anchors if a.edge == "start"]
     ends = [a for a in anchors if a.edge == "end"]
+    check()
     if paired and starts and ends:
         start_side = search.best_triggers(starts, "start", options.side_beam)
         end_side = search.best_triggers(ends, "end", options.side_beam)
@@ -1129,7 +1166,9 @@ def suggest(
 
     scored: list[_Scored] = []
     for base in bases:
+        check()
         scored += search.grow(base)
+    check()
     scored.sort(key=lambda s: s.key)
     kept: list[_Scored] = []
     seen: set[tuple[Any, ...]] = set()
@@ -1156,4 +1195,6 @@ def suggest(
         alias = f"Suggested: {describe(item.candidate)[:80]}"
         config = render_automation(item.candidate, alias=alias, description=explanation)
         suggestions.append(Suggestion(rank, item.candidate, item.stats, config, explanation))
-    return SuggestResult(suggestions, _hints(search, anchors, suggestions), search.evaluated)
+    return SuggestResult(
+        suggestions, _hints(search, anchors, suggestions), search.evaluated, context=SearchContext(search, words)
+    )

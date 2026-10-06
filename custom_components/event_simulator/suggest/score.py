@@ -5,6 +5,7 @@ Every fire is sorted into one bucket (see `Labels.classify`): matching an anchor
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,6 +36,7 @@ class Stats:
     inside_fires: tuple[float, ...]
     while_held: int = 0
     while_total: int = 0
+    fire_times: tuple[float, ...] = ()  # every fire, in order (the panel draws them)
 
     @property
     def recall(self) -> float:
@@ -57,6 +59,7 @@ class Stats:
             "inside_fires": [to_iso(t) for t in self.inside_fires],
             "while_held": self.while_held,
             "while_total": self.while_total,
+            "fire_times": [to_iso(t) for t in self.fire_times],
         }
 
 
@@ -69,6 +72,14 @@ def score_candidate(
     """The candidate's stats on `labels` (pass `fires` when already computed)."""
     if fires is None:
         fires = evaluator.fires(candidate)
+    return score_fires(evaluator, candidate, labels, fires)
+
+
+def score_fires(evaluator: Evaluator, candidate: Candidate, labels: Labels, fires: Sequence[Fire]) -> Stats:
+    """The stats of a list of fires on `labels`: what the miner's approximate fires and the sandbox's exact ones both go through.
+
+    `fires` are time-ordered, each naming the index of the trigger that fired (its id decides which anchors it can match). `while` periods are judged on the candidate's conditions over the timeline, which needs no fire times.
+    """
     hit: set[Anchor] = set()
     violations: list[float] = []
     outside: list[float] = []
@@ -97,6 +108,7 @@ def score_candidate(
         inside_fires=tuple(inside),
         while_held=held,
         while_total=len(labels.while_periods),
+        fire_times=tuple(fire.at for fire in fires),
     )
 
 
