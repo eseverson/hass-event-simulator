@@ -1,6 +1,6 @@
 """Candidate automations: a small internal representation, and its rendering to Home Assistant config.
 
-Candidates are frozen dataclasses, so the miner can hash them, cache their fire times and compare them. Durations and offsets are seconds; times of day are seconds since local midnight; state values are tuples (one value renders as a scalar). Each trigger and condition watches at most one entity: multi-entity "and" triggers are a non-goal.
+Candidates are frozen dataclasses, so the miner can hash them, cache their fire times and compare them. Durations and offsets are seconds; times of day are seconds since local midnight; state values are tuples (one value renders as a scalar). Each trigger and condition watches at most one entity (or, for an event trigger, one event type): multi-entity "and" triggers are a non-goal.
 
 `render_automation` writes the modern syntax (`triggers:` / `conditions:` / `actions:`, `trigger: state`, `condition: state`, `action:`), with a placeholder action the user replaces.
 """
@@ -108,6 +108,22 @@ class SunTrigger:
 
 
 @dataclass(frozen=True, slots=True)
+class EventTrigger:
+    """`trigger: event`: an event of `event_type` on the bus whose data holds every `(key, value)` of `event_data` (other keys may be there too).
+
+    Values are scalars compared as they are, as Home Assistant compares them (`1` is not `"1"`).
+    """
+
+    event_type: str
+    event_data: tuple[tuple[str, Any], ...] = ()
+    id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.event_type:
+            raise ValueError("event_type must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
 class StateCondition:
     """`condition: state`: the state (or attribute) is one of `state`, for longer than `for_` when given."""
 
@@ -169,7 +185,7 @@ class SunCondition:
                 raise ValueError(f"sun events are {SUN_EVENTS}")
 
 
-Trigger = StateTrigger | NumericStateTrigger | TimeTrigger | SunTrigger
+Trigger = StateTrigger | NumericStateTrigger | TimeTrigger | SunTrigger | EventTrigger
 Condition = StateCondition | NumericStateCondition | TimeCondition | SunCondition
 
 
@@ -191,6 +207,11 @@ class Candidate:
             for part in (*self.triggers, *self.conditions)
             if isinstance(part, (StateTrigger, NumericStateTrigger, StateCondition, NumericStateCondition))
         }
+
+    @property
+    def event_types(self) -> set[str]:
+        """The bus events the candidate listens to: what the sandbox needs fired."""
+        return {trigger.event_type for trigger in self.triggers if isinstance(trigger, EventTrigger)}
 
 
 # Rendering
@@ -268,6 +289,14 @@ def render_trigger(trigger: Trigger) -> dict[str, Any]:
             out["event"] = trigger.event
             if trigger.offset:
                 out["offset"] = format_duration(trigger.offset)
+            return out
+        case EventTrigger():
+            out = {"trigger": "event"}
+            if trigger.id is not None:
+                out["id"] = trigger.id
+            out["event_type"] = trigger.event_type
+            if trigger.event_data:
+                out["event_data"] = dict(trigger.event_data)
             return out
     raise TypeError(f"not a trigger: {trigger!r}")
 

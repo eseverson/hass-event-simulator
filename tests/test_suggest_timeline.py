@@ -145,6 +145,23 @@ def test_timeline_window_and_entities():
         Timeline.from_scenario({}, [], END, START)
 
 
+def test_bus_events_are_kept_per_type_sorted_and_inside_the_window():
+    bus = [
+        {"at": at(30), "event_type": "zha_event", "data": {"command": "off"}},
+        {"at": at(10), "event_type": "zha_event", "data": {"command": "on"}},
+        {"at": at(-5), "event_type": "zha_event", "data": {"command": "early"}},
+        {"at": at(24 * 60), "event_type": "zha_event", "data": {"command": "late"}},
+        {"at": at(20), "event_type": "tag_scanned", "data": {"tag_id": "t1"}},
+    ]
+    timeline = Timeline.from_scenario({}, [], START, END, bus_events=bus)
+    assert timeline.event_types == ["tag_scanned", "zha_event"]
+    zha = timeline.bus_events("zha_event")
+    assert [round(t - T0) for t in zha.times] == [600, 1800]
+    assert [d["command"] for d in zha.data] == ["on", "off"]
+    assert timeline.bus_events("nothing").times == []
+    assert build().event_types == []
+
+
 def test_the_suggest_core_imports_only_the_standard_library():
     """The miner core stays free of Home Assistant (and any third-party package)."""
     import ast

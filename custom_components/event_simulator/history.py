@@ -13,13 +13,13 @@ from functools import partial
 import re
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from homeassistant.components.automation import DATA_COMPONENT
 from homeassistant.components.labs.const import LABS_DATA
 from homeassistant.components.recorder import get_instance
-from homeassistant.components.recorder.db_schema import States
+from homeassistant.components.recorder.db_schema import EventData, Events, EventTypes, States
 from homeassistant.components.recorder.history import (
     get_significant_states_with_session,
 )
@@ -45,6 +45,35 @@ MAX_EVENTS = 50_000
 MAX_SUGGEST_WINDOW = timedelta(days=30)
 # State changes the suggest command reads for its window: the miner holds them in memory (about 0.3 s for 60k), and only the entities the candidates reference go on to the sandbox.
 MAX_SUGGEST_EVENTS = 200_000
+# Recorded bus events (zha_event, tag_scanned, ...) the suggest command reads for its window, for event triggers; past this the busiest types are left out.
+MAX_BUS_EVENTS = 20_000
+# Recorded event types that are Home Assistant's own bookkeeping rather than something happening in the home: never offered as triggers or replayed (the sandbox fires its own). `call_service` is recorded too, but replaying one would be a service call.
+SYSTEM_EVENT_TYPES = frozenset(
+    {
+        "automation_triggered",
+        "call_service",
+        "component_loaded",
+        "config_entry_discovered",
+        "core_config_updated",
+        "data_entry_flow_progressed",
+        "labs_updated",
+        "logbook_entry",
+        "logging_changed",
+        "lovelace_updated",
+        "panels_updated",
+        "script_started",
+        "service_registered",
+        "service_removed",
+        "shopping_list_updated",
+        "state_changed",
+        "state_reported",
+        "themes_updated",
+        "user_added",
+        "user_removed",
+        "user_updated",
+    }
+)
+_SYSTEM_EVENT_TYPE = re.compile(r"^(homeassistant_|recorder_)|(_registry_updated|_reloaded)$")
 # Registry snapshot caps: an area or label on a big install can pull in hundreds of
 # entities, and each entry is around a kilobyte of scenario.
 MAX_SNAPSHOT_ENTITIES = 500
@@ -228,6 +257,86 @@ async def async_get_timeline(
         for state in changes
     ]
     return {"initial_states": initial_states, "events": events}
+
+
+def is_system_event_type(event_type: str) -> bool:
+    """Whether a recorded event type is Home Assistant's own bookkeeping (see SYSTEM_EVENT_TYPES)."""
+    return event_type in SYSTEM_EVENT_TYPES or bool(_SYSTEM_EVENT_TYPE.search(event_type))
+
+
+async def async_get_bus_events(
+    hass: HomeAssistant,
+    start: datetime,
+    end: datetime,
+    *,
+    event_types: Iterable[str] | None = None,
+    max_events: int = MAX_BUS_EVENTS,
+) -> dict[str, Any]:
+    """The recorder's bus events in [start, end) (the scenario's `bus_events`), oldest first: `{bus_events: [{at, event_type, data}], dropped_event_types}`.
+
+    Every recorded type (or only `event_types`) except Home Assistant's own bookkeeping (`is_system_event_type`). When there are more than `max_events`, whole types are left out, the busiest first, and named in `dropped_event_types`.
+    """
+    start, end = dt_util.as_utc(start), dt_util.as_utc(end)
+    check_window(start, end, MAX_SUGGEST_WINDOW)
+    wanted = None if event_types is None else set(event_types)
+    rows, dropped = await get_instance(hass).async_add_executor_job(
+        partial(_read_bus_events, hass, start, end, wanted, max_events)
+    )
+    return {
+        "bus_events": [
+            {"at": dt_util.utc_from_timestamp(at).isoformat(), "event_type": event_type, "data": data}
+            for at, event_type, data in rows
+        ],
+        "dropped_event_types": dropped,
+    }
+
+
+def _read_bus_events(
+    hass: HomeAssistant, start: datetime, end: datetime, wanted: set[str] | None, max_events: int
+) -> tuple[list[tuple[float, str, dict[str, Any]]], list[str]]:
+    """Recorder executor: count the window's events by type, keep the quietest types up to `max_events`, and read those."""
+    start_ts, end_ts = start.timestamp(), end.timestamp()
+    in_window = (Events.time_fired_ts >= start_ts) & (Events.time_fired_ts < end_ts)
+    with session_scope(hass=hass, read_only=True) as session:
+        counts = session.execute(
+            select(EventTypes.event_type, func.count())
+            .select_from(Events)
+            .join(EventTypes, Events.event_type_id == EventTypes.event_type_id)
+            .where(in_window)
+            .group_by(EventTypes.event_type)
+        ).all()
+        eligible = sorted(
+            (count, event_type)
+            for event_type, count in counts
+            if event_type and not is_system_event_type(event_type) and (wanted is None or event_type in wanted)
+        )
+        kept: list[str] = []
+        dropped: list[str] = []
+        total = 0
+        for count, event_type in eligible:
+            if total + count <= max_events:
+                kept.append(event_type)
+                total += count
+            else:
+                dropped.append(event_type)
+        if not kept:
+            return [], sorted(dropped)
+        rows = session.execute(
+            select(Events.time_fired_ts, EventTypes.event_type, EventData.shared_data, Events.event_data)
+            .select_from(Events)
+            .join(EventTypes, Events.event_type_id == EventTypes.event_type_id)
+            .outerjoin(EventData, Events.data_id == EventData.data_id)
+            .where(in_window, EventTypes.event_type.in_(kept))
+            .order_by(Events.time_fired_ts, Events.event_id)
+        ).all()
+    found = []
+    for at, event_type, shared, legacy in rows:
+        try:
+            data = json_loads(shared or legacy or "{}")
+        except ValueError:
+            continue
+        found.append((at, event_type, data if isinstance(data, dict) else {}))
+    return found, sorted(dropped)
 
 
 def _unrecorded_attributes(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:

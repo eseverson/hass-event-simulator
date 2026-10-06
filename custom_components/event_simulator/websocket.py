@@ -25,6 +25,7 @@ from homeassistant.util.yaml import parse_yaml
 from . import history, runner
 from .const import DOMAIN
 from .history import (
+    MAX_BUS_EVENTS,
     MAX_ENTITIES,
     MAX_EVENTS,
     MAX_SUGGEST_EVENTS,
@@ -94,6 +95,7 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_automations)
     websocket_api.async_register_command(hass, ws_automation)
     websocket_api.async_register_command(hass, ws_history)
+    websocket_api.async_register_command(hass, ws_bus_events)
     websocket_api.async_register_command(hass, ws_scenarios_list)
     websocket_api.async_register_command(hass, ws_scenarios_get)
     websocket_api.async_register_command(hass, ws_scenarios_save)
@@ -139,6 +141,25 @@ async def ws_history(hass, connection, msg: dict[str, Any]) -> None:
         await history.async_get_timeline(
             hass, msg["entity_ids"], msg["start"], msg["end"], max_window=MAX_SUGGEST_WINDOW
         ),
+    )
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/bus_events",
+        vol.Required("start"): cv.datetime,
+        vol.Required("end"): cv.datetime,
+        vol.Optional("event_types"): [cv.string],
+    }
+)
+@websocket_api.async_response
+@_wrap
+async def ws_bus_events(hass, connection, msg: dict[str, Any]) -> None:
+    """The recorded bus events of the window (`history.async_get_bus_events`): what the panel's events lane shows, and a replay of an event-triggered automation fires."""
+    connection.send_result(
+        msg["id"],
+        await history.async_get_bus_events(hass, msg["start"], msg["end"], event_types=msg.get("event_types")),
     )
 
 
@@ -222,6 +243,8 @@ SIMULATE_SCENARIO = vol.Schema(
         vol.Optional("initial_states", default=dict): dict,
         # A plain list, or packed (packed.py) to fit the websocket's 4 MiB message limit.
         vol.Optional("events", default=list): vol.Any(list, unpack_events),
+        # Recorded bus events fired at their times (`event_simulator/bus_events`), for event triggers.
+        vol.Optional("bus_events"): vol.All(list, vol.Length(max=MAX_BUS_EVENTS)),
         # How much each run carries (the engine's TRACE_MODES): the panel needs `full`; a long validation can ask for `summary` or `none` to stay under the output cap.
         vol.Optional("traces"): vol.In(TRACE_MODES),
     },
@@ -401,8 +424,15 @@ async def async_suggest(
         max_window=MAX_SUGGEST_WINDOW,
         max_events=MAX_SUGGEST_EVENTS,
     )
+    # Every recorded bus event of the window but Home Assistant's own, for event triggers (#35).
+    timeline["bus_events"] = (await history.async_get_bus_events(hass, start, end))["bus_events"]
     progress(
-        {"stage": "mining", "events": len(timeline["events"]), "labels": len(msg["labels"])}
+        {
+            "stage": "mining",
+            "events": len(timeline["events"]),
+            "bus_events": len(timeline["bus_events"]),
+            "labels": len(msg["labels"]),
+        }
     )
     result = await hass.async_add_executor_job(
         partial(
@@ -452,7 +482,9 @@ def _mine(
     should_stop: Callable[[], bool],
 ) -> SuggestResult:
     """Executor: the miner over the loaded timeline (labels outside the window are left out)."""
-    timeline = Timeline.from_scenario(data["initial_states"], data["events"], start, end)
+    timeline = Timeline.from_scenario(
+        data["initial_states"], data["events"], start, end, bus_events=data.get("bus_events")
+    )
     tolerance = Tolerance(
         **{
             edge: options[f"tolerance_{edge}"]
@@ -481,11 +513,12 @@ async def _async_validate(
 ) -> SuggestResult:
     """Replay every suggestion in one sandbox child and re-score them on what Home Assistant did (suggest/exact.py).
 
-    Only the entities the suggestions reference are sent, with their initial states; core config, registry snapshot and services come from this instance as for `simulate`. `traces: none` keeps a month of runs small.
+    Only the entities the suggestions reference are sent, with their initial states, and only the bus events of the types their event triggers listen to; core config, registry snapshot and services come from this instance as for `simulate`. `traces: none` keeps a month of runs small.
     """
     configs = [suggestion.config for suggestion in result.suggestions]
     entity_ids = sorted(set().union(*(s.candidate.entity_ids for s in result.suggestions)))
     wanted = set(entity_ids)
+    event_types = set().union(*(s.candidate.event_types for s in result.suggestions))
     scenario = {
         "version": 1,
         "start": start.isoformat(),
@@ -497,6 +530,9 @@ async def _async_validate(
             if entity_id in wanted
         },
         "events": [event for event in timeline["events"] if event["entity_id"] in wanted],
+        "bus_events": [
+            event for event in timeline.get("bus_events") or () if event["event_type"] in event_types
+        ],
         "core": history.async_core_config(hass),
         "registry": history.async_registry_snapshot(hass, {"automations": configs}, entity_ids),
         "services": {

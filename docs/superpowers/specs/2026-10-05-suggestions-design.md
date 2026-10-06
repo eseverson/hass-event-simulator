@@ -33,6 +33,7 @@ Two stages, so the search is fast and the answer is exact.
      - `numeric_state` — `above`/`below` crossings near anchors; the threshold is searched over observed values to maximize anchor hits and minimize fires elsewhere; `for:` as above.
      - `time` — when anchors cluster by clock time.
      - `sun` — `sunrise`/`sunset` with offset, when anchors cluster by sun event better than by clock.
+     - `event` (#35) — for each recorded bus event type (`zha_event`, `tag_scanned`, ...; Home Assistant's own bookkeeping left out, at most 20 000 events a window, the busiest types dropped first) with events near the anchors more often than chance: the type alone and the `event_data` that singles out the anchored events, greedily (the `(key, value)` that drops the most other events of the type while keeping every anchor hit, from no data and from each value the anchored events share). Scalar values only, none a static template would parse as another type; of data picking out the same events the fewest, best-known keys stay (a device id over its cluster). The timeline carries the events as an optional `bus_events` list beside the states; exact validation fires the types the suggestions listen to in the sandbox. A calendar trigger without an offset is the calendar entity turning on/off, explained as "an event of calendar.x starts"; with an offset it is not generated (#37).
      - any change (#34) — a `state` trigger with no from/to on a numeric sensor or attribute (the blueprint controllers' "re-evaluate on every report"), when the anchors land on its reports more often than chance.
      - OR of triggers (#33) — when no single trigger hits every anchor (of a side), up to 3 triggers on any entities and of any kinds, by greedy set cover over the anchors; a trigger joins only when it hits the missed anchors more often than chance, and each extra one costs as much simplicity as a condition. The parts keep their side's trigger id.
    - **Conditions** (to remove fires outside / inside must-not): `state` and `numeric_state` at fire time, `time` window (`after`/`before`), weekday, `sun` before/after. Greedy: start from each trigger, add the condition that removes the most bad fires while keeping all (or the most) anchor hits, up to N (default 2) conditions.
@@ -52,7 +53,7 @@ Mode switch Replay / Suggest sharing the same timeline. Suggest mode adds: brush
 
 ## Non-goals (this cut)
 
-Actions (the user writes them), template triggers, multi-entity "and" triggers, learning from logbook manual actions (the Danm72 approach), neighbor-entity scanning, ML models. Deterministic search only — every suggestion is explainable by the stats shown.
+Actions (the user writes them), template triggers (#38), calendar triggers with an offset (#37), multi-entity "and" triggers, learning from logbook manual actions (the Danm72 approach), neighbor-entity scanning, ML models. Deterministic search only — every suggestion is explainable by the stats shown.
 
 ## Testing
 

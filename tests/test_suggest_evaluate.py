@@ -10,6 +10,7 @@ import pytest
 from custom_components.event_simulator.suggest.evaluate import Evaluator, Fire
 from custom_components.event_simulator.suggest.model import (
     Candidate,
+    EventTrigger,
     NumericStateCondition,
     NumericStateTrigger,
     StateCondition,
@@ -29,7 +30,7 @@ DOOR = "binary_sensor.door"
 HUM = "sensor.humidity"
 
 
-def make(initial, changes, *, start=UTC_START, days=1, tz="UTC", sun_events=None):
+def make(initial, changes, *, start=UTC_START, days=1, tz="UTC", sun_events=None, bus=()):
     """`changes` is [(seconds after start, entity_id, state, attributes?)]."""
     t0 = to_ts(start)
     events = [
@@ -42,7 +43,8 @@ def make(initial, changes, *, start=UTC_START, days=1, tz="UTC", sun_events=None
         for c in changes
     ]
     initial = {eid: {"state": s, "attributes": {}} if isinstance(s, str) else s for eid, s in initial.items()}
-    timeline = Timeline.from_scenario(initial, events, start, t0 + days * 86_400)
+    bus_events = [{"at": datetime.fromtimestamp(t0 + b[0], UTC).isoformat(), "event_type": b[1], "data": b[2]} for b in bus]
+    timeline = Timeline.from_scenario(initial, events, start, t0 + days * 86_400, bus_events=bus_events)
     return Evaluator(timeline, time_zone=tz, sun_events=sun_events)
 
 
@@ -223,6 +225,31 @@ def test_sun_trigger_without_a_sun_function_is_refused_and_polar_days_are_skippe
         make({}, []).trigger_fires(SunTrigger("sunset"))
     ev = make({}, [], days=2, sun_events=lambda d: {"sunrise": None, "sunset": None} if d.day == 4 else fake_sun(d))
     assert rel(ev.trigger_fires(SunTrigger("sunset"))) == [86_400 + 18 * H - 5 * M]
+
+
+# Event trigger
+
+
+def test_event_trigger_fires_on_events_of_its_type_whose_data_contains_its_data():
+    ev = make(
+        {},
+        [],
+        bus=[
+            (10 * M, "zha_event", {"device_ieee": "aa", "command": "on", "args": {"x": 1}}),
+            (20 * M, "zha_event", {"device_ieee": "bb", "command": "on"}),
+            (30 * M, "zha_event", {"device_ieee": "aa", "command": "off"}),
+            (40 * M, "tag_scanned", {"tag_id": "aa"}),
+            (50 * M, "zha_event", {"command": "on"}),
+        ],
+    )
+    assert rel(ev.trigger_fires(EventTrigger("zha_event"))) == [600, 1200, 1800, 3000]
+    assert rel(ev.trigger_fires(EventTrigger("zha_event", (("device_ieee", "aa"),)))) == [600, 1800]
+    assert rel(ev.trigger_fires(EventTrigger("zha_event", (("device_ieee", "aa"), ("command", "on"))))) == [600]
+    assert ev.trigger_fires(EventTrigger("call_service")) == []
+    # Home Assistant compares values as they are: 1 is not "1".
+    ev = make({}, [], bus=[(M, "e", {"n": 1})])
+    assert ev.trigger_fires(EventTrigger("e", (("n", "1"),))) == []
+    assert rel(ev.trigger_fires(EventTrigger("e", (("n", 1),)))) == [60]
 
 
 # Conditions

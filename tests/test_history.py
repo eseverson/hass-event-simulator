@@ -440,3 +440,40 @@ async def test_referenced_entities_include_device_trigger_entities(hass: HomeAss
     result = history.async_get_automation(hass, "automation.device_trigger")
 
     assert result["referenced_entities"] == ["binary_sensor.side_door"]
+
+
+async def test_bus_events_in_the_window_without_home_assistant_bookkeeping(hass: HomeAssistant):
+    """#35: the recorder's events of the window, oldest first, with their data; Home Assistant's own (automation_triggered, call_service, service_registered, *_registry_updated, ...) left out."""
+    start = dt_util.utcnow().replace(microsecond=0) - timedelta(days=2)
+    fired = [
+        (start - timedelta(minutes=5), "zha_event", {"command": "before"}),
+        (start + timedelta(minutes=10), "zha_event", {"device_ieee": "aa", "command": "on", "args": {"k": 1}}),
+        (start + timedelta(minutes=20), "tag_scanned", {"tag_id": "front"}),
+        (start + timedelta(minutes=30), "automation_triggered", {"name": "x"}),
+        (start + timedelta(minutes=31), "call_service", {"domain": "light"}),
+        (start + timedelta(minutes=32), "entity_registry_updated", {"action": "update"}),
+        (start + timedelta(minutes=33), "recorder_5min_statistics_generated", {}),
+        (start + timedelta(minutes=34), "script_reloaded", {}),
+        (start + timedelta(minutes=40), "zha_event", {"device_ieee": "aa", "command": "off"}),
+        (start + timedelta(hours=2), "zha_event", {"command": "after"}),
+    ]
+    for at, event_type, data in fired:
+        hass.bus.async_fire(event_type, data, time_fired=at.timestamp())
+    await async_wait_recording_done(hass)
+
+    found = await history.async_get_bus_events(hass, start, start + timedelta(hours=1))
+    assert found["dropped_event_types"] == []
+    assert [(e["event_type"], e["data"]) for e in found["bus_events"]] == [
+        ("zha_event", {"device_ieee": "aa", "command": "on", "args": {"k": 1}}),
+        ("tag_scanned", {"tag_id": "front"}),
+        ("zha_event", {"device_ieee": "aa", "command": "off"}),
+    ]
+    assert dt_util.parse_datetime(found["bus_events"][0]["at"]) == start + timedelta(minutes=10)
+
+    # Over the cap, the busiest types go first.
+    capped = await history.async_get_bus_events(hass, start, start + timedelta(hours=1), max_events=1)
+    assert capped["dropped_event_types"] == ["zha_event"]
+    assert [e["event_type"] for e in capped["bus_events"]] == ["tag_scanned"]
+    # Only some types.
+    only = await history.async_get_bus_events(hass, start, start + timedelta(hours=1), event_types=["tag_scanned", "call_service"])
+    assert [e["event_type"] for e in only["bus_events"]] == ["tag_scanned"]

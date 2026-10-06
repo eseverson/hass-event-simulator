@@ -10,6 +10,7 @@ from homeassistant.core import HomeAssistant
 
 from custom_components.event_simulator.suggest.model import (
     Candidate,
+    EventTrigger,
     NumericStateCondition,
     NumericStateTrigger,
     StateCondition,
@@ -77,6 +78,21 @@ def test_other_triggers_render():
         "offset": "-00:30:00",
     }
     assert render_trigger(SunTrigger("sunrise")) == {"trigger": "sun", "event": "sunrise"}
+
+
+def test_event_trigger_renders_type_and_data_subset():
+    assert render_trigger(EventTrigger("zha_event", (("device_ieee", "b0:e8"), ("command", "on")), id="start")) == {
+        "trigger": "event",
+        "id": "start",
+        "event_type": "zha_event",
+        "event_data": {"device_ieee": "b0:e8", "command": "on"},
+    }
+    assert render_trigger(EventTrigger("tag_scanned")) == {"trigger": "event", "event_type": "tag_scanned"}
+    with pytest.raises(ValueError):
+        EventTrigger("")
+    candidate = Candidate((EventTrigger("tag_scanned"), StateTrigger(DOOR, to=("on",))))
+    assert candidate.entity_ids == {DOOR}
+    assert candidate.event_types == {"tag_scanned"}
 
 
 def test_conditions_render():
@@ -147,6 +163,7 @@ EVERYTHING = Candidate(
         TimeTrigger(7 * 3600 + 30 * 60 + 15, weekdays=("mon", "fri")),
         SunTrigger("sunset", offset=-1800),
         SunTrigger("sunrise", offset=900),
+        EventTrigger("zha_event", (("device_ieee", "b0:e8:e8:ff:fe:48:0b:83"), ("command", "learned_ir_code"), ("endpoint_id", 1))),
     ),
     conditions=(
         StateCondition("person.me", ("home", "work"), for_=120),
@@ -162,7 +179,7 @@ def test_render_automation_shape():
     config = render_automation(EVERYTHING, alias="Suggested")
     assert config["alias"] == "Suggested"
     assert config["mode"] == "single"
-    assert len(config["triggers"]) == 10 and len(config["conditions"]) == 5
+    assert len(config["triggers"]) == 11 and len(config["conditions"]) == 5
     assert config["actions"][0]["action"] == "logbook.log"
     custom = render_automation(EVERYTHING, alias="x", actions=[{"action": "light.turn_on"}])
     assert custom["actions"] == [{"action": "light.turn_on"}]
@@ -173,7 +190,7 @@ async def test_rendered_automation_passes_home_assistant_validation(hass: HomeAs
     validated = await async_validate_config_item(hass, "suggested", config)
     assert validated is not None
     assert validated.validation_error is None, validated.validation_error
-    assert len(validated["triggers"]) == 10
+    assert len(validated["triggers"]) == 11
     assert len(validated["conditions"]) == 5
 
     # The check has teeth: a broken trigger is reported.

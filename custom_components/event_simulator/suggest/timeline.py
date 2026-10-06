@@ -2,6 +2,8 @@
 
 Input is the timeline replay uses (`history.async_get_timeline`, unpacked): `initial_states` `{entity_id: {state, attributes, last_changed?, last_updated?}}` and `events` `[{at, entity_id, state, attributes, ...}]`. Times are POSIX seconds (floats) throughout the miner; `to_ts` converts.
 
+Bus events (`bus_events` `[{at, event_type, data}]`, the scenario's optional list of recorded events such as `zha_event` or `tag_scanned`) are kept per event type as `BusEvents`, time-ordered, inside the window.
+
 Each entity becomes a `StepFunction`: the entries it held, sorted by when each began, so "state at t" is one binary search. The seeded state begins at the window start (the sandbox seeds it there) but keeps its recorded `last_changed`. Like the sandbox, events outside `[start, end)` are skipped, and a write identical to the previous state and attributes is dropped, since Home Assistant fires no `state_changed` for it.
 """
 
@@ -162,15 +164,31 @@ class StepFunction:
             )
 
 
-class Timeline:
-    """Step functions for every entity in a scenario window `[start, end)`."""
+@dataclass(frozen=True, slots=True)
+class BusEvents:
+    """The recorded events of one type: `times[i]` and the event's `data[i]`, oldest first."""
 
-    def __init__(self, start: float, end: float, entities: dict[str, StepFunction]) -> None:
+    event_type: str
+    times: list[float]
+    data: list[Mapping[str, Any]]
+
+
+class Timeline:
+    """Step functions for every entity in a scenario window `[start, end)`, and the window's bus events by type."""
+
+    def __init__(
+        self,
+        start: float,
+        end: float,
+        entities: dict[str, StepFunction],
+        bus_events: dict[str, BusEvents] | None = None,
+    ) -> None:
         if end <= start:
             raise ValueError("The window must end after it starts")
         self.start = start
         self.end = end
         self._entities = entities
+        self._bus = bus_events or {}
 
     @classmethod
     def from_scenario(
@@ -179,6 +197,7 @@ class Timeline:
         events: list[Mapping[str, Any]],
         start: str | datetime | float,
         end: str | datetime | float,
+        bus_events: list[Mapping[str, Any]] | None = None,
     ) -> Timeline:
         start_ts, end_ts = to_ts(start), to_ts(end)
         if end_ts <= start_ts:
@@ -205,7 +224,19 @@ class Timeline:
             if (step := entities.get(entity_id)) is None:
                 step = entities[entity_id] = StepFunction(entity_id)
             step._append(at, str(event["state"]), event.get("attributes") or {}, None)  # noqa: SLF001
-        return cls(start_ts, end_ts, entities)
+        bus: dict[str, BusEvents] = {}
+        for at, _, event in sorted(
+            ((to_ts(event["at"]), n, event) for n, event in enumerate(bus_events or ())),
+            key=lambda item: (item[0], item[1]),
+        ):
+            if not start_ts <= at < end_ts:
+                continue
+            event_type = str(event["event_type"])
+            if (found := bus.get(event_type)) is None:
+                found = bus[event_type] = BusEvents(event_type, [], [])
+            found.times.append(at)
+            found.data.append(event.get("data") or {})
+        return cls(start_ts, end_ts, entities, bus)
 
     def __getitem__(self, entity_id: str) -> StepFunction:
         return self._entities[entity_id]
@@ -219,3 +250,12 @@ class Timeline:
     @property
     def entity_ids(self) -> list[str]:
         return list(self._entities)
+
+    @property
+    def event_types(self) -> list[str]:
+        """The types of the bus events in the window, sorted."""
+        return sorted(self._bus)
+
+    def bus_events(self, event_type: str) -> BusEvents:
+        """The window's events of one type (none: empty lists)."""
+        return self._bus.get(event_type) or BusEvents(event_type, [], [])

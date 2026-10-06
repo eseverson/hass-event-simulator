@@ -6,6 +6,7 @@ The miner scores thousands of candidates, so this re-implements the trigger and 
 - numeric_state: fires on crossing into the range, not while staying in it. The entity is armed while out of range; `unavailable` / `unknown` / a missing attribute count as out of range, while any other non-number is an error that neither arms nor disarms (and cancels a pending `for:`). An entity in range when the automation attaches is not armed.
 - time: fires at the local wall time each day, DST-correct: on a fall-back day an ambiguous time fires twice, on a spring-forward day a skipped time does not fire.
 - sun: fires at every `sun_events(date)[event] + offset`.
+- event: fires at every bus event of its type whose data holds each of its `(key, value)` pairs, compared as they are (the event trigger's items comparison).
 - conditions read the state at the fire time; errors (unknown entity, non-numeric value) fail the condition, as a condition error stops the run in Home Assistant.
 
 Where this knowingly differs from Home Assistant (the sandbox is the exact answer):
@@ -31,6 +32,7 @@ from .model import (
     WEEKDAYS,
     Candidate,
     Condition,
+    EventTrigger,
     NumericStateCondition,
     NumericStateTrigger,
     StateCondition,
@@ -133,6 +135,8 @@ class Evaluator:
                 fires = self._time_fires(trigger)
             case SunTrigger():
                 fires = self._sun_fires(trigger)
+            case EventTrigger():
+                fires = self._event_fires(trigger)
             case _:
                 raise TypeError(f"not a trigger: {trigger!r}")
         self._trigger_cache[trigger] = fires
@@ -225,6 +229,17 @@ class Evaluator:
             if (at := self.sun(day)[index]) is not None and self.start <= at + trigger.offset < self.end:
                 found.add(at + trigger.offset)
         return sorted(found)
+
+    def _event_fires(self, trigger: EventTrigger) -> list[float]:
+        found = self.timeline.bus_events(trigger.event_type)
+        wanted = trigger.event_data
+        if not wanted:
+            return list(found.times)
+        return [
+            t
+            for t, data in zip(found.times, found.data, strict=True)
+            if all(key in data and data[key] == value for key, value in wanted)
+        ]
 
     # Conditions
 

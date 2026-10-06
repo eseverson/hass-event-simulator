@@ -16,6 +16,7 @@ from custom_components.event_simulator.suggest.evaluate import Evaluator
 from custom_components.event_simulator.suggest.labels import Label, Labels, Tolerance
 from custom_components.event_simulator.suggest.model import (
     Candidate,
+    EventTrigger,
     NumericStateTrigger,
     StateCondition,
     StateTrigger,
@@ -796,6 +797,12 @@ def test_describe_reads_like_a_sentence():
     # Every write (attribute-only ones too) against `to: null`, state changes only.
     assert describe(Candidate((StateTrigger(HUM),))) == f"Fires when {HUM} changes"
     assert describe(Candidate((StateTrigger(HUM, changes_only=True),))) == f"Fires when {HUM} changes state"
+    # A calendar entity is on while one of its events runs: on and off are an event starting and ending (#35).
+    assert describe(Candidate((StateTrigger("calendar.trash", to=("on",)),))) == "Fires when an event of calendar.trash starts"
+    assert describe(Candidate((StateTrigger("calendar.trash", to=("off",), id="end"), StateTrigger("calendar.trash", to=("on",), id="start")))) == (
+        "Starts when an event of calendar.trash starts; ends when an event of calendar.trash ends"
+    )
+    assert describe(Candidate((EventTrigger("tag_scanned", (("tag_id", "front"),)),))) == "Fires when a tag_scanned event arrives with tag_id front"
     assert describe(Candidate((SunTrigger("sunset"), StateTrigger(DOOR, to=("on",)), StateTrigger(HUM)))) == f"Fires at sunset or when {DOOR} changes to on or {HUM} changes"
     assert describe(Candidate((TimeTrigger(7 * H),), (SunCondition(after="sunset", before="sunrise"),))) == "Fires at 07:00, only after sunset or before sunrise"
     assert describe(Candidate((TimeTrigger(7 * H),), (SunCondition(before="sunset", before_offset=H),))) == "Fires at 07:00, only before sunset + 1 h"
@@ -839,3 +846,96 @@ def test_a_month_of_twenty_chatty_entities_is_fast():
     elapsed = time.perf_counter() - began
     assert top(result).candidate.triggers[0].entity_id == DOOR
     assert elapsed < 10, elapsed  # the budget is ~2 s; generous for slow CI runners
+
+
+# Event triggers
+
+
+def zha_remotes(rng, days):
+    """Two ZHA remotes sending commands at random, every event carrying the same device keys: the bus events of a zigbee install."""
+    bus = []
+    for ieee, device, per_day in (("aa:aa", "dev-aa", 6), ("bb:bb", "dev-bb", 20)):
+        for at in sorted(rng.uniform(0, days * D) for _ in range(per_day * days)):
+            command = rng.choice(("on", "off"))
+            data = {
+                "device_ieee": ieee,
+                "device_id": device,
+                "unique_id": f"{ieee}:1:0x0006",
+                "endpoint_id": 1,
+                # A technical key that singles out the device as well as its id does: the id reads better.
+                "cluster_id": 6 if ieee == "aa:aa" else 8,
+                "command": command,
+                "args": [],
+                "params": {},
+            }
+            bus.append((at, "zha_event", data))
+    return bus
+
+
+def with_bus(tl, bus):
+    events = [
+        {"at": datetime.fromtimestamp(T0 + at, UTC).isoformat(), "event_type": event_type, "data": data}
+        for at, event_type, data in bus
+    ]
+    return Timeline(tl.start, tl.end, tl._entities, Timeline.from_scenario({}, [], tl.start, tl.end, bus_events=events)._bus)  # noqa: SLF001
+
+
+def test_event_trigger_from_the_events_at_the_labels():
+    rng = random.Random(7)
+    days = 7
+    initial, changes = distractors(rng, days)
+    bus = zha_remotes(rng, days)
+    # Noise on the bus: a type with an event near every label by chance would be no evidence, and one nowhere near them is not offered.
+    bus += [(rng.uniform(0, days * D), "mobile_app_notification_cleared", {"tag": "x"}) for _ in range(5)]
+    tl = with_bus(timeline(initial, changes, days), bus)
+    wanted = EventTrigger("zha_event", (("device_id", "dev-aa"), ("command", "on")))
+    fires = Evaluator(tl, time_zone="UTC").trigger_fires(wanted)
+    assert len(fires) >= 10
+    result = run(tl, Labels([fire(t - T0) for t in fires[:3]]))
+    best = top(result)
+    assert best.candidate.triggers == (wanted,), best.explanation
+    assert list(best.stats.fire_times) == fires
+    assert best.config["triggers"] == [
+        {"trigger": "event", "event_type": "zha_event", "event_data": {"device_id": "dev-aa", "command": "on"}}
+    ]
+    assert "zha_event" in best.explanation and "dev-aa" in best.explanation
+    assert all(c.event_types <= {"zha_event"} for c in (s.candidate for s in result.suggestions))
+
+
+def test_event_trigger_for_both_commands_leaves_the_command_out():
+    rng = random.Random(8)
+    days = 7
+    tl = with_bus(timeline({}, [], days), zha_remotes(rng, days))
+    wanted = EventTrigger("zha_event", (("device_id", "dev-aa"),))
+    fires = Evaluator(tl, time_zone="UTC").trigger_fires(wanted)
+    result = run(tl, Labels([fire(t - T0) for t in fires[:8]]))
+    assert top(result).candidate.triggers == (wanted,), top(result).explanation
+
+
+def test_event_data_values_home_assistant_would_read_differently_are_left_out():
+    """A static string in `event_data` is parsed by Home Assistant's template rendering ("1" becomes 1), so it would never match the event's "1"."""
+    days = 3
+    bus = []
+    for day in range(days):
+        for hour, button in ((8, "1"), (13, "2"), (19, "1")):
+            bus.append((day * D + hour * H, "deconz_event", {"id": "remote", "event": button, "unique": f"{day}-{hour}"}))
+    tl = with_bus(timeline({}, [], days), bus)
+    result = run(tl, Labels([fire(day * D + 13 * H) for day in range(days)]))
+    assert any(isinstance(t, EventTrigger) for s in result.suggestions for t in s.candidate.triggers)
+    for suggestion in result.suggestions:
+        for trigger in suggestion.candidate.triggers:
+            if isinstance(trigger, EventTrigger):
+                assert ("event", "2") not in trigger.event_data
+
+
+def test_of_event_data_picking_out_the_same_events_the_device_key_stays():
+    """An IR blaster sends only `learned_ir_code` on its own cluster: its id, its radio address, its cluster and the command each single out its events. The suggestion names the device, once."""
+    rng = random.Random(9)
+    days = 7
+    bus = zha_remotes(rng, days)
+    learned = sorted(rng.uniform(0, days * D) for _ in range(12))
+    data = {"device_ieee": "cc:cc", "device_id": "dev-cc", "unique_id": "cc:cc:1:0xed00", "endpoint_id": 1, "cluster_id": 60672, "command": "learned_ir_code"}
+    bus += [(at, "zha_event", data) for at in learned]
+    tl = with_bus(timeline({}, [], days), bus)
+    result = run(tl, Labels([fire(at) for at in learned[:3]]))
+    assert top(result).candidate.triggers == (EventTrigger("zha_event", (("device_id", "dev-cc"),)),), top(result).explanation

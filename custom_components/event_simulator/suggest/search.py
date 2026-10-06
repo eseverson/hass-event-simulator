@@ -8,6 +8,7 @@ How it searches (see docs/superpowers/specs/2026-10-05-suggestions-design.md):
 2. Trigger candidates around the anchors, each evaluated over the whole window:
    - `state`: every state change near an anchor (to, and from + to), attribute changes when the state is static, and `for:` when a state consistently began a similar lag before the anchors (quantized to friendly durations). Anchors that follow changes in two or three directions also get one trigger listing them all (a toggle). A free-form entity (`FREE_FORM` or more values in the window, most seen once: a timestamp, a counter, free text) only offers values it took more than once, and a trigger on any change of its state (`to: null`).
    - `numeric_state`: `above` / `below`, the threshold searched over the full window's values. The behavior of a threshold only changes at observed values, so each gap between consecutive distinct values is one candidate, represented by its roundest number; gaps are scored by how many anchors a crossing hits and how often the value crosses elsewhere. `for:` as for state. And a state trigger with no from/to (every report, as blueprint controllers re-evaluate), with `to: null` too when some reports change attributes only, when the anchors line up with its writes (within `ALIGN` seconds, more often than chance: any chatty sensor has some write within the tolerance of every anchor). A numeric attribute that changes while the state stays put gets the same trigger on the attribute. Conditions at fire time (`numeric_state` above/below) then narrow it, the template-free form of "every report while it is warm".
+   - `event`: for each type of recorded bus event (`zha_event`, `tag_scanned`, ...) with events near the anchors, the type alone and the `event_data` that picks out the anchored events: greedily, the `(key, value)` of the anchored events that removes the most other events of the type while keeping every anchor the trigger hits, from no data and from each value the anchored events share (a command, a button). Only scalar values are used, and no string Home Assistant's template rendering would read as another type ("1" becomes 1). A type is offered only when the anchors fall near its events more often than chance would.
    - `time` / `sun`: when the anchors cluster by local clock time, or by sunrise/sunset offset; whichever clusters more anchors with less spread wins. The time is chosen at or just before the cluster and rounded.
    Triggers that hit fewer than `min_recall` of the best trigger's anchors are dropped before any condition search, and only the best `beam` go on.
    When no single trigger hits every anchor of a side, ORs of up to `max_triggers` triggers (possibly on different entities or of different kinds) join them: greedy set cover from each of the best `union_seeds` triggers, each step adding the trigger, searched again around the anchors still missed, that hits the most of them with the fewest bad fires. A trigger joins only as evidence, not chance: it hits the missed anchors more often than its fires would at random (binomial tail at `union_alpha`), and one fitted to a single moment (a clock time, a threshold, a `for:`) never joins for one anchor. The parts of an OR keep their side's trigger id, so a start/end pair stays a pair; each extra part costs as much simplicity as a condition.
@@ -17,6 +18,7 @@ How it searches (see docs/superpowers/specs/2026-10-05-suggestions-design.md):
 
 from __future__ import annotations
 
+import ast
 import math
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
@@ -33,6 +35,7 @@ from .model import (
     WEEKDAYS,
     Candidate,
     Condition,
+    EventTrigger,
     NumericStateCondition,
     NumericStateTrigger,
     StateCondition,
@@ -58,6 +61,8 @@ MAX_SUN_OFFSET = 3 * 3600  # a sun trigger or condition further from the event r
 _MERGE = 60  # outside fires of several suggestions closer than this are one hint
 ALIGN = 5.0  # an any-change trigger is offered when anchors fall this close (seconds) to the entity's writes ...
 ALIGN_ALPHA = 0.05  # ... more often than chance would, at this level
+# `event_data` keys in the order they are preferred when several pick out the same events (a device's id over its radio address).
+EVENT_KEYS = ("device_id", "entity_id", "tag_id", "device_ieee", "unique_id", "id", "command", "type", "subtype", "action", "event", "button")
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +268,9 @@ def describe_trigger(trigger: Trigger) -> str:
     match trigger:
         case StateTrigger():
             target = trigger.entity_id if trigger.attribute is None else f"{trigger.entity_id}'s {trigger.attribute}"
+            if trigger.entity_id.startswith("calendar.") and trigger.attribute is None and trigger.from_ is None and not trigger.for_ and trigger.to in (("on",), ("off",)):
+                # A calendar entity is on while one of its events runs (its attributes name the event): a calendar trigger without an offset, as a state trigger.
+                return f"an event of {trigger.entity_id} {'starts' if trigger.to == ('on',) else 'ends'}"
             if trigger.to is not None and trigger.from_ is not None:
                 text = f"{target} changes from {_values_text(trigger.from_)} to {_values_text(trigger.to)}"
             elif trigger.to is not None:
@@ -298,6 +306,11 @@ def describe_trigger(trigger: Trigger) -> str:
             return text
         case SunTrigger():
             return f"at {trigger.event}" if not trigger.offset else _sun_text(trigger.event, trigger.offset)
+        case EventTrigger():
+            text = f"a {trigger.event_type} event arrives"
+            if trigger.event_data:
+                text += " with " + ", ".join(f"{key} {value}" for key, value in trigger.event_data)
+            return text
     raise TypeError(f"not a trigger: {trigger!r}")
 
 
@@ -384,12 +397,15 @@ def explain(candidate: Candidate, stats: Stats, anchor_words: str) -> str:
 
 
 def complexity(candidate: Candidate) -> int:
-    """Options beyond the bare minimum (from, not_from, attribute, both bounds): fewer reads simpler."""
+    """Options beyond the bare minimum (from, not_from, attribute, both bounds, event data keys): fewer reads simpler."""
     count = 0
     for part in (*candidate.triggers, *candidate.conditions):
         match part:
             case StateTrigger():
                 count += sum(v is not None for v in (part.from_, part.not_from, part.not_to, part.attribute))
+            case EventTrigger():
+                # Every key beyond the first, and once more each technical one (a cluster, an endpoint; not in EVENT_KEYS): "device X, command on" reads better than "cluster 6, command on" for the same events.
+                count += max(0, len(part.event_data) - 1) + sum(key not in EVENT_KEYS for key, _ in part.event_data)
             case NumericStateTrigger() | NumericStateCondition():
                 count += part.above is not None and part.below is not None
             case StateCondition():
@@ -679,6 +695,24 @@ def _binomial_tail(n: int, k: int, p: float) -> float:
     return min(1.0, total)
 
 
+def _event_value(value: Any) -> bool:
+    """Whether an event data value can go in a trigger's `event_data`: a scalar that renders back to itself. Home Assistant renders `event_data` as a template and parses a static string's result, so "1", "True" or "[1]" would compare as 1, True, [1] and never match the event's string."""
+    if isinstance(value, bool | int | float):
+        return True
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    try:
+        parsed = ast.literal_eval(value)
+    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+        return True
+    return isinstance(parsed, str)
+
+
+def _event_pair_order(pair: tuple[str, Any]) -> tuple[Any, ...]:
+    key = pair[0]
+    return (EVENT_KEYS.index(key) if key in EVENT_KEYS else len(EVENT_KEYS), key, str(pair[1]))
+
+
 class _Search:
     def __init__(self, timeline: Timeline, labels: Labels, evaluator: Evaluator, options: SuggestOptions) -> None:
         self.timeline = timeline
@@ -743,7 +777,73 @@ class _Search:
                 found |= self._numeric_triggers(entity_id, anchors, trigger_id, min_hits)
             else:
                 found |= self._state_triggers(entity_id, anchors, trigger_id, min_hits)
+        found |= self._event_triggers(anchors, trigger_id, min_hits)
         found.update(clock_triggers(self.ev, self.labels, anchors, trigger_id, min_hits))
+        return found
+
+    def _anchors_hit(self, fires: Sequence[float], anchors: Sequence[Anchor]) -> int:
+        before, after = self.tolerance.before, self.tolerance.after
+        return sum(bisect_right(fires, a.at + after) > bisect_left(fires, a.at - before) for a in anchors)
+
+    def _event_triggers(self, anchors: Sequence[Anchor], tid: str | None, min_hits: int) -> set[Trigger]:
+        """Event triggers on each bus event type with events near the anchors: the type alone, and with the `event_data` that singles out the anchored events (see the module docstring)."""
+        found: set[Trigger] = set()
+        before, after = self.tolerance.before, self.tolerance.after
+        span = max(self.timeline.end - self.timeline.start, 1.0)
+        for event_type in self.timeline.event_types:
+            bus = self.timeline.bus_events(event_type)
+            support: dict[tuple[str, Any], set[int]] = defaultdict(set)
+            near = 0
+            for n, anchor in enumerate(anchors):
+                lo, hi = bisect_left(bus.times, anchor.at - before), bisect_right(bus.times, anchor.at + after)
+                near += hi > lo
+                for i in range(lo, hi):
+                    for key, value in bus.data[i].items():
+                        if _event_value(value):
+                            support[(key, value)].add(n)
+            if near < min_hits:
+                continue
+            pairs = sorted((pair for pair, hits in support.items() if len(hits) >= min_hits), key=_event_pair_order)
+
+            def trigger(data: tuple[tuple[str, Any], ...], event_type: str = event_type) -> EventTrigger:
+                return EventTrigger(event_type, tuple(sorted(data, key=_event_pair_order)), id=tid)
+
+            def specialize(data: tuple[tuple[str, Any], ...]) -> list[EventTrigger]:
+                """Greedy: add the pair that drops the most other events while keeping every anchor hit, until none drops any."""
+                path = [trigger(data)]
+                fires = self.ev.trigger_fires(path[0])
+                hits = self._anchors_hit(fires, anchors)
+                while True:
+                    best: tuple[int, EventTrigger, list[float]] | None = None
+                    for pair in pairs:
+                        if pair in data or any(key == pair[0] for key, _ in data):
+                            continue
+                        candidate = trigger((*data, pair))
+                        narrowed = self.ev.trigger_fires(candidate)
+                        if len(narrowed) >= len(fires) or self._anchors_hit(narrowed, anchors) < hits:
+                            continue
+                        if best is None or len(narrowed) < best[0]:
+                            best = (len(narrowed), candidate, narrowed)
+                    if best is None:
+                        return path
+                    _, chosen, fires = best
+                    data = chosen.event_data
+                    path.append(chosen)
+
+            # The type alone, then each value the anchored events share as a start (a command among several of one device). Of the data picking out the same events, only the fewest, best-known keys stay (a device's id over its command or its radio address).
+            best: dict[tuple[float, ...], tuple[tuple[Any, ...], EventTrigger]] = {}
+            for start in ((), *((pair,) for pair in pairs)):
+                for candidate in specialize(start):
+                    fires = self.ev.trigger_fires(candidate)
+                    hits = self._anchors_hit(fires, anchors)
+                    chance = min(1.0, len(fires) * (before + after) / span)
+                    if hits < min_hits or _binomial_tail(len(anchors), hits, chance) > ALIGN_ALPHA:
+                        continue
+                    order = (len(candidate.event_data), [_event_pair_order(pair) for pair in candidate.event_data])
+                    key = tuple(fires)
+                    if key not in best or order < best[key][0]:
+                        best[key] = (order, candidate)
+            found.update(candidate for _, candidate in best.values())
         return found
 
     def _state_triggers(self, entity_id: str, anchors: Sequence[Anchor], tid: str | None, min_hits: int) -> set[Trigger]:
