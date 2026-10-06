@@ -327,3 +327,29 @@ test("the subscribe request carries the packed scenario", () => {
   assert.equal(msg.type, "event_simulator/simulate/subscribe");
   assert.deepEqual(msg.scenario.events.entity_ids, ["x.y"]);
 });
+
+test("reset drops the run in flight and answers afresh once ready (a scenario loaded)", () => {
+  const h = harness();
+  h.scheduler.change();
+  h.advance(AUTO_RUN_DELAY);
+  assert.deepEqual(h.started.map((s) => s.seq), [1]);
+  h.scheduler.setReady(false); // the scenario's history is loading
+  h.scheduler.reset();
+  assert.deepEqual(h.cancelled, [1]);
+  assert.equal(h.scheduler.finish(1), false, "the old answer is not current");
+  h.advance(10 * AUTO_RUN_DELAY);
+  assert.equal(h.started.length, 1, "nothing starts while not ready");
+  h.scheduler.setReady(true);
+  h.advance(AUTO_RUN_DELAY);
+  assert.deepEqual(h.started.map((s) => s.seq), [1, 3]);
+});
+
+test("reset with auto off only marks the inputs changed", () => {
+  const h = harness({ enabled: false });
+  h.scheduler.runNow();
+  h.scheduler.reset();
+  h.advance(10 * AUTO_RUN_DELAY);
+  assert.deepEqual(h.started.map((s) => s.seq), [1]);
+  assert.equal(h.scheduler.dirty, true);
+  assert.equal(h.scheduler.running, false);
+});

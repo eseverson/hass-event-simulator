@@ -767,6 +767,13 @@ export class ReplayScheduler {
     this._abandon();
   }
 
+  /* Everything changed at once (a scenario loaded): drop the run in flight and anything
+   * pending, then answer afresh like after any change, once ready. */
+  reset() {
+    this.invalidate();
+    this.change();
+  }
+
   dispose() {
     this.invalidate();
   }
@@ -2817,9 +2824,10 @@ class EventSimulatorPanel extends Base {
     if (this._suggestState?.running) this._suggestState = { ...this._suggestState, running: false };
   }
 
-  /* Nothing suggested any more (a scenario loaded): drop the run, the result and the picks. */
+  /* Nothing suggested any more (a scenario loaded): drop the run, the result and the picks;
+   * auto-suggest then asks afresh, as auto-run replays a loaded scenario. */
   _resetSuggest() {
-    this._suggestScheduler.invalidate();
+    this._suggestScheduler.reset();
     this._cancelSuggest();
     this._suggestState = null;
     this._suggestPrint = null;
@@ -3221,8 +3229,7 @@ class EventSimulatorPanel extends Base {
     this._selectedRun = null;
     this._resultStale = false;
     this._resultPrint = null;
-    this._scheduler.invalidate();
-    this._scheduler.change();
+    this._scheduler.reset();
   }
 
   /* Something a replay depends on changed: the shown result is out of date, and auto-run
