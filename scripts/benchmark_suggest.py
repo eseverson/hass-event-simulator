@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import bisect
 import json
 import re
 import shutil
@@ -191,27 +192,29 @@ def latest_event(db: Path) -> float:
 # Metrics
 
 
-def _matches(fire: float, real: float) -> bool:
-    return real - TOL_BEFORE <= fire <= real + TOL_AFTER
-
-
 def coverage(fires: list[float], reals: list[float]) -> tuple[int, int]:
-    """(real fires matched by some fire, fires matching some real fire)."""
+    """(real fires matched by some fire, fires matching some real fire), by binary search: a month of a chatty trigger is 30 000 of each."""
     fires, reals = sorted(fires), sorted(reals)
-    hit = sum(any(_matches(f, r) for f in _near(fires, r)) for r in reals)
-    good = sum(any(_matches(f, r) for r in _near(reals, f)) for f in fires)
+    hit = sum(_any_in(fires, r - TOL_BEFORE, r + TOL_AFTER) for r in reals)
+    good = sum(_any_in(reals, f - TOL_AFTER, f + TOL_BEFORE) for f in fires)
     return hit, good
 
 
-def _near(values: list[float], t: float) -> list[float]:
-    import bisect
+def _any_in(values: list[float], lo: float, hi: float) -> bool:
+    """Whether sorted `values` has one in [lo, hi]."""
+    i = bisect.bisect_left(values, lo)
+    return i < len(values) and values[i] <= hi
 
-    return values[bisect.bisect_left(values, t - TOL_AFTER - 1) : bisect.bisect_right(values, t + TOL_AFTER + 1)]
+
+def _enabled(t: float, enabled: list[tuple[float, float]], starts: list[float]) -> bool:
+    i = bisect.bisect_right(starts, t) - 1
+    return i >= 0 and t < enabled[i][1]
 
 
 def evaluate(suggestion: dict[str, Any], reals: list[float], held_out: list[float], days: float, enabled: list[tuple[float, float]]) -> dict[str, Any]:
     """Only fires while the real automation was enabled count: before it existed, or while it was off, it could not fire."""
-    fires = [t for t in map(_ts, suggestion["stats"].get("fire_times", [])) if any(lo <= t < hi for lo, hi in enabled)]
+    starts = [lo for lo, _ in enabled]
+    fires = [t for t in map(_ts, suggestion["stats"].get("fire_times", [])) if _enabled(t, enabled, starts)]
     hit, good = coverage(fires, reals)
     held_hit, _ = coverage(fires, held_out)
     recall = hit / len(reals) if reals else 1.0
@@ -364,7 +367,8 @@ async def run_one(
         out["error"] = result["error"]
         return out
     suggestions = result.get("suggestions") or []
-    scored = [evaluate(s, fires, held_out, days, enabled) for s in suggestions]
+    # In a thread: the instance under test shares this event loop, and other runs' replays are waiting on it.
+    scored = await asyncio.to_thread(lambda: [evaluate(s, fires, held_out, days, enabled) for s in suggestions])
     out.update(
         {
             "warning": result.get("warning"),
