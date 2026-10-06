@@ -557,7 +557,9 @@ export function normalizeResult(raw) {
     }))
     .filter((c) => Number.isFinite(c.t));
   const warnings = (Array.isArray(r.warnings) ? r.warnings : []).map(normalizeWarning);
-  return { runs, calls, warnings };
+  // The states of the helpers the scenario asked for (#43, #44): {entity_id: [{at, state}]}.
+  const helperStates = isObject(r.helper_states) ? Object.fromEntries(Object.entries(r.helper_states).filter(([, v]) => Array.isArray(v))) : {};
+  return { runs, calls, warnings, helperStates };
 }
 
 /* A result warning as {code, message, at}: `at` in ms or null. The engine sends
@@ -693,7 +695,7 @@ function stripMarks(item) {
 /* The scenario sent to event_simulator/simulate (see the design spec). Events from all
  * tracks merged into one list ordered by time, as the child replays them. `automation`
  * is always the config as an object, edited or not (see the config editor below). */
-export function buildScenario({ automation, start, end, tracks, busEvents = [], calendars = {} }) {
+export function buildScenario({ automation, start, end, tracks, busEvents = [], calendars = {}, helpers = [] }) {
   const initial_states = {};
   const events = [];
   for (const track of tracks) {
@@ -720,6 +722,9 @@ export function buildScenario({ automation, start, end, tracks, busEvents = [], 
   const named = calendarTriggerEntities(automation);
   const served = Object.fromEntries(Object.entries(calendars || {}).filter(([id]) => named.has(id)));
   if (Object.keys(served).length) scenario.calendars = served;
+  // The trend/derivative helpers a suggestion needs, which the sandbox sets up (#43).
+  const needed = scenarioHelpers(helpers);
+  if (needed.length) scenario.helpers = needed;
   return scenario;
 }
 
@@ -2129,6 +2134,17 @@ export function suggestionView(raw, index = 0) {
     approx: isObject(s.approx_stats) ? s.approx_stats : null,
   };
   view.fires = count(stats.fires, view.fireTimes ? view.fireTimes.length : view.hits + view.violations.length + view.outside.length + view.inside.length);
+  // #44: the helpers it needs, its kinds (sent, else derived) and the variants folded into it.
+  const rawHelpers = Array.isArray(s.helpers) ? s.helpers : [];
+  view.helpers = rawHelpers.map(helperView).filter(Boolean);
+  Object.assign(view, suggestionKinds(s, config, rawHelpers));
+  view.variant = 0;
+  view.variants = (Array.isArray(s.variants) ? s.variants : []).filter(isObject).map((rv, i) => {
+    const v = suggestionView({ ...rv, rank: s.rank ?? index, helpers: Array.isArray(rv.helpers) ? rv.helpers : rawHelpers, variants: [] }, index);
+    v.variant = i + 1;
+    v.diff = variantDiff(config, v.config);
+    return v;
+  });
   return view;
 }
 
@@ -2276,6 +2292,286 @@ export function suggestEmptyState({ available, tracks, fireLabels, state }) {
   }
   if (!state?.result) return { kind: "waiting", text: state?.running ? "Looking for triggers and conditions that fit…" : "Press Suggest now to look for triggers and conditions that fit the labels." };
   return null;
+}
+
+// ---- suggestion kinds, variants and helpers (#44) ------------------------------
+//
+// The contract shared with the backend: each suggestion carries `kinds` (its triggers' and
+// conditions' kinds), `trigger_kinds` (its triggers' only: what the filter chips use),
+// `variants` (near-duplicates folded into the card, best first) and `helpers` (the trend or
+// derivative helpers it needs). A backend without them still gets chips: the kinds are then
+// derived from the config here, by the same rules.
+
+export const KIND_NAMES = {
+  state: "State",
+  attribute: "Attribute",
+  numeric: "Threshold",
+  any_change: "Any change",
+  trend: "Rising/falling (trend)",
+  time: "Time of day",
+  weekday: "Weekday",
+  sun: "Sun",
+  calendar: "Calendar",
+  event: "Event",
+  entity_time: "Entity time",
+  or: "Combined (OR)",
+};
+const KIND_RANK = new Map(Object.keys(KIND_NAMES).map((k, i) => [k, i]));
+
+export function kindName(kind) {
+  const k = String(kind);
+  if (KIND_NAMES[k]) return KIND_NAMES[k];
+  const words = k.replace(/_/g, " ");
+  return `${words.charAt(0).toUpperCase()}${words.slice(1)}`;
+}
+
+/* Kinds in the order the chips show them: the known ones in KIND_NAMES order, then the rest
+ * alphabetically. */
+export function sortKinds(kinds) {
+  const rank = (k) => KIND_RANK.get(k) ?? KIND_RANK.size;
+  return [...new Set(kinds)].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+}
+
+const asList = (v) => (v == null ? [] : Array.isArray(v) ? v : [v]);
+const CLOCK_RE = /^\d{1,2}:\d{2}(:\d{2})?$/;
+
+/* The kinds of one trigger config: [] for one the suggester never makes. `helperIds` are the
+ * entities of the suggestion's helpers: a trigger on one of them is a trend trigger. */
+export function triggerKinds(trigger, helperIds = new Set()) {
+  if (!isObject(trigger)) return [];
+  const platform = trigger.trigger ?? trigger.platform;
+  const onHelper = asList(trigger.entity_id).some((id) => helperIds.has(id));
+  if (platform === "state") {
+    if (onHelper) return ["trend"];
+    const constrained = ["from", "to", "not_from", "not_to"].some((k) => trigger[k] !== undefined && trigger[k] !== null);
+    if (trigger.attribute != null) return constrained ? ["attribute"] : ["attribute", "any_change"];
+    return constrained ? ["state"] : ["any_change"];
+  }
+  if (platform === "numeric_state") return [onHelper ? "trend" : "numeric"];
+  if (platform === "time") {
+    const out = asList(trigger.at).map((at) => (typeof at === "string" && CLOCK_RE.test(at.trim()) ? "time" : "entity_time"));
+    if (trigger.weekday != null) out.push("weekday");
+    return out.length ? out : ["time"];
+  }
+  if (platform === "time_pattern") return ["time"];
+  if (["sun", "calendar", "event"].includes(platform)) return [platform];
+  return platform ? [String(platform)] : [];
+}
+
+/* The kinds of one condition config, through and/or/not. */
+export function conditionKinds(condition, helperIds = new Set()) {
+  if (!isObject(condition)) return [];
+  const kind = condition.condition;
+  if (["and", "or", "not"].includes(kind)) return asList(condition.conditions).flatMap((c) => conditionKinds(c, helperIds));
+  const onHelper = asList(condition.entity_id).some((id) => helperIds.has(id));
+  if (kind === "state") return [onHelper ? "trend" : condition.attribute != null ? "attribute" : "state"];
+  if (kind === "numeric_state") return [onHelper ? "trend" : "numeric"];
+  if (kind === "time") {
+    const out = [];
+    if (condition.after != null || condition.before != null) out.push("time");
+    if (condition.weekday != null) out.push("weekday");
+    return out.length ? out : ["time"];
+  }
+  if (kind === "sun") return ["sun"];
+  return kind ? [String(kind)] : [];
+}
+
+/* {kinds, triggerKinds} of a suggested config, as the backend would send them: `or` when
+ * two or more triggers fire for the same side (share a trigger id, or both have none). */
+export function deriveKinds(config, helpers = []) {
+  const c = isObject(config) ? config : {};
+  const helperIds = new Set(asList(helpers).map((h) => h?.entity_id).filter(Boolean));
+  const triggers = asList(c.triggers ?? c.trigger);
+  const fromTriggers = triggers.flatMap((t) => triggerKinds(t, helperIds));
+  const sides = new Map();
+  for (const t of triggers) {
+    const id = isObject(t) && t.id != null ? String(t.id) : "";
+    sides.set(id, (sides.get(id) || 0) + 1);
+  }
+  if ([...sides.values()].some((n) => n > 1)) fromTriggers.push("or");
+  const fromConditions = asList(c.conditions ?? c.condition).flatMap((x) => conditionKinds(x, helperIds));
+  return { kinds: sortKinds([...fromTriggers, ...fromConditions]), triggerKinds: sortKinds(fromTriggers) };
+}
+
+const kindList = (v) => (Array.isArray(v) ? sortKinds(v.filter((k) => typeof k === "string" && k)) : null);
+
+/* A suggestion's {kinds, triggerKinds}: what the backend sent, else derived from its config. */
+export function suggestionKinds(raw, config, helpers = []) {
+  const s = isObject(raw) ? raw : {};
+  const sent = { kinds: kindList(s.kinds), triggerKinds: kindList(s.trigger_kinds) };
+  if (sent.kinds && sent.triggerKinds) return sent;
+  const derived = deriveKinds(config, helpers);
+  return { kinds: sent.kinds ?? derived.kinds, triggerKinds: sent.triggerKinds ?? derived.triggerKinds };
+}
+
+/* The filter chips for a list of suggestion views: [{kind, name, count}] for every kind at
+ * least one of them has (trigger kinds, or with `conditions` all kinds), count = how many. */
+export function kindChips(views, { conditions = false } = {}) {
+  const counts = new Map();
+  for (const v of views) for (const k of (conditions ? v.kinds : v.triggerKinds) || []) counts.set(k, (counts.get(k) || 0) + 1);
+  return sortKinds(counts.keys()).map((kind) => ({ kind, name: kindName(kind), count: counts.get(kind) }));
+}
+
+/* The selected kinds that some suggestion has: a remembered pick no longer in the result
+ * does not hide everything. */
+export function activeKinds(selected, chips) {
+  const present = new Set(chips.map((c) => c.kind));
+  return [...(selected || [])].filter((k) => present.has(k));
+}
+
+/* The suggestions a kind filter shows: those with any of the selected kinds (all of them
+ * when none is selected). */
+export function filterSuggestions(views, selected, { conditions = false } = {}) {
+  const want = new Set(selected || []);
+  if (!want.size) return views;
+  return views.filter((v) => ((conditions ? v.kinds : v.triggerKinds) || []).some((k) => want.has(k)));
+}
+
+/* Hints that belong with the shown suggestions: those that name one of them, and those that
+ * name none (recurrences of the labeled change). */
+export function hintsFor(hints, ranks) {
+  const shown = new Set(ranks);
+  return hints.filter((h) => !h.suggestions.length || h.suggestions.some((r) => shown.has(r)));
+}
+
+export const KIND_FILTER_KEY = "event_simulator.suggest_filter";
+
+/* The remembered kind filter: {kinds: [...], conditions: bool}; empty where storage is
+ * missing, throws or holds something else. */
+export function readKindFilter(storage = globalThis.localStorage) {
+  try {
+    const raw = JSON.parse(storage?.getItem(KIND_FILTER_KEY) || "null");
+    if (!isObject(raw)) return { kinds: [], conditions: false };
+    return { kinds: (Array.isArray(raw.kinds) ? raw.kinds : []).filter((k) => typeof k === "string"), conditions: raw.conditions === true };
+  } catch {
+    return { kinds: [], conditions: false };
+  }
+}
+
+export function writeKindFilter(filter, storage = globalThis.localStorage) {
+  try {
+    storage?.setItem(KIND_FILTER_KEY, JSON.stringify({ kinds: [...(filter.kinds || [])], conditions: !!filter.conditions }));
+  } catch {
+    // not remembered
+  }
+}
+
+const DURATION_KEYS = new Set(["days", "hours", "minutes", "seconds", "milliseconds"]);
+const isDuration = (v) => isObject(v) && Object.keys(v).length > 0 && Object.keys(v).every((k) => DURATION_KEYS.has(k));
+
+/* A duration as config writes it ({hours, minutes, ...}, "HH:MM:SS" or seconds) as H:MM:SS. */
+export function durationText(value) {
+  let s;
+  if (isDuration(value)) {
+    s = (count(value.days) * 86400 + count(value.hours) * 3600 + count(value.minutes) * 60 + count(value.seconds)) + count(value.milliseconds) / 1000;
+  } else if (typeof value === "number") s = value;
+  else return String(value);
+  const sign = s < 0 ? "-" : "";
+  s = Math.abs(s);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = Math.round((s % 60) * 1000) / 1000;
+  return `${sign}${h}:${pad2(m)}:${sec < 10 ? "0" : ""}${sec}`;
+}
+
+const THRESHOLD_KEYS = new Set(["above", "below"]);
+const DURATION_FIELDS = new Set(["for", "offset", "after_offset", "before_offset", "time_window", "sample_duration"]);
+
+/* A config part's leaves as path -> display text: durations and lists of scalars are one leaf. */
+function configLeaves(value, path, out) {
+  if (isDuration(value)) out.set(path, durationText(value));
+  else if (Array.isArray(value) && value.every((v) => !isObject(v) && !Array.isArray(v))) out.set(path, value.map((v) => String(v)).join(", "));
+  else if (Array.isArray(value)) value.forEach((v, i) => configLeaves(v, `${path}[${i}]`, out));
+  else if (isObject(value)) for (const [k, v] of Object.entries(value)) configLeaves(v, path ? `${path}.${k}` : k, out);
+  else out.set(path, value === null ? "null" : String(value));
+  return out;
+}
+
+/* How a variant's triggers and conditions differ from its card's: [{path, field, label,
+ * from, to, kind}] (from/to null where one side lacks it), kind "threshold" (above/below),
+ * "duration" (for/offset...) or "other"; thresholds and durations first. */
+export function variantDiff(base, variant) {
+  const part = (c) => {
+    const x = isObject(c) ? c : {};
+    return { triggers: asList(x.triggers ?? x.trigger), conditions: asList(x.conditions ?? x.condition) };
+  };
+  const a = configLeaves(part(base), "", new Map());
+  const b = configLeaves(part(variant), "", new Map());
+  const out = [];
+  for (const path of new Set([...a.keys(), ...b.keys()])) {
+    const from = a.has(path) ? a.get(path) : null;
+    const to = b.has(path) ? b.get(path) : null;
+    if (from === to) continue;
+    const m = /^(triggers|conditions)\[(\d+)\]\.(.+)$/.exec(path);
+    const field = m ? m[3] : path;
+    const leaf = field.split(/[.[]/)[0];
+    const kind = THRESHOLD_KEYS.has(leaf) ? "threshold" : DURATION_FIELDS.has(leaf) ? "duration" : "other";
+    const many = m && Math.max(part(base)[m[1]].length, part(variant)[m[1]].length) > 1;
+    const label = m ? `${many ? `${m[1] === "triggers" ? "trigger" : "condition"} ${Number(m[2]) + 1} ` : m[1] === "conditions" ? "condition " : ""}${field}` : field;
+    out.push({ path, field, label, from, to, kind });
+  }
+  const order = { threshold: 0, duration: 1, other: 2 };
+  return out.sort((x, y) => order[x.kind] - order[y.kind]);
+}
+
+export const HELPER_NAMES = { trend: "Trend", derivative: "Derivative sensor" };
+const HELPER_PLATFORM = { trend: "binary_sensor", derivative: "sensor" };
+
+/* A helper's options for the table: [[key, text]], durations as H:MM:SS. */
+export function helperOptionRows(options) {
+  return Object.entries(isObject(options) ? options : {}).map(([k, v]) => [k, isDuration(v) ? durationText(v) : isObject(v) || Array.isArray(v) ? JSON.stringify(v) : String(v)]);
+}
+
+/* The YAML that sets the helper up in configuration.yaml (the UI helper takes the same options). */
+export function helperYaml(helper) {
+  const options = isObject(helper.options) ? helper.options : {};
+  const objectId = String(helper.entityId || "").split(".")[1] || helper.domain;
+  const platform = HELPER_PLATFORM[helper.domain];
+  if (helper.domain === "trend") {
+    const sensor = { ...(helper.title ? { friendly_name: helper.title } : {}), ...options };
+    return toYaml({ [platform]: [{ platform: "trend", sensors: { [objectId]: sensor } }] });
+  }
+  return toYaml({ [platform || helper.domain]: [{ platform: helper.domain, ...(helper.title ? { name: helper.title } : {}), ...options }] });
+}
+
+/* A helper a suggestion needs, as the card shows it: {domain, name, title, options, entityId,
+ * rows, yaml}, or null without a domain. */
+export function helperView(raw) {
+  const h = isObject(raw) ? raw : {};
+  if (!h.domain) return null;
+  const domain = String(h.domain);
+  const view = {
+    domain,
+    name: HELPER_NAMES[domain] ?? kindName(domain),
+    title: String(h.title || "").trim(),
+    options: isObject(h.options) ? h.options : {},
+    entityId: h.entity_id ? String(h.entity_id) : null,
+  };
+  view.rows = helperOptionRows(view.options);
+  view.yaml = helperYaml(view);
+  return view;
+}
+
+/* What a replay scenario carries for the helpers: [{domain, options, entity_id}]. */
+export function scenarioHelpers(helpers) {
+  return asList(helpers)
+    .filter((h) => isObject(h) && h.domain)
+    .map((h) => ({ domain: h.domain, options: h.options || {}, entity_id: h.entityId ?? h.entity_id ?? null }));
+}
+
+/* A helper entity's states from a replay result as bars: [{t0, t1, state}] inside the window. */
+export function helperLane(states, start, end) {
+  const list = asList(states)
+    .map((s) => ({ t: msOf(s), state: isObject(s) ? String(s.state) : "" }))
+    .filter((s) => s.t !== null)
+    .sort((a, b) => a.t - b.t);
+  const out = [];
+  list.forEach((s, i) => {
+    const t0 = Math.max(start, s.t);
+    const t1 = Math.min(end, i + 1 < list.length ? list[i + 1].t : end);
+    if (t1 > t0) out.push({ t0, t1, state: s.state });
+  });
+  return out;
 }
 
 // ---- panel ----------------------------------------------------------------
@@ -2473,6 +2769,12 @@ class EventSimulatorPanel extends Base {
     this._suggestSel = null; // rank of the suggestion drawn on the Fires row
     this._hintSel = null; // index of the hint whose popover is open
     this._copied = null; // rank whose YAML was just copied
+    // #44: the kind filter over the cards (remembered per browser), the variant picked on
+    // each card (rank -> variant number, 0 = the card's own), and the helpers the config
+    // opened from a suggestion needs, which replays carry.
+    this._kindFilter = readKindFilter();
+    this._variantSel = new Map();
+    this._replayHelpers = [];
     // Auto-suggest: the same debounce and newest-wins machinery as auto-run.
     this._autoSuggest = readAutoRunPref(globalThis.localStorage, AUTO_SUGGEST_KEY);
     this._suggestScheduler = new ReplayScheduler({
@@ -2565,6 +2867,7 @@ class EventSimulatorPanel extends Base {
       if (entityId) return this._seedFromAutomation(entityId);
       this._entityId = "";
       this._automation = null;
+      this._replayHelpers = [];
       this._cfgDraft = null;
       this._cfgError = null;
       this._clearResult();
@@ -2573,6 +2876,7 @@ class EventSimulatorPanel extends Base {
     }
     this._entityId = entityId;
     this._automation = null;
+    this._replayHelpers = [];
     this._tracks = [];
     this._clearResult();
     this._clearEdits();
@@ -2589,6 +2893,7 @@ class EventSimulatorPanel extends Base {
       const automation = await this._hass.callWS({ type: "event_simulator/automation", entity_id: entityId });
       if (token !== this._requestToken) return;
       this._automation = automation;
+      this._replayHelpers = [];
       this._renderConfig();
       let ids = automation.referenced_entities || [];
       if (ids.length > MAX_ENTITIES) {
@@ -2621,6 +2926,7 @@ class EventSimulatorPanel extends Base {
       const automation = await this._hass.callWS({ type: "event_simulator/automation", entity_id: entityId });
       if (token !== this._requestToken) return;
       this._automation = automation;
+      this._replayHelpers = [];
       this._renderConfig();
       const have = new Set(this._tracks.map((t) => t.entity_id));
       const fresh = (automation.referenced_entities || []).filter((id) => !have.has(id));
@@ -3239,6 +3545,7 @@ class EventSimulatorPanel extends Base {
     this._suggestPrint = null;
     this._suggestSel = null;
     this._hintSel = null;
+    this._variantSel = new Map();
   }
 
   _onSuggestEvent(run, event) {
@@ -3267,15 +3574,64 @@ class EventSimulatorPanel extends Base {
         result: { suggestions, hints, evaluated: outcome.evaluated, warnings: outcome.warnings },
         stale: this._suggestScheduler.dirty || JSON.stringify(this._suggestRequest()) !== run.print,
       };
-      // Keep the suggestion on the timeline across re-suggests when it is still there.
-      if (!suggestions.some((v) => v.rank === this._suggestSel)) this._suggestSel = suggestions[0]?.rank ?? null;
+      // Variants are this result's; a re-suggest folds them anew.
+      this._variantSel = new Map();
+      // Keep the suggestion on the timeline across re-suggests when it is still shown.
+      this._keepSelectionVisible();
       this._hintSel = null;
     }
     this._renderSoon();
   }
 
+  /* The suggestion `rank` as shown: the variant picked on its card, else the card's own. */
   _suggestion(rank) {
+    const card = this._suggestCard(rank);
+    const variant = card ? this._variantSel.get(rank) : 0;
+    return (variant && card.variants.find((v) => v.variant === variant)) || card;
+  }
+
+  _suggestCard(rank) {
     return this._suggestState?.result?.suggestions.find((v) => v.rank === rank) || null;
+  }
+
+  /* The kind filter in effect: {chips, kinds (selected and present), conditions, shown}. */
+  _kindView() {
+    const all = this._suggestState?.result?.suggestions || [];
+    const conditions = this._kindFilter.conditions;
+    const chips = kindChips(all, { conditions });
+    const kinds = activeKinds(this._kindFilter.kinds, chips);
+    return { chips, kinds, conditions, shown: filterSuggestions(all, kinds, { conditions }) };
+  }
+
+  /* The hints of the shown cards. */
+  _shownHints() {
+    const hints = this._suggestState?.result?.hints || [];
+    return hintsFor(hints, this._kindView().shown.map((v) => v.rank));
+  }
+
+  /* After the filter or the result changed: the Fires row shows a card that is shown. */
+  _keepSelectionVisible() {
+    const shown = this._kindView().shown;
+    if (!shown.some((v) => v.rank === this._suggestSel)) this._suggestSel = shown[0]?.rank ?? null;
+    if (this._hintSel !== null && !this._shownHints().some((h) => h.index === this._hintSel)) this._hintSel = null;
+  }
+
+  /* Toggle a kind chip (null = All), or the "match conditions too" switch. */
+  _setKindFilter(changes) {
+    const next = { ...this._kindFilter, ...changes };
+    if ("toggle" in changes) {
+      const present = activeKinds(this._kindFilter.kinds, this._kindView().chips);
+      const set = new Set(present);
+      if (changes.toggle === null) set.clear();
+      else if (set.has(changes.toggle)) set.delete(changes.toggle);
+      else set.add(changes.toggle);
+      next.kinds = [...set];
+      delete next.toggle;
+    }
+    this._kindFilter = next;
+    writeKindFilter(next);
+    this._keepSelectionVisible();
+    this._render();
   }
 
   /* Copy a suggestion's full YAML; where the clipboard is refused, open it to copy by hand. */
@@ -3309,6 +3665,7 @@ class EventSimulatorPanel extends Base {
     const view = this._suggestion(rank);
     if (!view) return;
     const config = view.config;
+    this._replayHelpers = view.helpers;
     const real = this._automation && !this._automation.suggested;
     if (real) {
       this._cfgDraft = stableStringify(config) === stableStringify(this._automation.config) ? null : config;
@@ -3324,7 +3681,10 @@ class EventSimulatorPanel extends Base {
     this._renderConfig();
     this._clearResult();
     this._notice = [
-      `Suggestion #${rank} is loaded${real ? ` as an edit of ${this._entityId}` : ""}. Its action is a placeholder (logbook.log): replace it with what the automation should do. Nothing is saved to Home Assistant.`,
+      `Suggestion #${rank}${view.variant ? ` (variant ${view.variant})` : ""} is loaded${real ? ` as an edit of ${this._entityId}` : ""}. Its action is a placeholder (logbook.log): replace it with what the automation should do. Nothing is saved to Home Assistant.`,
+      view.helpers.length
+        ? `It needs ${view.helpers.map((h) => `a ${h.name} helper${h.entityId ? ` (${h.entityId})` : ""}`).join(" and ")}: the replay sets ${view.helpers.length === 1 ? "it" : "them"} up in the sandbox, but in Home Assistant ${view.helpers.length === 1 ? "it" : "they"} must be created (Settings → Devices & services → Helpers) before the automation works.`
+        : "",
       cut,
     ].filter(Boolean).join(" ");
     this._render();
@@ -3679,7 +4039,7 @@ class EventSimulatorPanel extends Base {
       return null;
     }
     const message = simulateSubscribeMessage(
-      buildScenario({ automation: this._runConfig(), start: this._window.start, end: this._window.end, tracks: this._tracks, busEvents: this._busEvents, calendars: this._calendars })
+      buildScenario({ automation: this._runConfig(), start: this._window.start, end: this._window.end, tracks: this._tracks, busEvents: this._busEvents, calendars: this._calendars, helpers: this._replayHelpers })
     );
     const size = messageBytes(message);
     const tooLarge = messageSizeError(message, size);
@@ -3785,12 +4145,12 @@ class EventSimulatorPanel extends Base {
   }
 
   _prints() {
-    const parts = [this._entityId, this._window.start, this._window.end, this._labels, this._mode, this._tolerance, ...this._tracks.flatMap((t) => [t.entity_id, t.initial, t.events, t.shift])];
+    const parts = [this._entityId, this._window.start, this._window.end, this._labels, this._mode, this._tolerance, this._replayHelpers, ...this._tracks.flatMap((t) => [t.entity_id, t.initial, t.events, t.shift])];
     const c = this._printCache;
     if (!c || c.parts.length !== parts.length || c.parts.some((x, i) => x !== parts[i]) || c.config !== this._runConfig()) {
       const payload = this._payload();
       const { labels, suggest_options, ...replay } = payload;
-      this._printCache = { parts, config: this._runConfig(), full: scenarioFingerprint(payload), replay: scenarioFingerprint(replay) };
+      this._printCache = { parts, config: this._runConfig(), full: scenarioFingerprint(payload), replay: scenarioFingerprint({ ...replay, helpers: scenarioHelpers(this._replayHelpers) }) };
     }
     return this._printCache;
   }
@@ -3912,6 +4272,7 @@ class EventSimulatorPanel extends Base {
     const entityId = record.automation_entity_id || "";
     this._entityId = entityId;
     this._automation = null;
+    this._replayHelpers = [];
     this._tracks = [];
     this._clearResult();
     this._clearEdits();
@@ -4221,9 +4582,12 @@ class EventSimulatorPanel extends Base {
     const head = `<div class="sg-top"><h2>Suggestions</h2>${result?.evaluated ? `<span class="muted small">best of ${result.evaluated} candidate${result.evaluated === 1 ? "" : "s"}</span>` : ""}${running}${stale}</div>`;
     const error = st?.error ? `<div class="alert error" role="alert"><div><strong>${esc(st.error.title)}</strong>: ${esc(st.error.message)}</div></div>` : "";
     const warnings = result?.warnings?.length ? this._warningsHtml(result.warnings, "checking the suggestions") : "";
-    const body = empty
-      ? `<div class="empty sg-empty" data-empty="${empty.kind}">${esc(empty.text)}</div>`
-      : `<ol class="sg-list">${result.suggestions.map((v) => this._suggestionHtml(v)).join("")}</ol>`;
+    let body;
+    if (empty) body = `<div class="empty sg-empty" data-empty="${empty.kind}">${esc(empty.text)}</div>`;
+    else {
+      const filter = this._kindView();
+      body = `${this._kindFilterHtml(filter, result.suggestions.length)}<ol class="sg-list">${filter.shown.map((v) => this._suggestionHtml(v)).join("")}</ol>`;
+    }
     return `<ha-card><div class="card-content suggest-card${st?.running && result ? " updating" : ""}">${head}${error}${warnings}${body}</div></ha-card>`;
   }
 
@@ -4235,7 +4599,73 @@ class EventSimulatorPanel extends Base {
     return links.join(" ");
   }
 
-  _suggestionHtml(v) {
+  /* The kind chips above the cards: All, one per kind with how many cards have it, and
+   * whether the conditions' kinds count too. */
+  _kindFilterHtml(filter, total) {
+    if (!filter.chips.length) return "";
+    const picked = new Set(filter.kinds);
+    const chip = (kind, text, n, on) =>
+      `<button class="kind-chip${on ? " on" : ""}" data-action="sg-kind" ${kind === null ? "" : `data-kind="${esc(kind)}"`} aria-pressed="${on}">${esc(text)}${n === null ? "" : ` <span class="n">${n}</span>`}</button>`;
+    const chips = [chip(null, "All", total, !picked.size), ...filter.chips.map((c) => chip(c.kind, c.name, c.count, picked.has(c.kind)))];
+    const shown = picked.size ? `<span class="muted small" id="sg-shown">showing ${filter.shown.length} of ${total}</span>` : "";
+    return `
+      <div class="kind-filter" role="group" aria-label="Filter suggestions by kind">
+        ${chips.join("")}
+        <label class="small kind-cond" title="Filter by the kinds of the conditions as well as the triggers">
+          <input type="checkbox" id="sg-kind-cond" ${filter.conditions ? "checked" : ""}> match conditions too
+        </label>
+        ${shown}
+      </div>`;
+  }
+
+  /* What a card says about the helpers its suggestion needs. */
+  _helpersHtml(helpers) {
+    if (!helpers.length) return "";
+    return `<div class="sg-helpers">${helpers
+      .map(
+        (h) => `
+        <div class="sg-helper">
+          <div class="small"><strong>Needs a helper:</strong> ${esc(h.name)}${h.title ? ` “${esc(h.title)}”` : ""}${h.entityId ? ` <span class="mono">${esc(h.entityId)}</span>` : ""}</div>
+          ${h.rows.length ? `<table class="helper-opts small">${h.rows.map(([k, v]) => `<tr><th>${esc(k)}</th><td class="mono">${esc(v)}</td></tr>`).join("")}</table>` : ""}
+          <details class="sg-full" data-key="sg-helper-${esc(h.entityId || h.domain)}" ${this._openAttr(`sg-helper-${h.entityId || h.domain}`)}>
+            <summary>Helper YAML</summary>
+            <pre class="mono sg-yaml">${esc(h.yaml)}</pre>
+          </details>
+          <div class="small muted">Create it in Home Assistant (Settings → Devices &amp; services → Helpers → ${esc(h.name)}) with these options before the automation works; the replay sets it up in the sandbox.</div>
+        </div>`
+      )
+      .join("")}</div>`;
+  }
+
+  /* The variants folded into a card: each one's differences from it and its numbers; picking
+   * one shows its fires, YAML and stats on the card. */
+  _variantsHtml(card, picked) {
+    const n = card.variants.length;
+    if (!n) return "";
+    const key = `sg-var-${card.rank}`;
+    const stat = (v) => `${v.hits}/${v.total} hit · ${v.fires} fire${v.fires === 1 ? "" : "s"}${v.violations.length ? ` · <span class="err">${v.violations.length} in must-not</span>` : ""}`;
+    const diff = (v) =>
+      v.diff.length
+        ? v.diff
+            .map((d) => `<span class="vdiff ${d.kind}" title="${esc(d.path)}">${esc(d.label)} ${d.from === null ? "" : `<s>${esc(d.from)}</s> → `}<strong>${d.to === null ? "(none)" : esc(d.to)}</strong></span>`)
+            .join(" ")
+        : `<span class="muted">same triggers and conditions</span>`;
+    const row = (v, i, text) => `
+      <li class="variant${picked === i ? " sel" : ""}">
+        <button class="link" data-action="sg-variant" data-rank="${card.rank}" data-variant="${i}" aria-pressed="${picked === i}">${text}</button>
+        <span class="small">${i ? diff(v) : `<span class="muted">as suggested</span>`}</span>
+        <span class="muted small">${stat(v)}${v.exact ? " · checked" : ""}</span>
+      </li>`;
+    return `
+      <details class="sg-variants" data-key="${key}" ${this._openAttr(key, picked > 0)}>
+        <summary>${n} similar variant${n === 1 ? "" : "s"}</summary>
+        <ol class="variant-list">${row(card, 0, `#${card.rank}`)}${card.variants.map((v) => row(v, v.variant, `variant ${v.variant}`)).join("")}</ol>
+      </details>`;
+  }
+
+  _suggestionHtml(card) {
+    const picked = this._variantSel.get(card.rank) || 0;
+    const v = (picked && card.variants.find((x) => x.variant === picked)) || card;
     const sel = v.rank === this._suggestSel;
     const badge = v.exact
       ? `<span class="chip pass" title="These numbers are what Home Assistant itself did when the suggestion was replayed in the sandbox">checked in HA's sandbox</span>`
@@ -4270,12 +4700,15 @@ class EventSimulatorPanel extends Base {
           <button class="link sg-rank" data-action="sg-select" data-rank="${v.rank}" aria-pressed="${sel}" title="${sel ? "On the timeline (Fires row)" : "Show its fires on the timeline"}">#${v.rank}</button>
           ${badge}
           ${sel ? `<span class="chip on-tl">on the timeline</span>` : `<button class="link small" data-action="sg-select" data-rank="${v.rank}">show on timeline</button>`}
+          ${v.variant ? `<span class="chip on-tl">variant ${v.variant}</span>` : ""}
           <span class="muted small sg-fires">${v.fires} fire${v.fires === 1 ? "" : "s"} in the window</span>
         </div>
+        <div class="sg-kinds">${v.kinds.map((k) => `<span class="kind-tag${v.triggerKinds.includes(k) ? " trig" : ""}" title="${v.triggerKinds.includes(k) ? "trigger" : "condition"}">${esc(kindName(k))}</span>`).join("")}</div>
         <p class="sg-expl">${esc(v.explanation || "No explanation was sent for this one.")}</p>
         ${zoned ? `<p class="small sg-zone">Its clock times and weekdays are Home Assistant's time (${esc(this._clock.serverTimeZone)}); the times on this page are ${esc(this._zoneName())}.</p>` : ""}
         <ul class="sg-stats">${stats}</ul>
         <pre class="mono sg-yaml">${esc(yaml(triggerYaml(v.config)))}</pre>
+        ${this._helpersHtml(v.helpers)}
         <details class="sg-full" data-key="${key}" ${this._openAttr(key)}>
           <summary>Full automation YAML</summary>
           <pre class="mono sg-yaml">${esc(yaml(toYaml(v.config)))}</pre>
@@ -4284,6 +4717,7 @@ class EventSimulatorPanel extends Base {
           <button data-action="sg-copy" data-rank="${v.rank}">${this._copied === v.rank ? "Copied" : "Copy YAML"}</button>
           <button class="primary small-btn" data-action="sg-open" data-rank="${v.rank}" title="Replay this suggestion in the simulator, on the same window and tracks">Open in simulator</button>
         </div>
+        ${this._variantsHtml(card, picked)}
       </li>`;
   }
 
@@ -4645,6 +5079,7 @@ class EventSimulatorPanel extends Base {
       if (this._suggestion(this._suggestSel)) parts.push(this._firesRow(scale));
     }
     if (this._mode === "replay" && (this._result || this._running)) parts.push(this._resultsRow(scale));
+    if (this._mode === "replay" && this._result) for (const [id, states] of Object.entries(this._result.helperStates || {})) parts.push(this._helperRow(scale, id, states));
     const bus = this._busLaneEvents();
     if (bus.length) parts.push(this._busEventsRow(scale, bus));
     for (const id of this._calendarIds()) {
@@ -4699,6 +5134,25 @@ class EventSimulatorPanel extends Base {
       </div>`;
   }
 
+  /* A helper's states in the replay (read-only): the sandbox's trend/derivative entity the
+   * suggestion triggers on, one bar per state. */
+  _helperRow(scale, id, states) {
+    const bars = helperLane(states, this._window.start, this._window.end);
+    let out = this._gridLines(scale, BUS_H);
+    for (const b of bars) {
+      const x0 = scale.toX(Math.max(b.t0, scale.t0));
+      const x1 = scale.toX(Math.min(b.t1, scale.t1));
+      if (x1 < 0 || x0 > scale.width) continue;
+      out += `<rect x="${x0.toFixed(1)}" y="5" width="${Math.max(x1 - x0, 1).toFixed(1)}" height="${BUS_H - 10}" fill="${stateColor(b.state)}" class="helper-bar"><title>${esc(`${b.state} from ${this._clock.full(b.t0)}`)}</title></rect>`;
+    }
+    const changes = Math.max(0, bars.length - 1);
+    return `
+      <div class="row bus-row helper-row">
+        <div class="track-head"><span class="name">${esc(id)}</span><span class="meta">helper in the sandbox · ${changes} change${changes === 1 ? "" : "s"}</span></div>
+        <svg class="bus" data-row="helper" width="${scale.width}" height="${BUS_H}">${out}</svg>
+      </div>`;
+  }
+
   /* A calendar lane (read-only): one bar per event, its summary in the tooltip, and where
    * the events came from. */
   _calendarRow(scale, id) {
@@ -4728,7 +5182,7 @@ class EventSimulatorPanel extends Base {
   /* The Hints row: where the top suggestions fire outside the labels (circles) and where the
    * labeled change happens again elsewhere (diamonds); likelier ones larger and more solid. */
   _hintsRow(scale) {
-    const hints = this._suggestState.result.hints;
+    const hints = this._shownHints();
     let out = this._gridLines(scale, HINTS_H);
     const y = HINTS_H / 2;
     for (const h of hints) {
@@ -4776,7 +5230,7 @@ class EventSimulatorPanel extends Base {
       .join(" · ");
     return `
       <div class="row fires-row">
-        <div class="track-head"><span class="name">Fires of #${view.rank}</span><span class="meta">${parts || "never fires in this window"}</span></div>
+        <div class="track-head"><span class="name">Fires of #${view.rank}${view.variant ? ` (variant ${view.variant})` : ""}</span><span class="meta">${parts || "never fires in this window"}</span></div>
         <svg class="fires" data-row="fires" width="${scale.width}" height="${FIRES_H}">${out}</svg>
       </div>`;
   }
@@ -5669,7 +6123,7 @@ class EventSimulatorPanel extends Base {
   /* The hint marker nearest the pointer on the Hints row, within reach. */
   _hintsHit(ev) {
     const svg = this._rowAt(ev.clientX, ev.clientY);
-    const hints = this._suggestState?.result?.hints;
+    const hints = this._suggestState?.result ? this._shownHints() : null;
     if (svg?.dataset.row !== "hints" || !hints) return null;
     const x = ev.clientX - svg.getBoundingClientRect().left;
     const scale = this._scale();
@@ -5839,6 +6293,13 @@ class EventSimulatorPanel extends Base {
     else if (action === "sg-select") {
       this._suggestSel = Number(el.dataset.rank);
       this._render();
+    } else if (action === "sg-kind") this._setKindFilter({ toggle: el.dataset.kind ?? null });
+    else if (action === "sg-variant") {
+      const rank = Number(el.dataset.rank);
+      this._variantSel.set(rank, Number(el.dataset.variant) || 0);
+      this._open[`sg-var-${rank}`] = true;
+      this._suggestSel = rank;
+      this._render();
     } else if (action === "sg-copy") this._copySuggestion(Number(el.dataset.rank));
     else if (action === "sg-open") this._openSuggestion(Number(el.dataset.rank));
     else if (action === "jump") this._jumpTo(Number(el.dataset.t));
@@ -5890,6 +6351,7 @@ class EventSimulatorPanel extends Base {
     if (id === "automation") this._selectAutomation(ev.target.value);
     else if (id === "auto-run") this._setAutoRun(ev.target.checked);
     else if (id === "auto-suggest") this._setAutoSuggest(ev.target.checked);
+    else if (id === "sg-kind-cond") this._setKindFilter({ conditions: ev.target.checked });
     else if (id === "lb-kind" && this._labelSel) this._updateLabel(this._labelSel, { kind: ev.target.value });
     else if (id === "lb-anchor" && this._labelSel) this._updateLabel(this._labelSel, { anchor: ev.target.value });
     else if (id === "tol-before" || id === "tol-after") this._setTolerance(id === "tol-before" ? "before" : "after", ev.target.value);
@@ -6257,6 +6719,28 @@ class EventSimulatorPanel extends Base {
       .sg-full { margin-top: 6px; }
       .sg-full summary { cursor: pointer; color: var(--secondary-text-color); font-size: 0.9em; margin-bottom: 4px; }
       .sg-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+      .kind-filter { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 0 0 10px; }
+      .kind-chip { font: inherit; font-size: 0.85em; padding: 3px 10px; border-radius: 14px; border: 1px solid var(--divider-color); background: var(--card-background-color); color: var(--primary-text-color); cursor: pointer; min-height: 28px; }
+      .kind-chip .n { color: var(--secondary-text-color); font-variant-numeric: tabular-nums; }
+      .kind-chip.on { background: var(--primary-color); border-color: var(--primary-color); color: var(--text-primary-color, #fff); }
+      .kind-chip.on .n { color: inherit; opacity: .85; }
+      .kind-cond { display: inline-flex; align-items: center; gap: 4px; margin-left: 6px; color: var(--secondary-text-color); }
+      .sg-kinds { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; }
+      .kind-tag { font-size: 0.75em; padding: 1px 7px; border-radius: 10px; border: 1px dashed var(--divider-color); color: var(--secondary-text-color); }
+      .kind-tag.trig { border-style: solid; color: var(--primary-text-color); }
+      .sg-helpers { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+      .sg-helper { border: 1px solid var(--warning-color, #ff9800); border-radius: 6px; padding: 8px 10px; background: rgba(255,152,0,.06); }
+      .helper-opts { border-collapse: collapse; margin: 6px 0; }
+      .helper-opts th { text-align: left; font-weight: 500; padding: 1px 12px 1px 0; color: var(--secondary-text-color); }
+      .helper-opts td { padding: 1px 0; overflow-wrap: anywhere; }
+      .sg-variants { margin-top: 8px; }
+      .sg-variants summary { cursor: pointer; color: var(--primary-color); font-size: 0.9em; }
+      .variant-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+      .variant { display: flex; align-items: baseline; gap: 4px 10px; flex-wrap: wrap; padding: 3px 6px; border-radius: 4px; }
+      .variant.sel { background: rgba(3,155,229,.12); }
+      .vdiff { margin-right: 6px; }
+      .vdiff s { color: var(--secondary-text-color); }
+      .vdiff.threshold strong, .vdiff.duration strong { background: rgba(255,152,0,.22); border-radius: 3px; padding: 0 3px; }
       .label-editor.fire { border-left-color: var(--success-color, #43a047); }
       .label-editor.nofire { border-left-color: var(--error-color, #db4437); }
       @media (max-width: 600px) {
