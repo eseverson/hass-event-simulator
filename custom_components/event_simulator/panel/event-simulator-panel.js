@@ -1522,6 +1522,7 @@ class EventSimulatorPanel extends Base {
     this._thumbDrag = null; // scroll bar thumb drag in progress
     this._evDrag = null; // event drag in progress: {entity_id, index, preview, ...}
     this._frame = 0;
+    this._heldRender = 0;
     this._rendered = false;
     // Timeline editing.
     this._sel = null; // {entity_id, index}: the event being edited, index -1 = initial state
@@ -2581,8 +2582,19 @@ class EventSimulatorPanel extends Base {
     // Replays finish whenever they finish, so a redraw can land while a field is typed in:
     // keep that field's focus, unsent text and caret.
     const typing = this._focusedField();
+    // Each redraw makes new ha-cards, which have no height until they render their slot a
+    // microtask later; the layout reads below would see the page collapse meanwhile and the
+    // browser would clamp a scrolled page back toward the top. Hold the height until then.
+    const page = this.shadowRoot.querySelector(".page");
+    page.style.minHeight = `${page.offsetHeight}px`;
     root.innerHTML = this._html();
     this.shadowRoot.getElementById("detail").innerHTML = this._detailCard();
+    const held = ++this._heldRender;
+    Promise.all([...page.querySelectorAll("ha-card")].map((card) => card.updateComplete))
+      .catch(() => {})
+      .then(() => {
+        if (held === this._heldRender) page.style.minHeight = "";
+      });
     const add = root.querySelector("#add-track");
     if (add) add.value = addValue;
     const menu = root.querySelector("ha-menu-button");
