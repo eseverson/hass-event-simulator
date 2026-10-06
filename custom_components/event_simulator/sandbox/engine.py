@@ -1,12 +1,14 @@
-"""Replay engine: runs one scenario against one automation in a throwaway Home Assistant.
+"""Replay engine: runs one scenario against one automation (or several independent ones) in a throwaway Home Assistant.
 
 Runs in the child process (see `__main__.py`). `run_scenario(scenario)` is the whole contract: a scenario dict in, a JSON-safe result dict out.
+
+The scenario carries either `automation` (one config) or `automations` (a list of up to `MAX_AUTOMATIONS` configs, for validating many candidates against one timeline at the cost of one boot). Every service call is only recorded, so automations replayed together cannot affect each other: each runs as it would alone, with its own mode, its own entity (the own-entity handling below applies to each) and its own id (one without an id, or repeating an earlier one, gets `DEFAULT_AUTOMATION_ID` plus its index).
 
 Timeline of a replay (all virtual time, see `vclock.py`)
 --------------------------------------------------------
 1. `start - BOOT_LEAD`: a `HomeAssistant` boots on the virtual loop with a temporary config dir (deleted afterwards). The scenario's `registry` snapshot is written into that dir's `.storage` first, so the entity/device/area/floor/label registries load it through their own load path (config entries as disabled stubs, never set up); registered entities with no initial state get HA's own `unavailable` placeholder at start, as live HA gives entities whose integration did not load. It loads the base registries, sets up only the `homeassistant` and `labs` integrations (turning on the scenario's `core.preview_features`, so Labs-gated triggers and conditions validate as they do live), then runs `async_start`; the automation integration and whatever it pulls in (`trace`, `blueprint`, trigger/condition platforms) come later. No recorder, http, frontend or network-facing integrations, and `skip_pip` is on, so nothing is installed or fetched. `BOOT_LEAD` absorbs any timers boot waits on, so the window starts with everything settled.
 2. `start`: initial states are seeded with their recorded `last_changed` / `last_updated` (`StateMachine.async_set(..., timestamp=...)`; an attribute-only update is reproduced by a second write at `last_updated`); states without them are stamped `start`, the same clamp the recorder applies. The automation's own entity is the exception: its recorded state is not seeded but stored as its last state before boot, so it loads enabled or disabled (and with its `last_triggered`) as live HA restores it. Then the automation is checked for platforms the sandbox cannot run (custom integrations' triggers/conditions, integration-specific device automations -> `unsupported_automation`, naming each by config path), validated with HA's own automation schema (invalid -> structured `invalid_automation` error) and set up. It attaches after `async_start`, so a `homeassistant: start` trigger does not fire, and at `start` exactly, so a time trigger at the window start does.
-3. `[start, end)`: timeline events are written with `async_set` at their `at`; events at the same instant are written in list order. A recorded on/off of the automation's own entity turns the automation on/off instead (`automation.turn_on` / `turn_off` semantics), so the entity's state, and every template reading it, is the sandbox's own. Every service call is intercepted at the `ServiceRegistry` (see `RecordingServiceRegistry`): recorded, answered with success (an empty response when one is asked for), and never executed, so recorded calls change no state.
+3. `[start, end)`: timeline events are written with `async_set` at their `at`; events at the same instant are written in list order. A recorded on/off of a replayed automation's own entity turns that automation on/off instead (`automation.turn_on` / `turn_off` semantics), so the entity's state, and every template reading it, is the sandbox's own. Every service call is intercepted at the `ServiceRegistry` (see `RecordingServiceRegistry`): recorded, answered with success (an empty response when one is asked for), and never executed, so recorded calls change no state.
 4. `end`: the automation's triggers are detached (`async_turn_off(stop_actions=False)`), so nothing new starts; the window is half-open and a run triggered at `end` itself is discarded. Runs already in flight (a `delay`, a `wait_for_trigger`, a queue) keep going for up to `overrun_seconds` of virtual time (default `DEFAULT_OVERRUN`, at most `MAX_OVERRUN`); a run still going at that bound is reported with outcome `unfinished` and a warning. Then HA is stopped.
 
 Runs are read from HA's own automation traces (captured as `trace_automation` stores them, so the stored-traces limit never drops one) and serialized with `as_extended_dict()`.
@@ -19,6 +21,8 @@ Result
       "service_calls": [{"at", "domain", "service", "data", "target", "run", "context": {"id", "parent_id", "user_id"}}],
       "warnings": [{"code", "message", "at"}]
     }
+
+Under `automations`, each run and service call also carries `"automation": index`, per-automation warnings carry it too, and the result adds `"automations": [{"index", "entity_id", "loaded", "error": null | {"code", "message"}, "run_count"}]`. An automation the sandbox refuses (`invalid_automation`, `unsupported_automation`) is reported there with `loaded: false` and the others still replay; the top-level `error` is only for a problem with the scenario itself.
 
 `outcome`: `fired` (the actions ran to the end or a `stop`), `condition_failed` (`stopped_by` = the failing condition's trace path, e.g. `condition/0`), `dropped` (the script mode refused the run; `stopped_by` = `mode_single` / `max_runs` / `recursion`), `aborted` (a condition or `stop: error` inside the actions; `stopped_by` = last action path), `cancelled` (a `restart` re-trigger or shutdown), `error` (an exception; `stopped_by` = last action path, `error` = message), `unfinished` (still running at the overrun bound).
 """
@@ -95,8 +99,10 @@ MAX_OVERRUN = timedelta(hours=24)
 MAX_WINDOW = timedelta(days=31)
 # Poll interval (virtual) while waiting for in-flight runs after `end`.
 _DRAIN_STEP = 1.0
-# The id given to an automation that has none: HA only finishes traces of automations with an id.
+# The id given to an automation that has none: HA only finishes traces of automations with an id. Under `automations`, the index is appended.
 DEFAULT_AUTOMATION_ID = "event_simulator_replay"
+# Most automations one scenario may carry under `automations`.
+MAX_AUTOMATIONS = 25
 # Core config keys copied from the scenario into the sandbox's `homeassistant:` section.
 _CORE_KEYS = ("time_zone", "latitude", "longitude", "elevation", "unit_system", "country", "language", "currency", "radius")
 # Attribute that makes the first of two seeding writes differ from the second, so the second counts as an attribute update.
@@ -148,11 +154,28 @@ class _Event:
 
 
 @dataclass
+class _Automation:
+    """One replayed automation: its config as given, the id and entity id it gets in the sandbox, and what became of it."""
+
+    index: int
+    # The scenario's item; anything but an object is that automation's `invalid_automation` error.
+    config: Any
+    id: str
+    # Predicted before boot (registry entry, else derived from the name as HA does); the loaded entity's own once it is set up.
+    entity_id: str
+    # Its own entity's recorded state at the window start (taken out of `initial_states`).
+    own_initial: _InitialState | None = None
+    entity: Any = None
+    error: dict[str, str] | None = None
+    run_count: int = 0
+
+
+@dataclass
 class _Scenario:
     core: dict[str, Any]
     start: datetime
     end: datetime
-    automation: dict[str, Any]
+    automations: list[_Automation]
     initial_states: dict[str, _InitialState]
     events: list[_Event]
     services: dict[str, set[str]] | None
@@ -161,9 +184,8 @@ class _Scenario:
     preview_features: list[tuple[str, str]] = field(default_factory=list)
     registry: dict[str, Any] = field(default_factory=dict)
     warnings: list[dict[str, Any]] = field(default_factory=list)
-    # The replayed automation's own entity id, and its recorded state at the window start (taken out of `initial_states`).
-    own_entity_id: str = ""
-    own_initial: _InitialState | None = None
+    # `automations` rather than `automation`: runs, calls and per-automation warnings carry the index, and the result lists each automation.
+    multi: bool = False
 
 
 def error_result(code: str, message: str, warnings: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -258,9 +280,19 @@ def _parse_scenario(raw: dict[str, Any]) -> _Scenario:
     core = {key: core_raw[key] for key in _CORE_KEYS if core_raw.get(key) is not None}
     preview_features = _parse_preview_features(core_raw.get("preview_features"))
 
-    automation = raw.get("automation")
-    if not isinstance(automation, dict):
-        raise ScenarioError("invalid_scenario", "automation must be an object (the automation config)")
+    multi = "automations" in raw
+    if multi:
+        if "automation" in raw:
+            raise ScenarioError("invalid_scenario", "Give either automation (one config) or automations (a list of configs), not both")
+        items = raw["automations"]
+        if not isinstance(items, list) or not items:
+            raise ScenarioError("invalid_scenario", "automations must be a non-empty list of automation configs")
+        if len(items) > MAX_AUTOMATIONS:
+            raise ScenarioError("invalid_scenario", f"automations carries {len(items)} configs; the limit is {MAX_AUTOMATIONS}")
+    else:
+        if not isinstance(raw.get("automation"), dict):
+            raise ScenarioError("invalid_scenario", "automation must be an object (the automation config)")
+        items = [raw["automation"]]
 
     warnings: list[dict[str, Any]] = []
 
@@ -325,22 +357,57 @@ def _parse_scenario(raw: dict[str, Any]) -> _Scenario:
         raise ScenarioError("invalid_scenario", "seed must be an integer")
 
     registry = _parse_registry(raw.get("registry"), warnings)
-    own_entity_id = _own_entity_id(automation, registry)
-    own_initial = initial_states.pop(own_entity_id, None)
+    automations = _automations(items, multi, registry, warnings)
+    for automation in automations:
+        automation.own_initial = initial_states.pop(automation.entity_id, None)
 
-    return _Scenario(
-        core, start, end, automation, initial_states, events, services, overrun, seed, preview_features, registry, warnings, own_entity_id, own_initial
-    )
+    return _Scenario(core, start, end, automations, initial_states, events, services, overrun, seed, preview_features, registry, warnings, multi)
 
 
-def _own_entity_id(automation: dict[str, Any], registry: dict[str, Any]) -> str:
-    """The entity id the replayed automation gets: its registry entry's (platform `automation`, unique id = the config id), else the one Home Assistant derives from its name."""
-    automation_id = automation.get("id") or DEFAULT_AUTOMATION_ID
+def _automations(items: list[Any], multi: bool, registry: dict[str, Any], warnings: list[dict[str, Any]]) -> list[_Automation]:
+    """Each automation with the id and entity id it gets in the sandbox.
+
+    Ids are unique, since Home Assistant sets up only the first automation with a given id: one without an id gets `DEFAULT_AUTOMATION_ID` (with its index under `automations`), and a repeated one is replaced the same way, with a warning. Entity ids are predicted as `_own_entity_id` does, numbered `_2`, `_3`, ... past one already taken, as the entity registry numbers them.
+    """
+    automations: list[_Automation] = []
+    ids: set[str] = set()
+    taken = {str(entry.get("entity_id")) for entry in registry.get("entities") or ()}
+    for index, config in enumerate(items):
+        given = config.get("id") if isinstance(config, dict) else None
+        automation_id = str(given) if given else DEFAULT_AUTOMATION_ID if not multi else f"{DEFAULT_AUTOMATION_ID}_{index}"
+        if automation_id in ids:
+            fallback = f"{DEFAULT_AUTOMATION_ID}_{index}"
+            while fallback in ids:
+                fallback += "_"
+            warnings.append({**_warning("duplicate_automation_id", f"automations[{index}] repeats the id {automation_id!r}; it replays as {fallback!r}"), "automation": index})
+            automation_id = fallback
+        ids.add(automation_id)
+        entity_id = _own_entity_id(config if isinstance(config, dict) else {}, automation_id, index, registry)
+        if entity_id in taken and not _registered(registry, automation_id, entity_id):
+            base, number = entity_id, 2
+            while f"{base}_{number}" in taken:
+                number += 1
+            entity_id = f"{base}_{number}"
+        taken.add(entity_id)
+        automations.append(_Automation(index, config, automation_id, entity_id))
+    return automations
+
+
+def _own_entity_id(config: dict[str, Any], automation_id: str, index: int, registry: dict[str, Any]) -> str:
+    """The entity id a replayed automation gets: its registry entry's (platform `automation`, unique id = the config id), else the one Home Assistant derives from its name (its alias, else `automation <list position>`)."""
     for entry in registry.get("entities") or ():
         if entry.get("platform") == "automation" and entry.get("unique_id") == automation_id and str(entry.get("entity_id", "")).startswith("automation."):
             return entry["entity_id"]
-    alias = automation.get("alias")
-    return f"automation.{slugify(alias if isinstance(alias, str) and alias else 'automation 0')}"
+    alias = config.get("alias")
+    return f"automation.{slugify(alias if isinstance(alias, str) and alias else f'automation {index}')}"
+
+
+def _registered(registry: dict[str, Any], automation_id: str, entity_id: Any) -> bool:
+    """Whether the snapshot registers `entity_id` as the automation with this id."""
+    return any(
+        entry.get("platform") == "automation" and entry.get("unique_id") == automation_id and entry.get("entity_id") == entity_id
+        for entry in registry.get("entities") or ()
+    )
 
 
 def _parse_registry(value: Any, warnings: list[dict[str, Any]]) -> dict[str, Any]:
@@ -435,18 +502,24 @@ def _write_registry_storage(config_dir: str, registry: dict[str, Any], stamp: da
 
 
 def _write_own_last_state(config_dir: str, scenario: _Scenario) -> None:
-    """Store the automation's recorded on/off state at the window start as its last state, so it boots enabled or disabled as live HA restores it after a restart (`last_triggered` included)."""
-    item = scenario.own_initial
-    if item is None or item.state not in (STATE_ON, STATE_OFF):
+    """Store each automation's recorded on/off state at the window start as its last state, so it boots enabled or disabled as live HA restores it after a restart (`last_triggered` included)."""
+    states = []
+    for automation in scenario.automations:
+        item = automation.own_initial
+        if item is None or item.state not in (STATE_ON, STATE_OFF):
+            continue
+        last_changed = item.last_changed or scenario.start
+        states.append(
+            {
+                "entity_id": automation.entity_id,
+                "state": item.state,
+                "attributes": item.attributes,
+                "last_changed": last_changed.isoformat(),
+                "last_updated": max(item.last_updated or last_changed, last_changed).isoformat(),
+            }
+        )
+    if not states:
         return
-    last_changed = item.last_changed or scenario.start
-    state = {
-        "entity_id": scenario.own_entity_id,
-        "state": item.state,
-        "attributes": item.attributes,
-        "last_changed": last_changed.isoformat(),
-        "last_updated": max(item.last_updated or last_changed, last_changed).isoformat(),
-    }
     storage = os.path.join(config_dir, ".storage")
     os.makedirs(storage, exist_ok=True)
     with open(os.path.join(storage, restore_state.STORAGE_KEY), "w", encoding="utf-8") as file:
@@ -454,7 +527,7 @@ def _write_own_last_state(config_dir: str, scenario: _Scenario) -> None:
             {
                 "version": restore_state.STORAGE_VERSION,
                 "key": restore_state.STORAGE_KEY,
-                "data": [{"state": state, "extra_data": None, "last_seen": scenario.start.isoformat()}],
+                "data": [{"state": state, "extra_data": None, "last_seen": scenario.start.isoformat()} for state in states],
             },
             file,
         )
@@ -572,8 +645,10 @@ class _Replay:
         self.warnings: list[dict[str, Any]] = list(scenario.warnings)
         self.log_warnings: list[dict[str, Any]] = []
         self._unknown_services: set[str] = set()
-        self._self_calls: set[str] = set()
-        self._entity: Any = None
+        self._self_calls: set[tuple[int, str]] = set()
+        # Trace key (`automation.<id>`) and own entity id -> the automation, once loaded.
+        self._by_key: dict[str, _Automation] = {}
+        self._by_entity_id: dict[str, _Automation] = {}
 
     def now(self) -> datetime:
         return self.clock.utcnow()
@@ -598,15 +673,17 @@ class _Replay:
                 self._seed_states()
                 ha_logger.addHandler(collector)
                 try:
-                    await self._load_automation()
+                    await self._load_automations()
                 except ScenarioError as err:
                     return error_result(err.code, str(err), self.warnings)
                 if self.clock.loop.time() != self.clock.loop_time_for(self.scenario.start):
                     # Setup waited on a timer: the automation attached late, so the window's first moments were not observed.
-                    self.warnings.append(_warning("late_attach", f"The automation attached at {self.now().isoformat()}, after the window start", self.now()))
+                    what = "The automations" if self.scenario.multi else "The automation"
+                    self.warnings.append(_warning("late_attach", f"{what} attached at {self.now().isoformat()}, after the window start", self.now()))
                 self._schedule_events()
                 await self._sleep_until(self.scenario.end)
-                await self._entity.async_turn_off(stop_actions=False)
+                for automation in self._loaded():
+                    await automation.entity.async_turn_off(stop_actions=False)
                 await self._drain()
                 return self._result(collector)
             finally:
@@ -670,16 +747,55 @@ class _Replay:
                 states.async_set(entity_id, item.state, {_SEED_MARKER: True}, timestamp=last_changed.timestamp())
             states.async_set(entity_id, item.state, item.attributes, timestamp=last_updated.timestamp())
 
-    async def _load_automation(self) -> None:
-        config = dict(self.scenario.automation)
-        if not config.get("id"):
-            config["id"] = DEFAULT_AUTOMATION_ID
-        if self.scenario.own_initial is not None and self.scenario.own_initial.state in (STATE_ON, STATE_OFF):
+    def _loaded(self) -> list[_Automation]:
+        return [automation for automation in self.scenario.automations if automation.entity is not None]
+
+    async def _load_automations(self) -> None:
+        """Validate each automation, then set them all up in one go.
+
+        With one `automation`, a refusal is the result's error. Under `automations` it is that automation's own `error` and the rest still replay; only the automation integration failing to set up fails them all.
+        """
+        multi = self.scenario.multi
+        configs: list[dict[str, Any]] = []
+        for automation in self.scenario.automations:
+            try:
+                configs.append(await self._validate(automation))
+            except ScenarioError as err:
+                if not multi:
+                    raise
+                automation.error = {"code": err.code, "message": str(err)}
+        if not configs:
+            return
+        if not await async_setup_component(self.hass, "automation", {"automation": configs}):
+            raise ScenarioError("invalid_automation", "The automation integration failed to set up")
+        # Setup awaits the trigger attachment itself. No async_block_till_done: it would wait out any run already started and so move virtual time.
+        entities = {entity.unique_id: entity for entity in self.hass.data[AUTOMATION_COMPONENT].entities}
+        for automation in self.scenario.automations:
+            if automation.error is not None:
+                continue
+            entity = entities.get(automation.id)
+            if entity is None or getattr(entity, "action_script", None) is None:
+                if not multi:
+                    raise ScenarioError("invalid_automation", "The automation did not load")
+                automation.error = {"code": "invalid_automation", "message": "The automation did not load"}
+                continue
+            automation.entity = entity
+            automation.entity_id = entity.entity_id
+            self._by_key[f"automation.{automation.id}"] = automation
+            self._by_entity_id[entity.entity_id] = automation
+        self.hass.services.intercepting = True
+
+    async def _validate(self, automation: _Automation) -> dict[str, Any]:
+        """The config to set up for one automation, checked as Home Assistant checks it; refusals raise `ScenarioError`."""
+        if not isinstance(automation.config, dict):
+            raise ScenarioError("invalid_automation", f"automations[{automation.index}] must be an object (the automation config)")
+        config = {**automation.config, "id": automation.id}
+        if automation.own_initial is not None and automation.own_initial.state in (STATE_ON, STATE_OFF):
             # Its recorded state at the window start says whether it was enabled; that wins over the configured state at boot.
             config.pop("initial_state", None)
         elif config.get("initial_state") is False:
             config.pop("initial_state")
-            self.warnings.append(_warning("initial_state_ignored", "initial_state: false was ignored so the automation can run"))
+            self._warn(automation, "initial_state_ignored", "initial_state: false was ignored so the automation can run")
 
         await _check_platforms(self.hass, config)
         try:
@@ -688,15 +804,14 @@ class _Replay:
             raise ScenarioError("invalid_automation", humanize_error(config, err)) from err
         except (HomeAssistantError, ValueError, KeyError, TypeError) as err:
             raise ScenarioError("invalid_automation", str(err) or type(err).__name__) from err
+        return config
 
-        if not await async_setup_component(self.hass, "automation", {"automation": [config]}):
-            raise ScenarioError("invalid_automation", "The automation integration failed to set up")
-        # Setup awaits the trigger attachment itself. No async_block_till_done: it would wait out any run already started and so move virtual time.
-        entities = list(self.hass.data[AUTOMATION_COMPONENT].entities)
-        if len(entities) != 1 or getattr(entities[0], "action_script", None) is None:
-            raise ScenarioError("invalid_automation", "The automation did not load")
-        self._entity = entities[0]
-        self.hass.services.intercepting = True
+    def _warn(self, automation: _Automation | None, code: str, message: str, at: datetime | None = None) -> None:
+        """A warning about one automation: under `automations` it carries the index and names it."""
+        if automation is None or not self.scenario.multi:
+            self.warnings.append(_warning(code, message, at))
+            return
+        self.warnings.append({**_warning(code, f"automations[{automation.index}]: {message}", at), "automation": automation.index})
 
     def _schedule_events(self) -> None:
         by_instant: dict[datetime, list[_Event]] = {}
@@ -708,14 +823,13 @@ class _Replay:
 
     def _play(self, events: list[_Event]) -> None:
         for event in events:
-            if event.entity_id == self.scenario.own_entity_id:
-                self._play_own(event)
+            if (automation := self._by_entity_id.get(event.entity_id)) is not None:
+                self._play_own(automation.entity, event)
             else:
                 self.hass.states.async_set(event.entity_id, event.state, event.attributes, timestamp=event.at.timestamp())
 
-    def _play_own(self, event: _Event) -> None:
+    def _play_own(self, entity: Any, event: _Event) -> None:
         """A recorded state of the automation itself turns it on or off, as the `automation.turn_on` / `turn_off` services do (`stop_actions` at its default); the entity writes its own state. Attribute-only updates (`last_triggered`, `current`) and other states are its own doing, so they are not played."""
-        entity = self._entity
         if event.state == STATE_ON and not entity.is_on:
             self.hass.async_create_task(entity.async_turn_on())
         elif event.state == STATE_OFF and entity.is_on:
@@ -725,9 +839,9 @@ class _Replay:
     async def _drain(self) -> None:
         """Let runs in flight at `end` finish, up to the overrun bound."""
         bound = self.clock.loop_time_for(self.scenario.end + self.scenario.overrun)
-        script = self._entity.action_script
+        scripts = [automation.entity.action_script for automation in self._loaded()]
         # No async_block_till_done here: it would wait for the in-flight runs themselves and so carry virtual time past the bound.
-        while script.is_running and self.clock.loop.time() < bound:
+        while any(script.is_running for script in scripts) and self.clock.loop.time() < bound:
             await asyncio.sleep(min(_DRAIN_STEP, bound - self.clock.loop.time()))
 
     async def _stop(self) -> None:
@@ -747,22 +861,32 @@ class _Replay:
         context: Any,
     ) -> None:
         trace_id = trace_id_get()
-        self.service_calls.append(
-            {
-                "at": self.now(),
-                "domain": domain,
-                "service": service,
-                "data": dict(data),
-                "target": dict(target) if target else None,
-                "run": trace_id[1] if trace_id else None,
-                "context": {"id": context.id, "parent_id": context.parent_id, "user_id": context.user_id},
-            }
-        )
+        automation = self._by_key.get(trace_id[0]) if trace_id else None
+        if automation is None and not self.scenario.multi:
+            automation = self.scenario.automations[0]
+        call = {
+            "at": self.now(),
+            "domain": domain,
+            "service": service,
+            "data": dict(data),
+            "target": dict(target) if target else None,
+            "run": trace_id[1] if trace_id else None,
+            "context": {"id": context.id, "parent_id": context.parent_id, "user_id": context.user_id},
+        }
+        if self.scenario.multi:
+            call["automation"] = None if automation is None else automation.index
+        self.service_calls.append(call)
         known = self.scenario.services
         name = f"{domain}.{service}"
-        if domain == "automation" and service in _SELF_SERVICES and name not in self._self_calls and self._targets_self(data, target):
-            self._self_calls.add(name)
-            own = self.scenario.own_entity_id
+        if (
+            automation is not None
+            and domain == "automation"
+            and service in _SELF_SERVICES
+            and (automation.index, name) not in self._self_calls
+            and self._targets_self(automation.entity_id, data, target)
+        ):
+            self._self_calls.add((automation.index, name))
+            own = automation.entity_id
             if service == "trigger":
                 message = f"The automation calls {name} on itself ({own}). Like every service call it is only recorded, so the replay does not start that extra run"
             else:
@@ -770,13 +894,13 @@ class _Replay:
                     f"The automation calls {name} on itself ({own}). Like every service call it is only recorded: in the replay it is turned on and off by "
                     f"the recorded state of {own}, when that is on the timeline"
                 )
-            self.warnings.append(_warning("self_service_call", message, self.now()))
+            self._warn(automation, "self_service_call", message, self.now())
         if known is not None and service not in known.get(domain, ()) and name not in self._unknown_services:
             self._unknown_services.add(name)
             self.warnings.append(_warning("unknown_service", f"{name} does not exist on the live instance", self.now()))
 
-    def _targets_self(self, data: dict[str, Any], target: dict[str, Any] | None) -> bool:
-        own = self.scenario.own_entity_id
+    @staticmethod
+    def _targets_self(own: str, data: dict[str, Any], target: dict[str, Any] | None) -> bool:
         for value in (data.get("entity_id"), (target or {}).get("entity_id")):
             ids = value.split(",") if isinstance(value, str) else value if isinstance(value, list) else []
             if any(isinstance(entity_id, str) and entity_id.strip().lower() in (own, "all") for entity_id in ids):
@@ -789,14 +913,17 @@ class _Replay:
         dropped_ids: set[str] = set()
         for trace in self.traces:
             run = _run_record(trace)
+            automation = self._by_key.get(trace.key)
+            if self.scenario.multi:
+                run["automation"] = None if automation is None else automation.index
             started = run["started"]
             if started is None or not start <= started < end:
                 dropped_ids.add(run["id"])
                 continue
+            if automation is not None:
+                automation.run_count += 1
             if run["outcome"] == "unfinished":
-                self.warnings.append(
-                    _warning("run_unfinished", f"Run {run['id']} was still running at the overrun bound ({self.scenario.overrun} after the end)", started)
-                )
+                self._warn(automation, "run_unfinished", f"Run {run['id']} was still running at the overrun bound ({self.scenario.overrun} after the end)", started)
             runs.append(run)
         calls = [call for call in self.service_calls if call["run"] not in dropped_ids]
         warnings = self.warnings + self.log_warnings
@@ -811,6 +938,11 @@ class _Replay:
             "service_calls": calls,
             "warnings": warnings,
         }
+        if self.scenario.multi:
+            result["automations"] = [
+                {"index": item.index, "entity_id": item.entity_id, "loaded": item.entity is not None, "error": item.error, "run_count": item.run_count}
+                for item in self.scenario.automations
+            ]
         return _json_safe(result)
 
 
