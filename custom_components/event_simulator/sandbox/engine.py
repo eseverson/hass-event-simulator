@@ -5,8 +5,8 @@ Runs in the child process (see `__main__.py`). `run_scenario(scenario)` is the w
 Timeline of a replay (all virtual time, see `vclock.py`)
 --------------------------------------------------------
 1. `start - BOOT_LEAD`: a `HomeAssistant` boots on the virtual loop with a temporary config dir (deleted afterwards). The scenario's `registry` snapshot is written into that dir's `.storage` first, so the entity/device/area/floor/label registries load it through their own load path (config entries as disabled stubs, never set up); registered entities with no initial state get HA's own `unavailable` placeholder at start, as live HA gives entities whose integration did not load. It loads the base registries, sets up only the `homeassistant` and `labs` integrations (turning on the scenario's `core.preview_features`, so Labs-gated triggers and conditions validate as they do live), then runs `async_start`; the automation integration and whatever it pulls in (`trace`, `blueprint`, trigger/condition platforms) come later. No recorder, http, frontend or network-facing integrations, and `skip_pip` is on, so nothing is installed or fetched. `BOOT_LEAD` absorbs any timers boot waits on, so the window starts with everything settled.
-2. `start`: initial states are seeded with their recorded `last_changed` / `last_updated` (`StateMachine.async_set(..., timestamp=...)`; an attribute-only update is reproduced by a second write at `last_updated`); states without them are stamped `start`, the same clamp the recorder applies. Then the automation is checked for platforms the sandbox cannot run (custom integrations' triggers/conditions, integration-specific device automations -> `unsupported_automation`, naming each by config path), validated with HA's own automation schema (invalid -> structured `invalid_automation` error) and set up. It attaches after `async_start`, so a `homeassistant: start` trigger does not fire, and at `start` exactly, so a time trigger at the window start does.
-3. `[start, end)`: timeline events are written with `async_set` at their `at`; events at the same instant are written in list order. Every service call is intercepted at the `ServiceRegistry` (see `RecordingServiceRegistry`): recorded, answered with success (an empty response when one is asked for), and never executed, so recorded calls change no state.
+2. `start`: initial states are seeded with their recorded `last_changed` / `last_updated` (`StateMachine.async_set(..., timestamp=...)`; an attribute-only update is reproduced by a second write at `last_updated`); states without them are stamped `start`, the same clamp the recorder applies. The automation's own entity is the exception: its recorded state is not seeded but stored as its last state before boot, so it loads enabled or disabled (and with its `last_triggered`) as live HA restores it. Then the automation is checked for platforms the sandbox cannot run (custom integrations' triggers/conditions, integration-specific device automations -> `unsupported_automation`, naming each by config path), validated with HA's own automation schema (invalid -> structured `invalid_automation` error) and set up. It attaches after `async_start`, so a `homeassistant: start` trigger does not fire, and at `start` exactly, so a time trigger at the window start does.
+3. `[start, end)`: timeline events are written with `async_set` at their `at`; events at the same instant are written in list order. A recorded on/off of the automation's own entity turns the automation on/off instead (`automation.turn_on` / `turn_off` semantics), so the entity's state, and every template reading it, is the sandbox's own. Every service call is intercepted at the `ServiceRegistry` (see `RecordingServiceRegistry`): recorded, answered with success (an empty response when one is asked for), and never executed, so recorded calls change no state.
 4. `end`: the automation's triggers are detached (`async_turn_off(stop_actions=False)`), so nothing new starts; the window is half-open and a run triggered at `end` itself is discarded. Runs already in flight (a `delay`, a `wait_for_trigger`, a queue) keep going for up to `overrun_seconds` of virtual time (default `DEFAULT_OVERRUN`, at most `MAX_OVERRUN`); a run still going at that bound is reported with outcome `unfinished` and a warning. Then HA is stopped.
 
 Runs are read from HA's own automation traces (captured as `trace_automation` stores them, so the stored-traces limit never drops one) and serialized with `as_extended_dict()`.
@@ -49,6 +49,8 @@ from homeassistant.const import (
     ATTR_SERVICE_DATA,
     EVENT_CALL_SERVICE,
     MAX_LENGTH_STATE_STATE,
+    STATE_OFF,
+    STATE_ON,
 )
 from homeassistant.core import (
     Context,
@@ -66,12 +68,14 @@ from homeassistant.helpers import (
     entity_registry,
     floor_registry,
     label_registry,
+    restore_state,
 )
 from homeassistant.helpers import trigger as trigger_helper
 from homeassistant.helpers.json import ExtendedJSONEncoder
 from homeassistant.helpers.trace import trace_id_get
 from homeassistant.loader import IntegrationNotFound, async_get_integration
 from homeassistant.setup import async_setup_component
+from homeassistant.util import slugify
 import voluptuous as vol  # noqa: I001 - after homeassistant, see above
 from voluptuous.humanize import humanize_error
 
@@ -113,6 +117,8 @@ _REGISTRY_STORES: dict[str, tuple[str, str, str | None, tuple[int, int]]] = {
 MAX_REGISTRY_ITEMS = 10_000
 # Device automation platforms the sandbox can run: those of entity-domain integrations (binary_sensor, light, sensor, ...), which work from the entity and device registries alone. Integration-specific ones (zha, mqtt, hue, ...) need that integration running.
 _GENERIC_DEVICE_AUTOMATION_TYPE = "entity"
+# Services that act on an automation entity; an automation calling one on itself gets a warning, since the call is only recorded.
+_SELF_SERVICES = frozenset({"turn_on", "turn_off", "toggle", "trigger"})
 # Config keys never searched for triggers/conditions: service-call payloads and variables.
 _PAYLOAD_KEYS = frozenset({"data", "data_template", "target", "variables", "event_data", "event_data_template", "response_variable", "metadata", "for_each"})
 
@@ -155,6 +161,9 @@ class _Scenario:
     preview_features: list[tuple[str, str]] = field(default_factory=list)
     registry: dict[str, Any] = field(default_factory=dict)
     warnings: list[dict[str, Any]] = field(default_factory=list)
+    # The replayed automation's own entity id, and its recorded state at the window start (taken out of `initial_states`).
+    own_entity_id: str = ""
+    own_initial: _InitialState | None = None
 
 
 def error_result(code: str, message: str, warnings: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -183,6 +192,7 @@ def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
     config_dir = tempfile.mkdtemp(prefix="event_simulator_")
     try:
         _write_registry_storage(config_dir, parsed.registry, parsed.start - BOOT_LEAD)
+        _write_own_last_state(config_dir, parsed)
         with patch_homeassistant_clock(clock):
             replay = _Replay(parsed, clock, config_dir)
             return clock.loop.run_until_complete(replay.run())
@@ -315,8 +325,22 @@ def _parse_scenario(raw: dict[str, Any]) -> _Scenario:
         raise ScenarioError("invalid_scenario", "seed must be an integer")
 
     registry = _parse_registry(raw.get("registry"), warnings)
+    own_entity_id = _own_entity_id(automation, registry)
+    own_initial = initial_states.pop(own_entity_id, None)
 
-    return _Scenario(core, start, end, automation, initial_states, events, services, overrun, seed, preview_features, registry, warnings)
+    return _Scenario(
+        core, start, end, automation, initial_states, events, services, overrun, seed, preview_features, registry, warnings, own_entity_id, own_initial
+    )
+
+
+def _own_entity_id(automation: dict[str, Any], registry: dict[str, Any]) -> str:
+    """The entity id the replayed automation gets: its registry entry's (platform `automation`, unique id = the config id), else the one Home Assistant derives from its name."""
+    automation_id = automation.get("id") or DEFAULT_AUTOMATION_ID
+    for entry in registry.get("entities") or ():
+        if entry.get("platform") == "automation" and entry.get("unique_id") == automation_id and str(entry.get("entity_id", "")).startswith("automation."):
+            return entry["entity_id"]
+    alias = automation.get("alias")
+    return f"automation.{slugify(alias if isinstance(alias, str) and alias else 'automation 0')}"
 
 
 def _parse_registry(value: Any, warnings: list[dict[str, Any]]) -> dict[str, Any]:
@@ -408,6 +432,32 @@ def _write_registry_storage(config_dir: str, registry: dict[str, Any], stamp: da
             for stub in registry["config_entries"]
         ]
         write(config_entries.STORAGE_KEY, (config_entries.STORAGE_VERSION, config_entries.STORAGE_VERSION_MINOR), {"entries": entries})
+
+
+def _write_own_last_state(config_dir: str, scenario: _Scenario) -> None:
+    """Store the automation's recorded on/off state at the window start as its last state, so it boots enabled or disabled as live HA restores it after a restart (`last_triggered` included)."""
+    item = scenario.own_initial
+    if item is None or item.state not in (STATE_ON, STATE_OFF):
+        return
+    last_changed = item.last_changed or scenario.start
+    state = {
+        "entity_id": scenario.own_entity_id,
+        "state": item.state,
+        "attributes": item.attributes,
+        "last_changed": last_changed.isoformat(),
+        "last_updated": max(item.last_updated or last_changed, last_changed).isoformat(),
+    }
+    storage = os.path.join(config_dir, ".storage")
+    os.makedirs(storage, exist_ok=True)
+    with open(os.path.join(storage, restore_state.STORAGE_KEY), "w", encoding="utf-8") as file:
+        json.dump(
+            {
+                "version": restore_state.STORAGE_VERSION,
+                "key": restore_state.STORAGE_KEY,
+                "data": [{"state": state, "extra_data": None, "last_seen": scenario.start.isoformat()}],
+            },
+            file,
+        )
 
 
 def _parse_preview_features(value: Any) -> list[tuple[str, str]]:
@@ -522,6 +572,7 @@ class _Replay:
         self.warnings: list[dict[str, Any]] = list(scenario.warnings)
         self.log_warnings: list[dict[str, Any]] = []
         self._unknown_services: set[str] = set()
+        self._self_calls: set[str] = set()
         self._entity: Any = None
 
     def now(self) -> datetime:
@@ -623,7 +674,10 @@ class _Replay:
         config = dict(self.scenario.automation)
         if not config.get("id"):
             config["id"] = DEFAULT_AUTOMATION_ID
-        if config.get("initial_state") is False:
+        if self.scenario.own_initial is not None and self.scenario.own_initial.state in (STATE_ON, STATE_OFF):
+            # Its recorded state at the window start says whether it was enabled; that wins over the configured state at boot.
+            config.pop("initial_state", None)
+        elif config.get("initial_state") is False:
             config.pop("initial_state")
             self.warnings.append(_warning("initial_state_ignored", "initial_state: false was ignored so the automation can run"))
 
@@ -654,7 +708,19 @@ class _Replay:
 
     def _play(self, events: list[_Event]) -> None:
         for event in events:
-            self.hass.states.async_set(event.entity_id, event.state, event.attributes, timestamp=event.at.timestamp())
+            if event.entity_id == self.scenario.own_entity_id:
+                self._play_own(event)
+            else:
+                self.hass.states.async_set(event.entity_id, event.state, event.attributes, timestamp=event.at.timestamp())
+
+    def _play_own(self, event: _Event) -> None:
+        """A recorded state of the automation itself turns it on or off, as the `automation.turn_on` / `turn_off` services do (`stop_actions` at its default); the entity writes its own state. Attribute-only updates (`last_triggered`, `current`) and other states are its own doing, so they are not played."""
+        entity = self._entity
+        if event.state == STATE_ON and not entity.is_on:
+            self.hass.async_create_task(entity.async_turn_on())
+        elif event.state == STATE_OFF and entity.is_on:
+            # Eager: its triggers are detached before the next event of the same instant is written.
+            self.hass.async_create_task(entity.async_turn_off())
 
     async def _drain(self) -> None:
         """Let runs in flight at `end` finish, up to the overrun bound."""
@@ -694,9 +760,28 @@ class _Replay:
         )
         known = self.scenario.services
         name = f"{domain}.{service}"
+        if domain == "automation" and service in _SELF_SERVICES and name not in self._self_calls and self._targets_self(data, target):
+            self._self_calls.add(name)
+            own = self.scenario.own_entity_id
+            if service == "trigger":
+                message = f"The automation calls {name} on itself ({own}). Like every service call it is only recorded, so the replay does not start that extra run"
+            else:
+                message = (
+                    f"The automation calls {name} on itself ({own}). Like every service call it is only recorded: in the replay it is turned on and off by "
+                    f"the recorded state of {own}, when that is on the timeline"
+                )
+            self.warnings.append(_warning("self_service_call", message, self.now()))
         if known is not None and service not in known.get(domain, ()) and name not in self._unknown_services:
             self._unknown_services.add(name)
             self.warnings.append(_warning("unknown_service", f"{name} does not exist on the live instance", self.now()))
+
+    def _targets_self(self, data: dict[str, Any], target: dict[str, Any] | None) -> bool:
+        own = self.scenario.own_entity_id
+        for value in (data.get("entity_id"), (target or {}).get("entity_id")):
+            ids = value.split(",") if isinstance(value, str) else value if isinstance(value, list) else []
+            if any(isinstance(entity_id, str) and entity_id.strip().lower() in (own, "all") for entity_id in ids):
+                return True
+        return False
 
     def _result(self, collector: _LogCollector) -> dict[str, Any]:
         start, end = self.scenario.start, self.scenario.end
