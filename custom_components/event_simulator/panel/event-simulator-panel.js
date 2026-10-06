@@ -680,7 +680,7 @@ function stripMarks(item) {
 /* The scenario sent to event_simulator/simulate (see the design spec). Events from all
  * tracks merged into one list ordered by time, as the child replays them. `automation`
  * is always the config as an object, edited or not (see the config editor below). */
-export function buildScenario({ automation, start, end, tracks, busEvents = [] }) {
+export function buildScenario({ automation, start, end, tracks, busEvents = [], calendars = {} }) {
   const initial_states = {};
   const events = [];
   for (const track of tracks) {
@@ -702,7 +702,70 @@ export function buildScenario({ automation, start, end, tracks, busEvents = [] }
   // Recorded bus events, only those the automation's event triggers listen to (#35).
   const bus = busEventsFor(busEvents, eventTriggerTypes(automation), start, end);
   if (bus.length) scenario.bus_events = bus;
+  // The events of the calendars the automation's calendar triggers read (#37); a calendar
+  // without them serves the events its recorded states name (the child does that).
+  const named = calendarTriggerEntities(automation);
+  const served = Object.fromEntries(Object.entries(calendars || {}).filter(([id]) => named.has(id)));
+  if (Object.keys(served).length) scenario.calendars = served;
   return scenario;
+}
+
+/* The calendars an automation's calendar triggers read: `trigger: calendar` (or the legacy
+ * `platform: calendar`) by `entity_id`, and `calendar.event_started` / `event_ended` by their
+ * target's `entity_id`, as a Set. */
+export function calendarTriggerEntities(automation) {
+  const found = new Set();
+  if (!automation || typeof automation !== "object") return found;
+  const raw = automation.triggers ?? automation.trigger ?? [];
+  for (const trigger of Array.isArray(raw) ? raw : [raw]) {
+    if (!trigger || typeof trigger !== "object") continue;
+    const platform = trigger.trigger ?? trigger.platform;
+    let named = null;
+    if (platform === "calendar") named = trigger.entity_id;
+    else if (typeof platform === "string" && platform.startsWith("calendar.")) named = trigger.target?.entity_id;
+    for (const id of Array.isArray(named) ? named : [named]) {
+      if (typeof id === "string" && id.startsWith("calendar.")) found.add(id);
+    }
+  }
+  return found;
+}
+
+/* The events of calendars around the window (#37): each calendar's own (calendar.get_events)
+ * plus those its recorded states name (history.async_get_calendar_events). */
+export function calendarEventsMessage(entityIds, start, end) {
+  return {
+    type: "event_simulator/calendar_events",
+    entity_ids: [...entityIds],
+    start: new Date(start).toISOString(),
+    end: new Date(end).toISOString(),
+  };
+}
+
+/* When a calendar event starts and ends, as epoch ms: a date is local midnight in Home
+ * Assistant's zone `tz`, a datetime without an offset local wall time there. */
+export function calendarEventSpan(event, tz) {
+  const at = (value) => {
+    const text = String(value ?? "");
+    if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return fromLocalInput(`${text}T00:00`, tz);
+    if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(text)) return fromLocalInput(text.replace(" ", "T").slice(0, 23), tz);
+    return parseTime(text);
+  };
+  return { t0: at(event?.start), t1: at(event?.end) };
+}
+
+/* What a calendar lane draws: one bar per event overlapping [start, end), with a title. */
+export function calendarLane(events, tz, start, end, fmt = (ms) => new Date(ms).toISOString()) {
+  const bars = [];
+  for (const event of events || []) {
+    const { t0, t1 } = calendarEventSpan(event, tz);
+    if (!Number.isFinite(t0) || !Number.isFinite(t1) || t1 < start || t0 >= end) continue;
+    const allDay = /^\d{4}-\d{2}-\d{2}$/.test(String(event.start));
+    const lines = [`${event.summary ?? ""}`, allDay ? `${event.start} (all day)` : `${fmt(t0)} – ${fmt(t1)}`];
+    if (event.location) lines.push(event.location);
+    if (event.description) lines.push(event.description);
+    bars.push({ t0, t1, title: lines.join("\n") });
+  }
+  return bars;
 }
 
 /* Recorded bus events (#35): zha_event, tag_scanned, ... of the window, from the recorder's
@@ -2384,6 +2447,12 @@ class EventSimulatorPanel extends Base {
     this._busEvents = [];
     this._busDropped = [];
     this._busKey = null;
+    // Events of the calendars the automation's calendar triggers read, or (Suggest mode) of
+    // the calendar tracks (#37): a read-only lane each, and what a replay serves its calendar
+    // triggers. `_calKey` is the window and calendars they were loaded for.
+    this._calendars = {};
+    this._calSources = {};
+    this._calKey = null;
     // {running, text, stage, error, stale, result: {suggestions: [suggestionView], hints:
     // [hintView], evaluated, warnings}}; a result stays shown (dimmed) while the next runs.
     this._suggestState = null;
@@ -2572,6 +2641,7 @@ class EventSimulatorPanel extends Base {
    * changed while it was in flight (both bump _requestToken and reload everything). */
   async _loadHistory(entityIds = null) {
     this._loadBusEvents();
+    this._loadCalendars();
     const token = this._requestToken;
     const ids = entityIds || this._tracks.map((t) => t.entity_id);
     this._error = null;
@@ -2624,6 +2694,42 @@ class EventSimulatorPanel extends Base {
       this._busDropped = found.dropped_event_types || [];
     } catch (e) {
       if (this._busKey === key) this._busEvents = [];
+    }
+    this._scheduleTimeline();
+  }
+
+  /* The calendars whose events the panel shows and a replay sends: in Replay mode those the
+   * automation's calendar triggers read, in Suggest mode the calendar tracks. */
+  _calendarIds() {
+    if (this._mode === "suggest") return this._tracks.map((t) => t.entity_id).filter((id) => id.startsWith("calendar."));
+    let config = null;
+    try {
+      config = this._runConfig();
+    } catch {
+      config = null;
+    }
+    return [...calendarTriggerEntities(config)];
+  }
+
+  /* Their events around the window, once per window and set of calendars; a backend without
+   * the command (or a failed read) leaves the lanes empty, and the sandbox reads the events
+   * from the calendars' recorded states instead. */
+  async _loadCalendars() {
+    const { start, end } = this._window;
+    const ids = this._calendarIds().sort();
+    const key = `${start}-${end}-${ids.join(",")}`;
+    if (this._calKey === key) return;
+    this._calKey = key;
+    this._calendars = {};
+    this._calSources = {};
+    if (!ids.length) return this._scheduleTimeline();
+    try {
+      const found = await this._hass.callWS(calendarEventsMessage(ids, start, end));
+      if (this._calKey !== key) return;
+      this._calendars = found.calendars || {};
+      this._calSources = found.sources || {};
+    } catch (e) {
+      if (this._calKey === key) this._calendars = {};
     }
     this._scheduleTimeline();
   }
@@ -2713,6 +2819,7 @@ class EventSimulatorPanel extends Base {
     this._labelError = null;
     this._notice = null;
     this._hintSel = null;
+    this._loadCalendars();
     if (mode === "suggest") this._suggestScheduler.change();
     if (mode === "replay") {
       this._labelSel = null;
@@ -3266,6 +3373,8 @@ class EventSimulatorPanel extends Base {
       if (check.ok) this._cfgDraft = stableStringify(value) === stableStringify(this._savedConfig()) ? null : value;
     }
     this._markStale();
+    // An edit may name other calendars (its own key: one read per set of calendars).
+    this._loadCalendars();
     this._updateConfigStatus();
     this._updateConfigDiff();
     this._updateDirty();
@@ -3552,7 +3661,7 @@ class EventSimulatorPanel extends Base {
       return null;
     }
     const message = simulateSubscribeMessage(
-      buildScenario({ automation: this._runConfig(), start: this._window.start, end: this._window.end, tracks: this._tracks, busEvents: this._busEvents })
+      buildScenario({ automation: this._runConfig(), start: this._window.start, end: this._window.end, tracks: this._tracks, busEvents: this._busEvents, calendars: this._calendars })
     );
     const size = messageBytes(message);
     const tooLarge = messageSizeError(message, size);
@@ -4256,7 +4365,11 @@ class EventSimulatorPanel extends Base {
       this._cfgDraft ? "the edited automation config" : "",
     ].filter(Boolean);
     const bus = this._busLaneEvents().length;
-    const fired = bus ? ` and ${bus} recorded event${bus === 1 ? "" : "s"}` : "";
+    const calendarEvents = this._calendarIds().reduce((n, id) => n + (this._calendars[id]?.length || 0), 0);
+    const fired = [
+      bus ? `${bus} recorded event${bus === 1 ? "" : "s"}` : "",
+      calendarEvents ? `${calendarEvents} calendar event${calendarEvents === 1 ? "" : "s"}` : "",
+    ].filter(Boolean).map((text) => ` and ${text}`).join("");
     return `Replays ${events} state change${events === 1 ? "" : "s"} on ${this._tracks.length} track${this._tracks.length === 1 ? "" : "s"}${fired}${what.length ? `, with ${what.join(" and ")}` : ""}${this._autoRun ? ", after every change" : ""}. Service calls are recorded, never made.`;
   }
 
@@ -4515,6 +4628,9 @@ class EventSimulatorPanel extends Base {
     if (this._mode === "replay" && (this._result || this._running)) parts.push(this._resultsRow(scale));
     const bus = this._busLaneEvents();
     if (bus.length) parts.push(this._busEventsRow(scale, bus));
+    for (const id of this._calendarIds()) {
+      if (this._calendars[id]) parts.push(this._calendarRow(scale, id));
+    }
     for (const track of this._tracks) parts.push(this._trackRow(track, scale));
     tl.innerHTML = parts.join("");
     // The hover line starts under the axis and its scroll bar.
@@ -4561,6 +4677,32 @@ class EventSimulatorPanel extends Base {
       <div class="row bus-row">
         <div class="track-head"><span class="name">Events</span><span class="meta">${items.join(" · ")}</span></div>
         <svg class="bus" data-row="bus" width="${scale.width}" height="${BUS_H}">${out}</svg>
+      </div>`;
+  }
+
+  /* A calendar lane (read-only): one bar per event, its summary in the tooltip, and where
+   * the events came from. */
+  _calendarRow(scale, id) {
+    const { start, end } = this._window;
+    const bars = calendarLane(this._calendars[id], this._clock.serverTimeZone, start, end, (t) => this._clock.full(t));
+    let out = this._gridLines(scale, BUS_H);
+    for (const b of bars) {
+      const x0 = scale.toX(Math.max(b.t0, scale.t0));
+      const x1 = scale.toX(Math.min(b.t1, scale.t1));
+      if (x1 < 0 || x0 > scale.width) continue;
+      out += `<rect x="${x0.toFixed(1)}" y="5" width="${Math.max(x1 - x0, 2).toFixed(1)}" height="${BUS_H - 10}" rx="3" class="cal-bar"><title>${esc(b.title)}</title></rect>`;
+    }
+    const source = this._calSources[id] || {};
+    const from = [
+      source.calendar ? `${source.calendar} from the calendar` : "",
+      source.states ? `${source.states} from its recorded states` : "",
+    ].filter(Boolean);
+    const meta = `${bars.length} event${bars.length === 1 ? "" : "s"}${from.length ? ` (${from.join(", ")})` : ""}`;
+    const note = source.error ? ` · <span title="${esc(source.error)}">calendar not read</span>` : "";
+    return `
+      <div class="row bus-row cal-row">
+        <div class="track-head"><span class="name">${esc(id)}</span><span class="meta">${meta}${note}</span></div>
+        <svg class="bus" data-row="calendar" width="${scale.width}" height="${BUS_H}">${out}</svg>
       </div>`;
   }
 
@@ -6060,6 +6202,7 @@ class EventSimulatorPanel extends Base {
       .pop-group .nofire-btn.primary { background: var(--error-color, #db4437); border-color: var(--error-color, #db4437); }
       svg.hints, svg.fires, svg.bus { background: var(--secondary-background-color); border-radius: 4px; }
       .bus-mark { stroke-width: 2; stroke-linecap: round; }
+      .cal-bar { fill: var(--info-color, #039be5); fill-opacity: 0.45; stroke: var(--info-color, #039be5); stroke-width: 1; }
       .bus-mark.b0 { stroke: var(--info-color, #039be5); }
       .bus-mark.b1 { stroke: var(--warning-color, #ff9800); }
       .bus-mark.b2 { stroke: var(--success-color, #43a047); }
