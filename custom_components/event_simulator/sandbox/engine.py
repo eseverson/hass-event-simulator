@@ -7,7 +7,7 @@ The scenario carries either `automation` (one config) or `automations` (a list o
 Timeline of a replay (all virtual time, see `vclock.py`)
 --------------------------------------------------------
 1. `start - BOOT_LEAD`: a `HomeAssistant` boots on the virtual loop with a temporary config dir (deleted afterwards). The scenario's `registry` snapshot is written into that dir's `.storage` first, so the entity/device/area/floor/label registries load it through their own load path (config entries as disabled stubs, never set up); registered entities with no initial state get HA's own `unavailable` placeholder at start, as live HA gives entities whose integration did not load. It loads the base registries, sets up only the `homeassistant` and `labs` integrations (turning on the scenario's `core.preview_features`, so Labs-gated triggers and conditions validate as they do live), then runs `async_start`; the automation integration and whatever it pulls in (`trace`, `blueprint`, trigger/condition platforms) come later. No recorder, http, frontend or network-facing integrations, and `skip_pip` is on, so nothing is installed or fetched. `BOOT_LEAD` absorbs any timers boot waits on, so the window starts with everything settled.
-2. `start`: initial states are seeded with their recorded `last_changed` / `last_updated` (`StateMachine.async_set(..., timestamp=...)`; an attribute-only update is reproduced by a second write at `last_updated`); states without them are stamped `start`, the same clamp the recorder applies. The automation's own entity is the exception: its recorded state is not seeded but stored as its last state before boot, so it loads enabled or disabled (and with its `last_triggered`) as live HA restores it. Then the automation is checked for platforms the sandbox cannot run (custom integrations' triggers/conditions, integration-specific device automations -> `unsupported_automation`, naming each by config path), validated with HA's own automation schema (invalid -> structured `invalid_automation` error) and set up. It attaches after `async_start`, so a `homeassistant: start` trigger does not fire, and at `start` exactly, so a time trigger at the window start does.
+2. `start`: the scenario's optional `helpers` (`[{domain, entity_id, options, title?}]`, core Trend and Derivative helpers; see `helpers.py` and `_Replay._setup_helpers`) are set up first, as config entries of those integrations with the requested entity ids, so they take in the seeded states and compute from the replayed source states on virtual time; a helper's own recorded states are not played (its state at the start is restored as its last state). Then initial states are seeded with their recorded `last_changed` / `last_updated` (`StateMachine.async_set(..., timestamp=...)`; an attribute-only update is reproduced by a second write at `last_updated`); states without them are stamped `start`, the same clamp the recorder applies. The automation's own entity is the exception: its recorded state is not seeded but stored as its last state before boot, so it loads enabled or disabled (and with its `last_triggered`) as live HA restores it. Then the automation is checked for platforms the sandbox cannot run (custom integrations' triggers/conditions, integration-specific device automations -> `unsupported_automation`, naming each by config path), validated with HA's own automation schema (invalid -> structured `invalid_automation` error) and set up. It attaches after `async_start`, so a `homeassistant: start` trigger does not fire, and at `start` exactly, so a time trigger at the window start does.
 3. `[start, end)`: timeline events are written with `async_set` at their `at`; events at the same instant are written in list order. The optional `bus_events` (`[{at, event_type, data}]`, recorded events such as `zha_event` or `tag_scanned`) are fired on the bus at their `at` (`time_fired` set to it), after the state writes of the same instant, so event triggers replay and a condition reads the states of that instant. Home Assistant's own lifecycle and bookkeeping events (`state_changed`, `call_service`, `homeassistant_start`, ...) are refused: the sandbox's Home Assistant fires those itself. Calendar triggers ask a stub calendar per calendar entity for its events (see `_Replay._serve_calendars`): the scenario's optional `calendars` (`{entity_id: [{start, end, summary, description?, location?}]}`, the shape `calendar.get_events` answers with; see `calendars.py`), else the events the calendar's own recorded states name (a `calendar_from_states` warning, or `calendar_no_events` when there are none); the calendar's recorded states still replay as recorded. A recorded on/off of a replayed automation's own entity turns that automation on/off instead (`automation.turn_on` / `turn_off` semantics), so the entity's state, and every template reading it, is the sandbox's own. Every service call is intercepted at the `ServiceRegistry` (see `RecordingServiceRegistry`): recorded, answered with success (an empty response when one is asked for), and never executed, so recorded calls change no state.
 4. `end`: the automation's triggers are detached (`async_turn_off(stop_actions=False)`), so nothing new starts; the window is half-open and a run triggered at `end` itself is discarded. Runs already in flight (a `delay`, a `wait_for_trigger`, a queue) keep going for up to `overrun_seconds` of virtual time (default `DEFAULT_OVERRUN`, at most `MAX_OVERRUN`); a run still going at that bound is reported with outcome `unfinished` and a warning. Then HA is stopped.
 
@@ -23,8 +23,11 @@ Result
       "version": 1, "start": iso, "end": iso, "error": null | {"code", "message"},
       "runs": [{"id", "started", "finished", "trigger": {...}, "outcome", "stopped_by", "script_execution", "error", "trace"}],
       "service_calls": [{"at", "domain", "service", "data", "target", "run", "context": {"id", "parent_id", "user_id"}}],
-      "warnings": [{"code", "message", "at"}]
+      "warnings": [{"code", "message", "at"}],
+      "helper_states": {entity_id: [{"at", "state"}]}
     }
+
+`helper_states` has each helper's state at the window start, then every change of its state in the window (attribute-only updates left out), at most `helpers.MAX_HELPER_STATES` per helper (`helper_states_truncated` warning past that); `{}` without helpers.
 
 `traces` sets how much each run carries: `full` (the default) is the shape above. `summary` drops `trace` and adds `conditions`, the result of each top-level condition by trace path (`{"condition/0": false}`; empty when none was evaluated). `none` keeps only `id`, `started`, `finished`, `outcome` and `trigger` as `{"idx", "id"}`, and records no service calls (`service_calls` is empty). Trimmed runs are reduced as each one finishes, so the child never holds more than Home Assistant's own few stored traces per automation; that keeps a month of many automations well under the runner's output cap.
 
@@ -47,6 +50,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -96,6 +100,7 @@ from homeassistant.helpers import (
     restore_state,
 )
 from homeassistant.helpers import trigger as trigger_helper
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.json import ExtendedJSONEncoder
 from homeassistant.helpers.trace import script_execution_set, trace_id_get
 from homeassistant.loader import IntegrationNotFound, async_get_integration
@@ -104,7 +109,7 @@ from homeassistant.util import slugify
 import voluptuous as vol  # noqa: I001 - after homeassistant, see above
 from voluptuous.humanize import humanize_error
 
-from . import calendars as calendar_events
+from . import calendars as calendar_events, helpers as scenario_helpers
 from .vclock import VirtualClock, patch_homeassistant_clock
 
 _LOGGER = logging.getLogger(__name__)
@@ -257,6 +262,8 @@ class _Scenario:
     # Every calendar the sandbox serves (see `_calendars`): entity_id -> its events, sorted by start.
     calendars: dict[str, list[calendar_events.Event]] = field(default_factory=dict)
     time_zone: Any = UTC
+    # The Trend / Derivative helpers set up before the automations (see `_helpers`).
+    helpers: list[scenario_helpers.Helper] = field(default_factory=list)
 
 
 def error_result(code: str, message: str, warnings: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -452,12 +459,41 @@ def _parse_scenario(raw: dict[str, Any]) -> _Scenario:
     automations = _automations(items, multi, registry, warnings)
     time_zone = _time_zone(core.get("time_zone"))
     calendars = _calendars(raw.get("calendars"), items, initial_states, events, time_zone, warnings)
+    helpers = _helpers(raw.get("helpers"), initial_states, events, warnings)
     for automation in automations:
         automation.own_initial = initial_states.pop(automation.entity_id, None)
 
     return _Scenario(
-        core, start, end, automations, initial_states, events, services, overrun, seed, preview_features, registry, warnings, multi, traces, time_limit, bus_events, calendars, time_zone
+        core, start, end, automations, initial_states, events, services, overrun, seed, preview_features, registry, warnings, multi, traces, time_limit, bus_events, calendars, time_zone, helpers
     )
+
+
+def _helpers(value: Any, initial_states: dict[str, _InitialState], events: list[_Event], warnings: list[dict[str, Any]]) -> list[scenario_helpers.Helper]:
+    """The scenario's `helpers` (see `helpers.py`), each one's own recorded states taken off the timeline.
+
+    A helper computes its own state, so a recorded one of its entity (the helper exists live too) is not played: the one at the window start becomes its restored last state, as after a restart, and the rest are dropped with a `helper_replaces_recorded` warning. A helper whose source has no state on the timeline gets a `helper_source_missing` warning: it never changes.
+    """
+    try:
+        helpers = scenario_helpers.parse_helpers(value, valid_entity_id)
+    except ValueError as err:
+        raise ScenarioError("invalid_scenario", str(err)) from err
+    timeline = set(initial_states) | {event.entity_id for event in events}
+    for helper in helpers:
+        if (initial := initial_states.pop(helper.entity_id, None)) is not None:
+            helper.recorded = {"state": initial.state, "attributes": initial.attributes, "last_changed": initial.last_changed, "last_updated": initial.last_updated}
+        dropped = [event for event in events if event.entity_id == helper.entity_id]
+        if dropped:
+            events[:] = [event for event in events if event.entity_id != helper.entity_id]
+            count = len(dropped)
+            warnings.append(
+                _warning(
+                    "helper_replaces_recorded",
+                    f"{helper.entity_id}: the {helper.domain} helper computes it from {helper.source}, so its {count} recorded state{'' if count == 1 else 's'} in the window {'was' if count == 1 else 'were'} not played",
+                )
+            )
+        if helper.source not in timeline and helper.source not in {other.entity_id for other in helpers}:
+            warnings.append(_warning("helper_source_missing", f"{helper.entity_id}: its source {helper.source} has no state in the scenario, so the {helper.domain} helper never changes"))
+    return helpers
 
 
 def _time_zone(name: Any) -> Any:
@@ -694,8 +730,9 @@ def _write_registry_storage(config_dir: str, registry: dict[str, Any], stamp: da
 
 
 def _write_own_last_state(config_dir: str, scenario: _Scenario) -> None:
-    """Store each automation's recorded on/off state at the window start as its last state, so it boots enabled or disabled as live HA restores it after a restart (`last_triggered` included)."""
+    """Store each automation's recorded on/off state at the window start as its last state, so it boots enabled or disabled as live HA restores it after a restart (`last_triggered` included); likewise each helper's recorded state (a derivative's value with its sensor data, as the sensor restores it)."""
     states = []
+    extra: dict[str, Any] = {}
     for automation in scenario.automations:
         item = automation.own_initial
         if item is None or item.state not in (STATE_ON, STATE_OFF):
@@ -710,6 +747,25 @@ def _write_own_last_state(config_dir: str, scenario: _Scenario) -> None:
                 "last_updated": max(item.last_updated or last_changed, last_changed).isoformat(),
             }
         )
+    for helper in scenario.helpers:
+        recorded = helper.recorded
+        if recorded is None or recorded["state"] in ("unknown", "unavailable"):
+            continue
+        last_changed = recorded["last_changed"] or scenario.start
+        states.append(
+            {
+                "entity_id": helper.entity_id,
+                "state": recorded["state"],
+                "attributes": recorded["attributes"],
+                "last_changed": last_changed.isoformat(),
+                "last_updated": max(recorded["last_updated"] or last_changed, last_changed).isoformat(),
+            }
+        )
+        if helper.domain == "derivative":
+            extra[helper.entity_id] = {
+                "native_value": {"__type": "<class 'decimal.Decimal'>", "decimal_str": recorded["state"]},
+                "native_unit_of_measurement": recorded["attributes"].get("unit_of_measurement"),
+            }
     if not states:
         return
     storage = os.path.join(config_dir, ".storage")
@@ -719,7 +775,7 @@ def _write_own_last_state(config_dir: str, scenario: _Scenario) -> None:
             {
                 "version": restore_state.STORAGE_VERSION,
                 "key": restore_state.STORAGE_KEY,
-                "data": [{"state": state, "extra_data": None, "last_seen": scenario.start.isoformat()} for state in states],
+                "data": [{"state": state, "extra_data": extra.get(state["entity_id"]), "last_seen": scenario.start.isoformat()} for state in states],
             },
             file,
         )
@@ -921,6 +977,9 @@ class _Replay:
         self._event_handles: list[asyncio.TimerHandle] = []
         # Automations whose run the watchdog's hard stop cancelled.
         self._hard_stopped: set[str] = set()
+        # Each helper's state changes in the window (`helper_states`), and how many past the cap were left out.
+        self.helper_states: dict[str, list[dict[str, Any]]] = {}
+        self._helper_states_dropped: dict[str, int] = {}
 
     def now(self) -> datetime:
         return self.clock.utcnow()
@@ -945,10 +1004,13 @@ class _Replay:
                 except ScenarioError as err:
                     return error_result(err.code, str(err), self.warnings)
                 await self._sleep_until(self.scenario.start)
-                self._seed_states()
-                self._serve_calendars()
                 ha_logger.addHandler(collector)
                 try:
+                    # Helpers first, so the seeded states reach them as they reached the live ones: a trend's latest sample is its source's state at the start.
+                    await self._setup_helpers()
+                    self._seed_states()
+                    await self._settle_helpers()
+                    self._serve_calendars()
                     await self._load_automations()
                 except ScenarioError as err:
                     return error_result(err.code, str(err), self.warnings)
@@ -1096,9 +1158,74 @@ class _Replay:
             last_changed = item.last_changed or start
             last_updated = max(item.last_updated or last_changed, last_changed)
             if last_updated > last_changed:
-                # Written twice so last_changed and last_updated both match the record: the state at last_changed, then an attribute update at last_updated.
-                states.async_set(entity_id, item.state, {_SEED_MARKER: True}, timestamp=last_changed.timestamp())
+                # Written twice so last_changed and last_updated both match the record: the state at last_changed, then an attribute update at last_updated. Both carry the recorded attributes, so a helper reading one (a trend's `attribute`) finds it in either.
+                states.async_set(entity_id, item.state, {**item.attributes, _SEED_MARKER: True}, timestamp=last_changed.timestamp())
             states.async_set(entity_id, item.state, item.attributes, timestamp=last_updated.timestamp())
+
+    async def _setup_helpers(self) -> None:
+        """Set up the scenario's helpers (`_Scenario.helpers`) as config entries of Home Assistant's own Trend and Derivative integrations, each with its options and its requested entity id.
+
+        A config entry is what the helper's config flow creates live, so the helper runs the same code (`async_setup_entry`) on the same options. Its entity id is reserved in the entity registry first (unique id = the entry id, as the helper registers it), replacing a registry entry the snapshot holds for that entity id. Both integrations compute from state timestamps and `utcnow` (a trend's `sample_duration`) or loop timers (a derivative's `max_sub_interval`), all of which run on virtual time.
+        """
+        if not self.scenario.helpers:
+            return
+        hass = self.hass
+        registry = entity_registry.async_get(hass)
+        for helper in self.scenario.helpers:
+            what = f"helpers[{helper.index}] ({helper.domain} {helper.entity_id})"
+            try:
+                integration = await async_get_integration(hass, helper.domain)
+                await integration.async_get_platform("config_flow")
+            except Exception as err:
+                raise ScenarioError("helper_failed", f"{what}: the {helper.domain} integration could not be loaded: {err}") from err
+            handler = config_entries.HANDLERS[helper.domain]
+            entry = config_entries.ConfigEntry(
+                data={},
+                discovery_keys=MappingProxyType({}),
+                domain=helper.domain,
+                entry_id=f"event_simulator_helper_{helper.index}",
+                minor_version=handler.MINOR_VERSION,
+                options=helper.options,
+                source=config_entries.SOURCE_USER,
+                subentries_data=None,
+                title=helper.title,
+                unique_id=None,
+                version=handler.VERSION,
+            )
+            if registry.async_get(helper.entity_id) is not None:
+                registry.async_remove(helper.entity_id)
+            hass.states.async_remove(helper.entity_id)
+            registry.async_get_or_create(helper.entity_domain, helper.domain, entry.entry_id, suggested_object_id=helper.entity_id.split(".", 1)[1])
+            await hass.config_entries.async_add(entry)
+            if entry.state is not config_entries.ConfigEntryState.LOADED or hass.states.get(helper.entity_id) is None:
+                reason = entry.reason or "see the log warnings"
+                raise ScenarioError("helper_failed", f"{what} did not set up ({entry.state.value}): {reason}")
+
+    async def _settle_helpers(self) -> None:
+        """Let the helpers take in the seeded states, then record each one's state from here on (`helper_states`)."""
+        if not self.scenario.helpers:
+            return
+        # Nothing runs yet but the helpers' own updates (a trend's gradient is computed in the executor, which takes no virtual time).
+        await self.hass.async_block_till_done()
+        entity_ids = [helper.entity_id for helper in self.scenario.helpers]
+        for entity_id in entity_ids:
+            state = self.hass.states.get(entity_id)
+            self.helper_states[entity_id] = [{"at": self.now(), "state": state.state if state is not None else None}]
+
+        def changed(event: Any) -> None:
+            new_state = event.data["new_state"]
+            if new_state is None or self.now() >= self.scenario.end:
+                return
+            entity_id = event.data["entity_id"]
+            seen = self.helper_states[entity_id]
+            if seen[-1]["state"] == new_state.state:
+                return
+            if len(seen) >= scenario_helpers.MAX_HELPER_STATES:
+                self._helper_states_dropped[entity_id] = self._helper_states_dropped.get(entity_id, 0) + 1
+                return
+            seen.append({"at": self.now(), "state": new_state.state})
+
+        async_track_state_change_event(self.hass, entity_ids, changed)
 
     def _serve_calendars(self) -> None:
         """Stand in for the calendar integration: each calendar the scenario serves (`_Scenario.calendars`) answers calendar triggers with its events.
@@ -1324,6 +1451,10 @@ class _Replay:
                 self._warn(automation, "run_unfinished", f"Run {run['id']} was still running at the overrun bound ({self.scenario.overrun} after the end)", started)
             runs.append(run)
         calls = [call for call in self.service_calls if call["run"] not in dropped_ids]
+        for entity_id, count in self._helper_states_dropped.items():
+            self.warnings.append(
+                _warning("helper_states_truncated", f"{entity_id}: only its first {scenario_helpers.MAX_HELPER_STATES} state changes are in helper_states; {count} more were left out")
+            )
         warnings = self.warnings + self.log_warnings
         if collector.dropped:
             warnings.append(_warning("log_truncated", f"{collector.dropped} more log warnings were not included"))
@@ -1335,6 +1466,7 @@ class _Replay:
             "runs": runs,
             "service_calls": calls,
             "warnings": warnings,
+            "helper_states": self.helper_states,
         }
         if self.scenario.multi:
             result["automations"] = [
