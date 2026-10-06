@@ -1,8 +1,8 @@
 """What kind of suggestion a candidate is (the panel's filter chips), and its structure (what near-duplicates share).
 
-Kinds (the contract shared with the panel, #41/#44): `state`, `attribute`, `numeric`, `any_change`, `trend`, `time`, `weekday`, `sun`, `calendar`, `event`, `entity_time`, and `or` when two or more triggers share one id. A state trigger with an attribute is `attribute`; one with no from/to (or `to: null`) is `any_change` (both, on an attribute); any other is `state`. A numeric_state trigger or condition is `numeric`. A clock time is `time`, plus `weekday` when it names weekdays; a time condition with only weekdays is `weekday`. A time at an entity is `entity_time`. Sun, calendar and event triggers are what they say. `trend` is a state or numeric trigger on the entity of a helper the suggestion needs (#42; none yet).
+Kinds (the contract shared with the panel, #41/#44): `state`, `attribute`, `numeric`, `any_change`, `trend`, `time`, `weekday`, `sun`, `calendar`, `event`, `entity_time`, and `or` when two or more triggers share one id. A state trigger with an attribute is `attribute`; one with no from/to (or `to: null`) is `any_change` (both, on an attribute); any other is `state`. A numeric_state trigger or condition is `numeric`. A clock time is `time`, plus `weekday` when it names weekdays; a time condition with only weekdays is `weekday`. A time at an entity is `entity_time`. Sun, calendar and event triggers are what they say. `trend` is a trigger on a Trend or Derivative helper the suggestion needs (#42: `model.TrendTrigger`, `model.DerivativeTrigger`), or a state or numeric trigger on the entity of such a helper.
 
-Structure: the parts of a candidate with their thresholds, durations, offsets, clock times and weekdays left out (whether a `for:` is there stays, as does a threshold's direction and a state's values). Candidates of one structure are the same suggestion with different numbers: the miner folds them into one card (`search.suggest`).
+Structure: the parts of a candidate with their thresholds, durations, offsets, clock times, weekdays and helper windows left out (whether a `for:` is there stays, as does a threshold's direction and a state's values). Candidates of one structure are the same suggestion with different numbers: the miner folds them into one card (`search.suggest`).
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from .model import (
     CalendarTrigger,
     Candidate,
     Condition,
+    DerivativeTrigger,
     EntityTimeTrigger,
     EventTrigger,
     NumericStateCondition,
@@ -25,6 +26,7 @@ from .model import (
     TimeCondition,
     TimeTrigger,
     Trigger,
+    TrendTrigger,
 )
 
 
@@ -52,6 +54,8 @@ def part_kinds(part: Trigger | Condition, helper_entities: Iterable[str] = ()) -
             return {"calendar"}
         case EventTrigger():
             return {"event"}
+        case TrendTrigger() | DerivativeTrigger():
+            return {"trend"}
         case StateCondition():
             return {"attribute"} if part.attribute is not None else {"state"}
         case NumericStateCondition():
@@ -97,6 +101,10 @@ def _part_structure(part: Trigger | Condition) -> tuple[Any, ...]:
             return ("calendar", part.id, part.entity_id, part.event)
         case EventTrigger():
             return ("event", part.id, part.event_type, part.event_data)
+        case TrendTrigger():
+            return ("trend", part.id, part.entity_id, part.delta > 0)
+        case DerivativeTrigger():
+            return ("derivative", part.id, part.entity_id, part.above is not None)
         case StateCondition():
             return ("state?", part.entity_id, part.attribute, part.state, bool(part.for_))
         case NumericStateCondition():

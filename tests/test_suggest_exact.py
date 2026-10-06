@@ -138,13 +138,28 @@ def test_plan_validation_takes_the_best_suggestions_whose_runs_fit_the_budget():
     runs = {"a": 30_000, "b": 30_000, "c": 5_000, "d": 4_000}
     ev = SimpleNamespace(trigger_fires=lambda trigger: [0.0] * runs[trigger])
     result = SimpleNamespace(
-        suggestions=[SimpleNamespace(candidate=SimpleNamespace(triggers=(name,))) for name in runs],
+        suggestions=[SimpleNamespace(candidate=SimpleNamespace(triggers=(name,)), helpers=()) for name in runs],
         context=SimpleNamespace(search=SimpleNamespace(ev=ev)),
     )
     assert plan_validation(result, budget=40_000) == ([0, 2, 3], 30_000)
     assert plan_validation(result, budget=8_000) == ([2], 64_000)
     assert plan_validation(result, budget=0) == ([], 69_000)
     assert plan_validation(result, budget=10**6) == ([0, 1, 2, 3], 0)
+
+
+def test_plan_validation_keeps_the_helpers_within_what_one_child_sets_up():
+    """The sandbox sets up at most 20 helpers (#42): a suggestion needing more is passed over; one sharing a helper already chosen still fits."""
+    ev = SimpleNamespace(trigger_fires=lambda trigger: [0.0])
+
+    def needing(*ids):
+        return SimpleNamespace(candidate=SimpleNamespace(triggers=("t",)), helpers=tuple({"entity_id": i} for i in ids))
+
+    many = [f"binary_sensor.h{n}" for n in range(19)]
+    result = SimpleNamespace(
+        suggestions=[needing(*many), needing("sensor.a", "sensor.b"), needing("sensor.a"), needing("binary_sensor.h3"), needing("sensor.c")],
+        context=SimpleNamespace(search=SimpleNamespace(ev=ev)),
+    )
+    assert plan_validation(result) == ([0, 2, 3], 2)
 
 
 def test_suggestions_left_unchecked_keep_the_miner_stats_and_their_rank():

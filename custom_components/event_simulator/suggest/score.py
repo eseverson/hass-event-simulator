@@ -16,6 +16,7 @@ from .labels import Anchor, Labels
 from .model import (
     CalendarTrigger,
     Candidate,
+    DerivativeTrigger,
     EntityTimeTrigger,
     NumericStateCondition,
     NumericStateTrigger,
@@ -25,6 +26,7 @@ from .model import (
     SunTrigger,
     TimeCondition,
     TimeTrigger,
+    TrendTrigger,
 )
 from .timeline import to_iso
 
@@ -141,9 +143,9 @@ def extra_triggers(candidate: Candidate) -> int:
 
 
 def simplicity(candidate: Candidate) -> tuple[int, int, int, int]:
-    """Lower is simpler: (conditions and extra triggers of an OR, `for:` options, roughness of thresholds and times, triggers).
+    """Lower is simpler: (conditions, extra triggers of an OR and helpers to create, `for:` options, roughness of thresholds and times, triggers).
 
-    Each extra trigger of an OR costs as much as a condition: "door opens or motion" is no simpler than "door opens, only when someone is home".
+    Each extra trigger of an OR costs as much as a condition: "door opens or motion" is no simpler than "door opens, only when someone is home". So does each Trend or Derivative helper the user must create first (#42): a level that explains the labels as well stays ahead of a rate.
     """
     fors = 0
     rough = 0
@@ -169,7 +171,12 @@ def simplicity(candidate: Candidate) -> tuple[int, int, int, int]:
                 rough += clock_roundness(part.offset)
             case SunCondition():
                 rough += clock_roundness(part.after_offset) + clock_roundness(part.before_offset)
-    return (len(candidate.conditions) + extra_triggers(candidate), fors, rough, len(candidate.triggers))
+            case TrendTrigger():
+                rough += roundness(abs(part.delta)) + clock_roundness(part.window)
+            case DerivativeTrigger():
+                rough += roundness(abs(part.above if part.above is not None else part.below)) + clock_roundness(part.window)
+    helpers = len({trigger.helper_key for trigger in candidate.helper_triggers})
+    return (len(candidate.conditions) + extra_triggers(candidate) + helpers, fors, rough, len(candidate.triggers))
 
 
 def rank_key(stats: Stats, candidate: Candidate) -> tuple[Any, ...]:

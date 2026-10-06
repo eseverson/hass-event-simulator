@@ -198,7 +198,9 @@ def test_threshold_variants_fold_into_one_card():
         assert structure(variant.candidate) == structure(best.candidate)
         assert variant.candidate != best.candidate
     out = result.as_dict()["suggestions"][0]["variants"]
-    assert [set(v) for v in out] == [{"config", "stats", "explanation", "exact"}] * len(out)
+    # A variant carries its own helpers (#42): the same entities as its card's, with its own options; none here.
+    assert [set(v) for v in out] == [{"config", "stats", "explanation", "exact", "helpers"}] * len(out)
+    assert all(v["helpers"] == [] for v in out)
     assert all(v["exact"] is False for v in out)
     assert out[0]["config"]["triggers"][0]["trigger"] == "numeric_state"
 
@@ -243,7 +245,8 @@ def test_every_suggestion_carries_kinds_helpers_and_the_result_counts_them():
     out = result.as_dict()
     counts: dict[str, int] = {}
     for suggestion in out["suggestions"]:
-        assert suggestion["helpers"] == []
+        # A helper exactly where a trigger reads one (#42: the outdoor temperature's rise is a trend card past the top few).
+        assert bool(suggestion["helpers"]) == ("trend" in suggestion["trigger_kinds"])
         assert set(suggestion["trigger_kinds"]) <= set(suggestion["kinds"])
         assert suggestion["kinds"] == sorted(suggestion["kinds"])
         for kind in suggestion["kinds"]:

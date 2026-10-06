@@ -17,6 +17,7 @@ from custom_components.event_simulator.suggest.evaluate import Evaluator
 from custom_components.event_simulator.suggest.model import (
     CalendarTrigger,
     Candidate,
+    DerivativeTrigger,
     EntityTimeTrigger,
     NumericStateCondition,
     NumericStateTrigger,
@@ -26,6 +27,8 @@ from custom_components.event_simulator.suggest.model import (
     SunTrigger,
     TimeCondition,
     TimeTrigger,
+    TrendTrigger,
+    helper_spec,
     render_automation,
 )
 from custom_components.event_simulator.suggest.timeline import Timeline, to_ts
@@ -93,9 +96,38 @@ CHANGES = [
     ("06:00", BINS, "off", bins("2026-10-26", "Paper") | {"friendly_name": "Bins"}),
     ("12:00", BINS, "off", bins("2026-10-27", "Glass")),
 ]
+TEMP = "sensor.temp"
+CELSIUS = {"unit_of_measurement": "°C", "state_class": "measurement"}
+
+
+def temp_changes() -> list[tuple[str, str, str, dict[str, Any]]]:
+    """A temperature for the rate helpers (#42): a slow rise, a fast one, unavailable and garbage, a fast fall, an attribute-only write, a gap longer than any window, a jittery stretch."""
+    found = []
+
+    def at(minute: int, value: Any, attributes: dict[str, Any] = CELSIUS) -> None:
+        found.append((f"{minute // 60:02d}:{minute % 60:02d}", TEMP, str(value), attributes))
+
+    for n in range(13):
+        at(60 + 5 * n, round(20 + 0.1 * n, 2))
+    for n in range(11):
+        at(180 + 2 * n, round(21.2 + 0.8 * n, 2))
+    at(240, "unavailable")
+    at(250, 22)
+    at(260, "garbage")
+    at(265, 21)
+    for n in range(11):
+        at(300 + 3 * n, round(21 - 0.7 * n, 2))
+    at(360, 14, {**CELSIUS, "battery": 80})
+    at(480, 25)
+    at(481, 25.5)
+    for n in range(31):
+        at(540 + n, 25 + (0.6 if n % 3 == 0 else -0.2 * (n % 2)) + 0.05 * n)
+    return found
+
+
 EVENTS = [
     {"at": f"2026-10-25T{hhmm}:00+00:00", "entity_id": entity_id, "state": state, "attributes": attributes}
-    for hhmm, entity_id, state, attributes in CHANGES
+    for hhmm, entity_id, state, attributes in CHANGES + temp_changes()
 ]
 INITIAL = {
     DOOR: {"state": "off", "attributes": {}, "last_changed": "2026-10-24T12:00:00+00:00", "last_updated": "2026-10-24T12:00:00+00:00"},
@@ -106,6 +138,8 @@ INITIAL = {
     ALARM: {"state": "06:30:00", "attributes": helper("06:30:00")},
     NEXT: {"state": "2026-10-25T03:00:00+00:00", "attributes": TIMESTAMP},
     BINS: {"state": "off", "attributes": bins("2026-10-26", "Paper")},
+    # Seeded twice, at last_changed and at last_updated (an attribute-only update): two samples before the window.
+    TEMP: {"state": "20", "attributes": CELSIUS, "last_changed": "2026-10-24T21:00:00+00:00", "last_updated": "2026-10-24T21:55:00+00:00"},
 }
 
 H = 3600
@@ -152,6 +186,23 @@ CANDIDATES = {
         ),
         (StateCondition(BINS, ("Paper",), attribute="message"),),
     ),
+    # Trend and Derivative helpers set up in the sandbox (#42, #43): the evaluator computes their states the way they do.
+    "trend": Candidate(
+        (
+            TrendTrigger(TEMP, window=600, delta=1.0, max_samples=10),
+            TrendTrigger(TEMP, window=900, delta=-1.5, max_samples=20),
+            TrendTrigger(TEMP, window=300, delta=0.5, max_samples=3, min_samples=3),
+            TrendTrigger(TEMP, window=7200, delta=0.4, max_samples=200),
+        )
+    ),
+    "derivative": Candidate(
+        (
+            DerivativeTrigger(TEMP, 600, "min", above=0.2),
+            DerivativeTrigger(TEMP, 0, "h", below=-10),
+            DerivativeTrigger(TEMP, 1800, "min", below=-0.1, round_digits=1),
+            DerivativeTrigger(TEMP, 300, "min", above=0.3),
+        )
+    ),
     "sun": Candidate(
         (SunTrigger("sunrise", offset=60), SunTrigger("sunset", offset=-1800), SunTrigger("sunset", offset=1800)),
         (SunCondition(after="sunrise", after_offset=30, before="sunset", before_offset=-60), StateCondition(PERSON, ("home",))),
@@ -168,10 +219,19 @@ def sun_events(day: date) -> dict[str, datetime | None]:
     }
 
 
+def helper_ids(candidate: Candidate) -> dict[tuple[Any, ...], str]:
+    """One helper entity per distinct helper the candidate's triggers read."""
+    keys = list(dict.fromkeys(trigger.helper_key for trigger in candidate.helper_triggers))
+    return {key: f"{'binary_sensor' if key[0] == 'trend' else 'sensor'}.rate_{n}" for n, key in enumerate(keys)}
+
+
 def scenario(name: str, candidate: Candidate) -> dict[str, Any]:
-    automation = render_automation(candidate, alias=name)
+    ids = helper_ids(candidate)
+    automation = render_automation(candidate, alias=name, helper_ids=ids)
     automation["id"] = name
+    helpers = {trigger.helper_key: helper_spec(trigger, ids[trigger.helper_key]) for trigger in candidate.helper_triggers}
     return {
+        "helpers": list(helpers.values()),
         "version": 1,
         "core": CORE,
         "start": START,
@@ -217,6 +277,8 @@ def test_evaluator_matches_the_sandbox(name, sandbox_runs):
     assert triggered == sandbox_started, [datetime.fromtimestamp(t, UTC).isoformat() for t, _ in sandbox_started]
     assert fired == sandbox_fired
     assert 0 < len(fired) < len(triggered) or not candidate.conditions
+    # Every helper trigger fires somewhere, so each one is compared.
+    assert all(evaluator.trigger_fires(trigger) for trigger in candidate.helper_triggers)
 
 
 def test_entity_times_fire_where_home_assistant_arms_them():

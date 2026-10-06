@@ -1,12 +1,13 @@
 """Candidate automations: a small internal representation, and its rendering to Home Assistant config.
 
-Candidates are frozen dataclasses, so the miner can hash them, cache their fire times and compare them. Durations and offsets are seconds; times of day are seconds since local midnight; state values are tuples (one value renders as a scalar). Each trigger and condition watches at most one entity (or, for an event trigger, one event type): multi-entity "and" triggers are a non-goal.
+Candidates are frozen dataclasses, so the miner can hash them, cache their fire times and compare them. A `TrendTrigger` or `DerivativeTrigger` reads a helper the user must create (#42): it renders as a trigger on the helper's entity, and `helper_spec` says what the helper is. Durations and offsets are seconds; times of day are seconds since local midnight; state values are tuples (one value renders as a scalar). Each trigger and condition watches at most one entity (or, for an event trigger, one event type): multi-entity "and" triggers are a non-goal.
 
 `render_automation` writes the modern syntax (`triggers:` / `conditions:` / `actions:`, `trigger: state`, `condition: state`, `action:`), with a placeholder action the user replaces.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -161,6 +162,111 @@ class EventTrigger:
             raise ValueError("event_type must not be empty")
 
 
+UNIT_TIMES = {"s": 1, "min": 60, "h": 3600, "d": 86_400}
+
+
+def _object_id(entity_id: str) -> str:
+    return entity_id.split(".", 1)[1]
+
+
+@dataclass(frozen=True, slots=True)
+class TrendTrigger:
+    """The source rose (`delta` > 0) or fell (`delta` < 0) by more than `delta` within `window` seconds: a core Trend helper (`binary_sensor`, `min_gradient = delta / window` units per second, `sample_duration = window`, `max_samples`) turning on (#42).
+
+    `unit` is the source's unit, for the explanation only.
+    """
+
+    entity_id: str
+    window: float
+    delta: float
+    max_samples: int
+    min_samples: int = 2
+    id: str | None = None
+    unit: str | None = field(default=None, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.window <= 0 or not self.delta:
+            raise ValueError("a trend needs a window and a non-zero change")
+        if self.min_samples < 2 or self.max_samples < self.min_samples:
+            raise ValueError("a trend needs 2 <= min_samples <= max_samples")
+
+    @property
+    def min_gradient(self) -> float:
+        return self.delta / self.window
+
+    @property
+    def helper_key(self) -> tuple[Any, ...]:
+        """What tells helpers apart: equal keys are one helper."""
+        return ("trend", self.entity_id, self.window, self.delta, self.max_samples, self.min_samples)
+
+    @property
+    def default_helper_id(self) -> str:
+        return f"binary_sensor.{_object_id(self.entity_id)}_{'rising' if self.delta > 0 else 'falling'}"
+
+    def helper_options(self) -> dict[str, Any]:
+        """The Trend helper's options, as its config flow stores them (sandbox/helpers.py)."""
+        return {
+            "entity_id": self.entity_id,
+            "invert": False,
+            "max_samples": self.max_samples,
+            "min_gradient": float(f"{self.min_gradient:.6g}"),  # what a person types; the sandbox validates with this value
+            "min_samples": self.min_samples,
+            "sample_duration": round(self.window),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DerivativeTrigger:
+    """`numeric_state` on a core Derivative helper (`sensor`, the source's rate of change in its unit per `unit_time`, time-weighted over `window` seconds, rounded to `round_digits`): crossing above or below the threshold (#42)."""
+
+    entity_id: str
+    window: float
+    unit_time: str = "min"
+    above: float | None = None
+    below: float | None = None
+    round_digits: int = 2
+    id: str | None = None
+    unit: str | None = field(default=None, compare=False)
+
+    def __post_init__(self) -> None:
+        if (self.above is None) == (self.below is None):
+            raise ValueError("a derivative trigger needs above or below")
+        if self.unit_time not in UNIT_TIMES or self.window < 0:
+            raise ValueError("a derivative needs a unit_time and a window")
+
+    @property
+    def helper_key(self) -> tuple[Any, ...]:
+        return ("derivative", self.entity_id, self.window, self.unit_time, self.round_digits)
+
+    @property
+    def default_helper_id(self) -> str:
+        return f"sensor.{_object_id(self.entity_id)}_derivative"
+
+    def helper_options(self) -> dict[str, Any]:
+        """The Derivative helper's options, as its config flow stores them (sandbox/helpers.py)."""
+        whole = round(self.window)
+        return {
+            "round": self.round_digits,
+            "source": self.entity_id,
+            "time_window": {"hours": whole // 3600, "minutes": whole // 60 % 60, "seconds": whole % 60},
+            "unit_time": self.unit_time,
+        }
+
+
+HelperTrigger = TrendTrigger | DerivativeTrigger
+
+
+def helper_spec(trigger: HelperTrigger, entity_id: str | None = None, title: str | None = None) -> dict[str, Any]:
+    """The helper a trigger needs, as a scenario's / suggestion's `helpers` item: `{domain, entity_id, title, options}`."""
+    entity_id = entity_id or trigger.default_helper_id
+    return {
+        "domain": "trend" if isinstance(trigger, TrendTrigger) else "derivative",
+        "entity_id": entity_id,
+        "title": title or _object_id(entity_id).replace("_", " ").capitalize(),
+        "options": trigger.helper_options(),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class StateCondition:
     """`condition: state`: the state (or attribute) is one of `state`, for longer than `for_` when given."""
@@ -223,7 +329,7 @@ class SunCondition:
                 raise ValueError(f"sun events are {SUN_EVENTS}")
 
 
-Trigger = StateTrigger | NumericStateTrigger | TimeTrigger | EntityTimeTrigger | SunTrigger | CalendarTrigger | EventTrigger
+Trigger = StateTrigger | NumericStateTrigger | TimeTrigger | EntityTimeTrigger | SunTrigger | CalendarTrigger | EventTrigger | TrendTrigger | DerivativeTrigger
 Condition = StateCondition | NumericStateCondition | TimeCondition | SunCondition
 
 
@@ -243,8 +349,13 @@ class Candidate:
         return {
             part.entity_id
             for part in (*self.triggers, *self.conditions)
-            if isinstance(part, (StateTrigger, NumericStateTrigger, EntityTimeTrigger, CalendarTrigger, StateCondition, NumericStateCondition))
+            if isinstance(part, (StateTrigger, NumericStateTrigger, EntityTimeTrigger, CalendarTrigger, TrendTrigger, DerivativeTrigger, StateCondition, NumericStateCondition))
         }
+
+    @property
+    def helper_triggers(self) -> list[HelperTrigger]:
+        """Its triggers on a Trend or Derivative helper (what it needs created)."""
+        return [trigger for trigger in self.triggers if isinstance(trigger, (TrendTrigger, DerivativeTrigger))]
 
     @property
     def calendars(self) -> set[str]:
@@ -285,8 +396,8 @@ def _values(values: Values) -> Any:
     return values[0] if len(values) == 1 else list(values)
 
 
-def render_trigger(trigger: Trigger) -> dict[str, Any]:
-    """One trigger as automation config."""
+def render_trigger(trigger: Trigger, helper_ids: Mapping[tuple[Any, ...], str] | None = None) -> dict[str, Any]:
+    """One trigger as automation config. A trigger on a helper reads the helper's entity: `helper_ids[trigger.helper_key]`, else its default id."""
     match trigger:
         case StateTrigger():
             out: dict[str, Any] = {"trigger": "state"}
@@ -357,6 +468,17 @@ def render_trigger(trigger: Trigger) -> dict[str, Any]:
             if trigger.event_data:
                 out["event_data"] = dict(trigger.event_data)
             return out
+        case TrendTrigger() | DerivativeTrigger():
+            numeric = isinstance(trigger, DerivativeTrigger)
+            out = {"trigger": "numeric_state" if numeric else "state"}
+            if trigger.id is not None:
+                out["id"] = trigger.id
+            out["entity_id"] = (helper_ids or {}).get(trigger.helper_key) or trigger.default_helper_id
+            if isinstance(trigger, DerivativeTrigger):
+                out["above" if trigger.above is not None else "below"] = trigger.above if trigger.above is not None else trigger.below
+            else:
+                out["to"] = "on"
+            return out
     raise TypeError(f"not a trigger: {trigger!r}")
 
 
@@ -419,12 +541,13 @@ def render_automation(
     alias: str,
     description: str | None = None,
     actions: list[dict[str, Any]] | None = None,
+    helper_ids: Mapping[tuple[Any, ...], str] | None = None,
 ) -> dict[str, Any]:
-    """The candidate as a full automation config (mode `single`)."""
+    """The candidate as a full automation config (mode `single`); `helper_ids` names the entities of the helpers it needs (`render_trigger`)."""
     config: dict[str, Any] = {"alias": alias}
     if description:
         config["description"] = description
-    config["triggers"] = [render_trigger(trigger) for trigger in candidate.triggers]
+    config["triggers"] = [render_trigger(trigger, helper_ids) for trigger in candidate.triggers]
     config["conditions"] = [render_condition(condition) for condition in candidate.conditions]
     config["actions"] = actions if actions is not None else placeholder_actions(alias)
     config["mode"] = "single"

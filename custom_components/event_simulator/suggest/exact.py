@@ -23,6 +23,8 @@ MATCH_WINDOW = 60.0
 DIVERGED = 0.5
 # Most runs one validation replays, counted as `estimated_runs`. Home Assistant takes about 50 µs a run in the sandbox: eight any-change suggestions on two sensors reporting every minute and a half were 300 000 runs over a month, 25 s, holding a sandbox slot that other replays waited on (issue #36). This keeps the runs to about two seconds on top of boot and playback (room for one suggestion firing every minute and a half for a month); suggestions past it keep the miner's estimate (`plan_validation`).
 MAX_VALIDATION_RUNS = 40_000
+# Most helpers one validation child sets up (sandbox/helpers.py MAX_HELPERS).
+MAX_VALIDATION_HELPERS = 20
 
 
 def estimated_runs(evaluator: Evaluator, candidate: Candidate) -> int:
@@ -31,7 +33,7 @@ def estimated_runs(evaluator: Evaluator, candidate: Candidate) -> int:
 
 
 def plan_validation(result: SuggestResult, budget: int | None = None) -> tuple[list[int], int]:
-    """Which suggestions to replay: best first, each one whose `estimated_runs` still fit in `budget` (default `MAX_VALIDATION_RUNS`) with those before it (one that does not fit is passed over and the next tried). Returns their indices and the runs of those passed over."""
+    """Which suggestions to replay: best first, each one whose `estimated_runs` still fit in `budget` (default `MAX_VALIDATION_RUNS`) with those before it, and whose helpers still fit `MAX_VALIDATION_HELPERS` (one that does not fit is passed over and the next tried). Returns their indices and the runs of those passed over."""
     if budget is None:
         budget = MAX_VALIDATION_RUNS
     context = result.context
@@ -40,11 +42,14 @@ def plan_validation(result: SuggestResult, budget: int | None = None) -> tuple[l
     evaluator = context.search.ev
     chosen: list[int] = []
     spent = skipped = 0
+    helpers: set[str] = set()
     for n, suggestion in enumerate(result.suggestions):
         runs = estimated_runs(evaluator, suggestion.candidate)
-        if spent + runs <= budget:
+        needed = helpers | {helper["entity_id"] for helper in suggestion.helpers}
+        if spent + runs <= budget and len(needed) <= MAX_VALIDATION_HELPERS:
             chosen.append(n)
             spent += runs
+            helpers = needed
         else:
             skipped += runs
     return chosen, skipped

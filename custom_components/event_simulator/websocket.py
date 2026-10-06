@@ -18,7 +18,7 @@ import yaml
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.util import dt as dt_util
 from homeassistant.util.yaml import parse_yaml
 
@@ -463,6 +463,8 @@ async def async_suggest(
             "labels": len(msg["labels"]),
         }
     )
+    # The entities that exist: a helper a suggestion needs (#42) never takes one's id.
+    taken = frozenset({*hass.states.async_entity_ids(), *er.async_get(hass).entities})
     result = await hass.async_add_executor_job(
         partial(
             _mine,
@@ -474,6 +476,7 @@ async def async_suggest(
             hass.config.time_zone,
             async_sun_events(hass),
             stop.is_set,
+            taken,
         )
     )
     if result.suggestions:
@@ -508,6 +511,7 @@ def _mine(
     time_zone: str,
     sun_events: Callable[[date], dict[str, datetime | None]],
     should_stop: Callable[[], bool],
+    taken: frozenset[str] = frozenset(),
 ) -> SuggestResult:
     """Executor: the miner over the loaded timeline (labels outside the window are left out)."""
     timeline = Timeline.from_scenario(
@@ -535,6 +539,7 @@ def _mine(
         sun_events=sun_events,
         options=SuggestOptions.from_dict(options),
         should_stop=should_stop,
+        taken=taken,
     )
 
 
@@ -552,7 +557,7 @@ async def _async_validate(
 ) -> SuggestResult:
     """Replay the top suggestions in one sandbox child and re-score them on what Home Assistant did (suggest/exact.py).
 
-    Only the suggestions whose runs fit `exact.MAX_VALIDATION_RUNS` are replayed (`plan_validation`); the rest keep the miner's estimate, with a `validation_capped` warning. They replay without their actions: a run's fire is decided by its trigger and conditions, and the placeholder action only costs time. Only the entities the replayed suggestions reference are sent, with their initial states, only the bus events of the types their event triggers listen to, and only the events of the calendars their calendar triggers read; core config, registry snapshot and services come from this instance as for `simulate`. `traces: none` keeps a month of runs small. The replay is a background one (`runner.MAX_BACKGROUND`), so it never takes the last sandbox slot from the panel's replays; while it waits for one, `progress` gets `{stage: "queued"}`.
+    Only the suggestions whose runs fit `exact.MAX_VALIDATION_RUNS` (and whose helpers fit the sandbox's cap) are replayed (`plan_validation`); the rest keep the miner's estimate, with a `validation_capped` warning. The Trend and Derivative helpers the replayed suggestions need (#42) are set up in the child (`helpers`), so they compute from their source's history as they would live. They replay without their actions: a run's fire is decided by its trigger and conditions, and the placeholder action only costs time. Only the entities the replayed suggestions reference are sent, with their initial states, only the bus events of the types their event triggers listen to, and only the events of the calendars their calendar triggers read; core config, registry snapshot and services come from this instance as for `simulate`. `traces: none` keeps a month of runs small. The replay is a background one (`runner.MAX_BACKGROUND`), so it never takes the last sandbox slot from the panel's replays; while it waits for one, `progress` gets `{stage: "queued"}`.
     """
     chosen, skipped_runs = await hass.async_add_executor_job(plan_validation, result)
     unchecked = sorted(set(range(len(result.suggestions))) - set(chosen))
@@ -593,6 +598,8 @@ async def _async_validate(
             for entity_id, events in (timeline.get("calendars") or {}).items()
             if entity_id in calendars
         },
+        # Each helper once: cards needing the same helper share its entity (search.helper_names).
+        "helpers": list({helper["entity_id"]: helper for s in replayed for helper in s.helpers}.values()),
         "core": history.async_core_config(hass),
         "registry": history.async_registry_snapshot(hass, {"automations": configs}, entity_ids),
         "services": {

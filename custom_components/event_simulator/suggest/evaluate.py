@@ -9,6 +9,7 @@ The miner scores thousands of candidates, so this re-implements the trigger and 
 - sun: fires at every `sun_events(date)[event] + offset`.
 - calendar: fires at every start (or end) of the calendar's events plus the offset (`Timeline.calendar`: the events given, else those its recorded states name), once per event, so two events starting together fire twice; an event starting after the window still fires inside it with a negative offset. An all-day event starts at local midnight, and the offset adds local wall time (as for a time at an entity).
 - event: fires at every bus event of its type whose data holds each of its `(key, value)` pairs, compared as they are (the event trigger's items comparison).
+- trend / derivative (#42): the helper's states are computed from its source as the helper does (`rates.py`, which lists where it differs), and the trigger on them is a state trigger to `on` (a trend: its gradient crossing `min_gradient`) or a numeric_state trigger (a derivative), as above.
 - conditions read the state at the fire time; errors (unknown entity, non-numeric value) fail the condition, as a condition error stops the run in Home Assistant.
 
 Where this knowingly differs from Home Assistant (the sandbox is the exact answer):
@@ -37,6 +38,7 @@ from .model import (
     CalendarTrigger,
     Candidate,
     Condition,
+    DerivativeTrigger,
     EntityTimeTrigger,
     EventTrigger,
     NumericStateCondition,
@@ -48,7 +50,9 @@ from .model import (
     TimeCondition,
     TimeTrigger,
     Trigger,
+    TrendTrigger,
 )
+from .rates import derivative_step, trend_step
 from .timeline import NON_NUMERIC, UNAVAILABLE_STATES, StepFunction, Timeline
 
 SunEvents = Callable[[date], Mapping[str, datetime | None]]
@@ -106,6 +110,7 @@ class Evaluator:
         self._sun_events = sun_events
         self._sun_cache: dict[date, tuple[float | None, float | None]] = {}
         self._trigger_cache: dict[Trigger, list[float]] = {}
+        self._helper_cache: dict[tuple[Any, ...], StepFunction | None] = {}
 
     # Time helpers
 
@@ -169,6 +174,13 @@ class Evaluator:
                 fires = [at for at, _ in self.calendar_fires(trigger)]
             case EventTrigger():
                 fires = self._event_fires(trigger)
+            case TrendTrigger():
+                step = self.helper_step(trigger)
+                bound = {"above": trigger.delta} if trigger.delta > 0 else {"below": trigger.delta}
+                fires = [] if step is None else self._numeric_fires(NumericStateTrigger(step.entity_id, **bound), step)
+            case DerivativeTrigger():
+                step = self.helper_step(trigger)
+                fires = [] if step is None else self._numeric_fires(NumericStateTrigger(step.entity_id, above=trigger.above, below=trigger.below), step)
             case _:
                 raise TypeError(f"not a trigger: {trigger!r}")
         self._trigger_cache[trigger] = fires
@@ -212,8 +224,24 @@ class Evaluator:
         fires.sort()
         return fires
 
-    def _numeric_fires(self, trigger: NumericStateTrigger) -> list[float]:
-        step = self.timeline.get(trigger.entity_id)
+    def helper_step(self, trigger: TrendTrigger | DerivativeTrigger) -> StepFunction | None:
+        """The numeric view of the helper a trigger reads (`rates.py`; a trend's in its change over the window), computed once per helper; None when its source is not on the timeline."""
+        # A trend's gradient does not depend on its threshold: one per window and sample count.
+        key = ("trend", trigger.entity_id, trigger.window, trigger.max_samples, trigger.min_samples) if isinstance(trigger, TrendTrigger) else trigger.helper_key
+        if key not in self._helper_cache:
+            source = self.timeline.get(trigger.entity_id)
+            if source is None:
+                found = None
+            elif isinstance(trigger, TrendTrigger):
+                found = trend_step(source, self.start, sample_duration=trigger.window, max_samples=trigger.max_samples, min_samples=trigger.min_samples, scale=trigger.window)
+            else:
+                found = derivative_step(source, self.start, time_window=trigger.window, unit_time=trigger.unit_time, round_digits=trigger.round_digits)
+            self._helper_cache[key] = found
+        return self._helper_cache[key]
+
+    def _numeric_fires(self, trigger: NumericStateTrigger, step: StepFunction | None = None) -> list[float]:
+        if step is None:
+            step = self.timeline.get(trigger.entity_id)
         if step is None:
             return []
         above = float("-inf") if trigger.above is None else trigger.above

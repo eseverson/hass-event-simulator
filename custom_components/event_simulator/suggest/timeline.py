@@ -89,7 +89,7 @@ class Transition:
 class StepFunction:
     """One entity's history: entry i holds from `times[i]` until `times[i + 1]`."""
 
-    __slots__ = ("_numeric", "attributes", "changed", "entity_id", "seeded", "states", "times")
+    __slots__ = ("_numeric", "attributes", "changed", "entity_id", "reports", "seed_updated", "seeded", "states", "times")
 
     def __init__(self, entity_id: str) -> None:
         self.entity_id = entity_id
@@ -98,6 +98,8 @@ class StepFunction:
         self.attributes: list[Mapping[str, Any]] = []
         self.changed: list[float] = []  # last_changed of each entry
         self.seeded = False  # entry 0 is the initial state, not a write
+        self.seed_updated: float | None = None  # the initial state's recorded last_updated (a rate helper's sample time, rates.py)
+        self.reports: list[float] = []  # writes identical to the state in effect (no state_changed, but a state_reported a derivative reads)
         self._numeric: dict[str | None, list[Any]] = {}
 
     def __len__(self) -> int:
@@ -106,6 +108,7 @@ class StepFunction:
     def _append(self, at: float, state: str, attributes: Mapping[str, Any], changed: float | None) -> None:
         if self.states:
             if state == self.states[-1] and attributes == self.attributes[-1]:
+                self.reports.append(at)
                 return
             if changed is None:
                 changed = self.changed[-1] if state == self.states[-1] else at
@@ -256,6 +259,8 @@ class Timeline:
                 min(to_ts(changed), start_ts) if changed else start_ts,
             )
             step.seeded = True
+            if updated := initial.get("last_updated"):
+                step.seed_updated = min(to_ts(updated), start_ts)
         timed = sorted(
             ((to_ts(event["at"]), n, event) for n, event in enumerate(events)),
             key=lambda item: (item[0], item[1]),

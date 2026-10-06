@@ -7,6 +7,7 @@ How it searches (see docs/superpowers/specs/2026-10-05-suggestions-design.md):
 1. Sides. A label anchored at `both` asks for an on/off pair, so the start and end anchors are searched independently (trigger ids `start` / `end`) and combined. Otherwise one side covers every anchor and triggers carry no id. Labels that are only `while` periods also anchor at each period's start: the automation should act when the period begins, with conditions that hold throughout it.
 2. Trigger candidates around the anchors, each evaluated over the whole window:
    - `state`: every state change near an anchor (to, and from + to), attribute changes when the state is static, and `for:` when a state consistently began a similar lag before the anchors (quantized to friendly durations). Anchors that follow changes in two or three directions also get one trigger listing them all (a toggle). A free-form entity (`FREE_FORM` or more values in the window, most seen once: a timestamp, a counter, free text) only offers values it took more than once, and a trigger on any change of its state (`to: null`).
+   - rate of change (#42): for a numeric entity, a Trend helper turning on (its least-squares gradient over a sample window of 5 min to 1 h passing `min_gradient`, rising or falling) or a Derivative helper (time-weighted over the window) crossing a threshold, the helper's states computed as it does (`rates.py`) and its threshold searched as a level's is (on a rounded copy of its series). Offered only for a direction where the entity's levels fall short (they miss anchors, or fire in must-not periods or unlabeled time within the labeled stretch) and the rate does better, and more often than chance; a derivative only on the trend's best windows. Each helper costs as much simplicity as a condition, so a level that does as well stays ahead. The card's `helpers` say what to create (`model.helper_spec`), named after the source and never an existing entity (`helper_names`); a variant reads its card's helper entity with its own options.
    - `numeric_state`: `above` / `below`, the threshold searched over the full window's values. The behavior of a threshold only changes at observed values, so each gap between consecutive distinct values is one candidate, represented by its roundest number; gaps are scored by how many anchors a crossing hits and how often the value crosses elsewhere. `for:` as for state. And a state trigger with no from/to (every report, as blueprint controllers re-evaluate), with `to: null` too when some reports change attributes only, when the anchors line up with its writes (within `ALIGN` seconds, more often than chance: any chatty sensor has some write within the tolerance of every anchor). A numeric attribute that changes while the state stays put gets the same trigger on the attribute. Conditions at fire time (`numeric_state` above/below) then narrow it, the template-free form of "every report while it is warm".
    - `event`: for each type of recorded bus event (`zha_event`, `tag_scanned`, ...) with events near the anchors, the type alone and the `event_data` that picks out the anchored events: greedily, the `(key, value)` of the anchored events that removes the most other events of the type while keeping every anchor the trigger hits, from no data and from each value the anchored events share (a command, a button). Only scalar values are used, and no string Home Assistant's template rendering would read as another type ("1" becomes 1). A type is offered only when the anchors fall near its events more often than chance would.
    - `time` / `sun`: when the anchors cluster by local clock time, or by sunrise/sunset offset; whichever clusters more anchors with less spread wins. The time is chosen at or just before the cluster and rounded.
@@ -40,6 +41,7 @@ from .model import (
     CalendarTrigger,
     Candidate,
     Condition,
+    DerivativeTrigger,
     EntityTimeTrigger,
     EventTrigger,
     NumericStateCondition,
@@ -51,9 +53,12 @@ from .model import (
     TimeCondition,
     TimeTrigger,
     Trigger,
+    TrendTrigger,
+    helper_spec,
     render_automation,
 )
 from .kinds import candidate_kinds, structure
+from .model import UNIT_TIMES
 from .score import Stats, clock_parts, clock_roundness, prefer_entities, rank_key, roundness, score_candidate, simplicity
 from .timeline import NON_NUMERIC, UNAVAILABLE_STATES, StepFunction, Timeline, to_iso
 
@@ -76,6 +81,11 @@ RELATION_RECALL = 0.8  # share of the anchors such a relation must hit
 MAX_CARDS = 25  # most suggestions one result carries: they are validated in one sandbox child, which takes at most this many automations (sandbox/engine.py MAX_AUTOMATIONS)
 MAX_VARIANTS = 4  # near-duplicates folded into one card
 KIND_COVERAGE = 3  # cards of each trigger kind found that the result carries, past the top-K, so a filter by kind is never empty
+RATE_WINDOWS = (300, 600, 900, 1800, 3600)  # sample windows of the Trend and Derivative helpers the miner proposes (#42)
+RATE_THRESHOLDS = 2  # thresholds kept per helper, window and direction
+RATE_DERIVATIVE_WINDOWS = 2  # windows a Derivative helper is tried on: the Trend helper's best
+RATE_BEAM = 3  # rate triggers of one helper kind, source and direction that go on to the condition search
+MAX_TREND_SAMPLES = 1000
 EVENT_KEYS = ("device_id", "entity_id", "tag_id", "device_ieee", "unique_id", "id", "command", "type", "subtype", "action", "event", "button")
 
 
@@ -117,9 +127,10 @@ class Variant:
     stats: Stats
     config: dict[str, Any]
     explanation: str
+    helpers: tuple[dict[str, Any], ...] = ()  # its own helpers' options, under the card's helper entities (#42)
 
     def as_dict(self) -> dict[str, Any]:
-        return {"config": self.config, "stats": self.stats.as_dict(), "explanation": self.explanation, "exact": False}
+        return {"config": self.config, "stats": self.stats.as_dict(), "explanation": self.explanation, "exact": False, "helpers": [dict(h) for h in self.helpers]}
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,8 +329,22 @@ def _sun_point(event: str, offset: float) -> str:
     return f"{event} {'−' if offset < 0 else '+'} {_duration_text(offset)}"
 
 
+def _amount(value: float, unit: str | None) -> str:
+    return f"{round(value, 6):g} {unit}" if unit else f"{round(value, 6):g}"
+
+
 def describe_trigger(trigger: Trigger) -> str:
     match trigger:
+        case TrendTrigger():
+            verb = "rises" if trigger.delta > 0 else "drops"
+            return f"{trigger.entity_id} {verb} by more than {_amount(abs(trigger.delta), trigger.unit)} within {_duration_text(trigger.window)} (Trend helper)"
+        case DerivativeTrigger():
+            threshold = trigger.above if trigger.above is not None else trigger.below
+            per = UNIT_TIMES[trigger.unit_time]
+            verb = "rises" if threshold > 0 else "drops"
+            rate = f"{threshold:g} {trigger.unit or ''}/{trigger.unit_time}".replace(" /", "/")
+            change = _amount(abs(threshold) * trigger.window / per, trigger.unit)
+            return f"{trigger.entity_id} {verb} by more than {change} within {_duration_text(trigger.window)} (Derivative helper {'above' if trigger.above is not None else 'below'} {rate})"
         case StateTrigger():
             target = trigger.entity_id if trigger.attribute is None else f"{trigger.entity_id}'s {trigger.attribute}"
             if trigger.entity_id.startswith("calendar.") and trigger.attribute is None and trigger.from_ is None and not trigger.for_ and trigger.to in (("on",), ("off",)):
@@ -497,6 +522,8 @@ def complexity(candidate: Candidate) -> int:
                 count += max(0, len(part.event_data) - 1) + sum(key not in EVENT_KEYS for key, _ in part.event_data)
             case NumericStateTrigger() | NumericStateCondition():
                 count += part.above is not None and part.below is not None
+            case DerivativeTrigger():
+                count += 1  # a threshold in a unit per time over a window: a Trend helper saying the same reads simpler
             case StateCondition():
                 count += len(part.state) - 1
             case TimeCondition():
@@ -608,6 +635,25 @@ def _ranked_thresholds(crossings: _Crossings, scores: Mapping[int, tuple[int, fl
         ranked.append((-covered, fires - covered, roundness(theta), distance / covered, theta, fires))
     ranked.sort()
     return [(theta, -neg, fires) for neg, _, _, _, theta, fires in ranked[:limit]]
+
+
+RATE_LEVELS = 200  # about how many distinct values a helper's series keeps for the threshold search
+
+
+def _quantized(step: StepFunction) -> StepFunction:
+    """A copy of a helper's numeric series on a round grid of about `RATE_LEVELS` values over its range (a gradient takes a new value at every report, and the threshold search costs as much as the values it has to step over). The thresholds found are round anyway, and each trigger is then scored on the exact series."""
+    values = step.numeric_values()
+    numbers = sorted(v for v in values if isinstance(v, float))
+    if len(set(numbers)) <= RATE_LEVELS:
+        return step
+    lo, hi = numbers[len(numbers) // 100], numbers[-1 - len(numbers) // 100]
+    wanted = max(hi - lo, 1e-9) / RATE_LEVELS
+    grid = 10 ** math.floor(math.log10(wanted))
+    grid = next(g for g in (grid, 2 * grid, 5 * grid, 10 * grid) if g >= wanted)
+    copy = StepFunction(step.entity_id)
+    copy.times, copy.states, copy.attributes, copy.changed, copy.seeded = step.times, step.states, step.attributes, step.changed, step.seeded
+    copy._numeric[None] = [round(round(v / grid) * grid, 10) if isinstance(v, float) else v for v in values]  # noqa: SLF001
+    return copy
 
 
 def numeric_thresholds(
@@ -857,6 +903,9 @@ class _Search:
         self._while_cache: dict[Condition, bool] = {}
         self._entries: dict[tuple[str, str | None], Counter[Any]] = {}
         self._held: dict[str, list[tuple[str, Any] | None]] = {}
+        self._samples: dict[tuple[str, float], int] = {}
+        self._rate_cache: dict[tuple[Any, ...], _Crossings | None] = {}
+        self._quantized: dict[int, StepFunction] = {}  # by the id of a helper step the evaluator keeps
         self._unlabeled = labels.unlabeled_intervals(timeline.start, timeline.end)
         lo, hi = labels.span or (0.0, 0.0)
         self._unlabeled_near = [(max(a, lo), min(b, hi)) for a, b in self._unlabeled if a < hi and b > lo]
@@ -1219,6 +1268,7 @@ class _Search:
             changes = [step.times[i] for i in step.write_range() if i and step.states[i] != step.states[i - 1]]
             if len(changes) < len(writes) and self.lines_up(changes, anchors, min_hits):
                 found.add(StateTrigger(entity_id, changes_only=True, id=tid))
+        levels: dict[str, tuple[int, int]] = {}
         for direction in ("above", "below"):
             crossings = self.crossings(entity_id, direction)
             if not crossings.times or len(crossings.values) < 2:
@@ -1226,7 +1276,10 @@ class _Search:
             direct = _gap_scores(crossings, anchors, -before, after)
             for theta, covered, _ in _ranked_thresholds(crossings, direct, 3):
                 if covered >= min_hits:
-                    found.add(NumericStateTrigger(entity_id, **{direction: theta}, id=tid))
+                    trigger = NumericStateTrigger(entity_id, **{direction: theta}, id=tid)
+                    found.add(trigger)
+                    hits, must_not, near, _, _ = self.screen(trigger, anchors)
+                    levels[direction] = min(levels.get(direction, (0, _INF)), (-hits, must_not + near))
             lagged = _gap_scores(crossings, anchors, -max_lag - before, -before)
             ranked = sorted(
                 (-covered, roundness(theta := crossings.representative(k)), crossings.count(theta), theta)
@@ -1239,7 +1292,98 @@ class _Search:
                     continue
                 for duration in infer_for(lags, self.tolerance):
                     found.add(NumericStateTrigger(entity_id, **{direction: theta}, for_=duration, id=tid))
+        found |= self._rate_triggers(entity_id, anchors, tid, min_hits, levels)
         return found
+
+    # Rate of change (#42)
+
+    def max_samples(self, entity_id: str, window: float) -> int:
+        """A Trend helper's `max_samples` for a sample window: room for every report the entity made in any span that long (the most seen, plus one), rounded up to a multiple of 5 past 10."""
+        if (found := self._samples.get((entity_id, window))) is None:
+            step = self.timeline[entity_id]
+            times = [step.times[i] for i in step.write_range()]
+            peak, lo = 1, 0
+            for hi, t in enumerate(times):
+                while t - times[lo] > window:
+                    lo += 1
+                peak = max(peak, hi - lo + 1)
+            found = peak + 1
+            if found > 10:
+                found = -(-found // 5) * 5
+            found = self._samples[(entity_id, window)] = min(max(found, 2), MAX_TREND_SAMPLES)
+        return found
+
+    def rate_crossings(self, trigger: TrendTrigger | DerivativeTrigger, direction: str) -> _Crossings | None:
+        """The crossings of the helper a trigger reads (its numeric view, `Evaluator.helper_step`), computed once per helper and direction."""
+        key = (trigger.entity_id, type(trigger).__name__, trigger.window, getattr(trigger, "unit_time", None), direction)
+        if key not in self._rate_cache:
+            step = self.ev.helper_step(trigger)
+            if step is not None and (quantized := self._quantized.get(id(step))) is None:
+                quantized = self._quantized[id(step)] = _quantized(step)
+            self._rate_cache[key] = None if step is None else _crossings(quantized, direction)
+        return self._rate_cache[key]
+
+    def _rate_triggers(self, entity_id: str, anchors: Sequence[Anchor], tid: str | None, min_hits: int, levels: Mapping[str, tuple[int, int]]) -> set[Trigger]:
+        """Triggers on a Trend or Derivative helper of a numeric entity: for each sample window and direction, the change over the window (a trend's gradient times the window) or the derivative crossing the thresholds the anchors cross. Offered only where they explain the anchors better than any level of the entity does (more anchors hit, or as many with fewer must-not and unlabeled fires within the labeled stretch), and more often than chance. A derivative says nearly what a trend says, so it is tried only on the trend's best `RATE_DERIVATIVE_WINDOWS` windows."""
+        found: set[Trigger] = set()
+        # A level hitting every anchor without a bad fire leaves a rate nothing to add in that direction.
+        directions = [d for d in ("above", "below") if levels.get(d, (0, _INF)) > (-len(anchors), 0)]
+        step = self.timeline[entity_id]
+        if not directions or not len(step):
+            return found
+        unit = step.attributes[-1].get("unit_of_measurement")
+        unit = unit if isinstance(unit, str) else None
+        before, after = self.tolerance.before, self.tolerance.after
+        near = sum(bisect_right(step.times, a.at + after) > bisect_left(step.times, a.at - before - max(RATE_WINDOWS)) for a in anchors)
+        if near < min_hits:
+            return found
+        windows: list[tuple[tuple[Any, ...], float]] = []
+        for window in RATE_WINDOWS:
+            probe = TrendTrigger(entity_id, window, 1.0, self.max_samples(entity_id, window), unit=unit)
+            best = (0, _INF)
+            for direction in directions:
+                kept, key = self._rate_thresholds(probe, direction, anchors, tid, min_hits, levels.get(direction, (0, _INF)))
+                found |= kept
+                best = min(best, key)
+            windows.append((best, window))
+        for _, window in sorted(windows)[:RATE_DERIVATIVE_WINDOWS]:
+            trend = self.ev.helper_step(TrendTrigger(entity_id, window, 1.0, self.max_samples(entity_id, window)))
+            # In the unit per minute, or per hour when the changes around the anchors are too slow to show in two decimals per minute.
+            changes = [abs(v) for a in anchors if trend is not None and isinstance(v := trend.numeric_at(a.at + after), float)]
+            unit_time = "min" if changes and max(changes) / (window / 60) >= 0.1 else "h"
+            probe = DerivativeTrigger(entity_id, window, unit_time, above=1.0, unit=unit)
+            for direction in directions:
+                found |= self._rate_thresholds(probe, direction, anchors, tid, min_hits, levels.get(direction, (0, _INF)))[0]
+        return found
+
+    def _rate_thresholds(
+        self, probe: TrendTrigger | DerivativeTrigger, direction: str, anchors: Sequence[Anchor], tid: str | None, min_hits: int, level: tuple[int, int]
+    ) -> tuple[set[Trigger], tuple[int, int]]:
+        """The best `RATE_THRESHOLDS` thresholds of one helper (`probe`'s) in one direction that beat `level` and chance, and the best `(-anchors hit, bad fires)` any threshold had."""
+        found: set[Trigger] = set()
+        best = (0, _INF)
+        crossings = self.rate_crossings(probe, direction)
+        if crossings is None or not crossings.times or len(crossings.values) < 2:
+            return found, best
+        before, after = self.tolerance.before, self.tolerance.after
+        span = max(self.timeline.end - self.timeline.start, 1.0)
+        scores = _gap_scores(crossings, anchors, -before, after)
+        for theta, covered, _ in _ranked_thresholds(crossings, scores, 3 * RATE_THRESHOLDS):
+            if len(found) >= RATE_THRESHOLDS or covered < min_hits or (theta <= 0 if direction == "above" else theta >= 0):
+                continue
+            if isinstance(probe, TrendTrigger):
+                trigger: Trigger = replace(probe, delta=theta, id=tid)
+            else:
+                trigger = replace(probe, above=theta if direction == "above" else None, below=theta if direction == "below" else None, id=tid)
+            hits, must_not, near, _, fires = self.screen(trigger, anchors)
+            key = (-hits, must_not + near)
+            best = min(best, key)
+            if key >= level or hits < min_hits:
+                continue
+            if _binomial_tail(len(anchors), hits, min(1.0, len(fires) * (before + after) / span)) > ALIGN_ALPHA:
+                continue
+            found.add(trigger)
+        return found, best
 
     def _numeric_lag(self, step: StepFunction, crossings: _Crossings, theta: float, at: float) -> float | None:
         """How long before `at` the value last entered the range (it must still be in it at `at`), within `max_lag`."""
@@ -1265,6 +1409,18 @@ class _Search:
             return None
         lag = at - step.times[began]
         return lag if lag > self.tolerance.before else None
+
+    def helpers(self, candidate: Candidate, ids: Mapping[tuple[Any, ...], str]) -> tuple[dict[str, Any], ...]:
+        """The helpers a candidate needs (`model.helper_spec`), named by `ids`, titled after the source's friendly name."""
+        found: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for trigger in candidate.helper_triggers:
+            step = self.timeline.get(trigger.entity_id)
+            name = step.attributes[-1].get("friendly_name") if step is not None and len(step) else None
+            if not isinstance(name, str) or not name:
+                name = trigger.entity_id.split(".", 1)[1].replace("_", " ").capitalize()
+            role = ("rising" if trigger.delta > 0 else "falling") if isinstance(trigger, TrendTrigger) else "derivative"
+            found.setdefault(trigger.helper_key, helper_spec(trigger, ids.get(trigger.helper_key), f"{name} {role}"))
+        return tuple(found.values())
 
     # Screening
 
@@ -1295,9 +1451,16 @@ class _Search:
         screened.sort(key=lambda item: item[0])
         kept: list[Trigger] = []
         seen: set[tuple[float, ...]] = set()
+        families: Counter[tuple[Any, ...]] = Counter()
         for key, trigger, fires in screened:
             if -key[0] < floor or fires in seen:
                 continue
+            if isinstance(trigger, (TrendTrigger, DerivativeTrigger)):
+                # Windows and thresholds of one rate fire nearly alike and fold into one card: a few of them, not the whole beam.
+                family = structure(Candidate((trigger,)))
+                if families[family] >= RATE_BEAM:
+                    continue
+                families[family] += 1
             seen.add(fires)
             kept.append(trigger)
             if len(kept) >= beam:
@@ -1344,7 +1507,7 @@ class _Search:
     def _evidence(self, trigger: Trigger, part: _Part, new: Iterable[int], missed: int) -> bool:
         """Whether a trigger hitting the `new` anchors (of `missed` ones) is evidence, not chance. What counts is the moments it fires at (one fire near a burst of labels is one moment): one fitted to a single moment (a clock time, a threshold, a `for:`) never is evidence, and anything else must fire near more of them than its fires would at random (binomial tail at `union_alpha`). An any-change trigger on a chatty sensor fires near every anchor, so for it the anchors landing on its reports (within `ALIGN`) count instead."""
         moments = len({part.nearest[n] for n in new})
-        fitted = isinstance(trigger, (TimeTrigger, EntityTimeTrigger, SunTrigger, CalendarTrigger, NumericStateTrigger)) or bool(getattr(trigger, "for_", 0))
+        fitted = isinstance(trigger, (TimeTrigger, EntityTimeTrigger, SunTrigger, CalendarTrigger, NumericStateTrigger, TrendTrigger, DerivativeTrigger)) or bool(getattr(trigger, "for_", 0))
         if fitted and moments < 2:
             return False
         alpha = self.options.union_alpha
@@ -1782,6 +1945,35 @@ def _with_coverage(cards: Sequence[list[_Scored]], top_k: int) -> list[list[_Sco
     return kept[:MAX_CARDS]
 
 
+def helper_names(cards: Sequence[Candidate], taken: Iterable[str]) -> dict[tuple[Any, ...], str]:
+    """An entity id for each helper the cards need (`model.HelperTrigger.helper_key`), in rank order: the helper's default id (`binary_sensor.<source>_rising`, ...), with `_2`, `_3`, ... when that is taken by an entity or by another helper."""
+    used = set(taken)
+    names: dict[tuple[Any, ...], str] = {}
+    for candidate in cards:
+        for trigger in candidate.helper_triggers:
+            if trigger.helper_key in names:
+                continue
+            base = name = trigger.default_helper_id
+            n = 2
+            while name in used:
+                name = f"{base}_{n}"
+                n += 1
+            used.add(name)
+            names[trigger.helper_key] = name
+    return names
+
+
+def variant_names(card: Candidate, variant: Candidate, names: Mapping[tuple[Any, ...], str]) -> dict[tuple[Any, ...], str]:
+    """A variant's helpers named as its card's: the same helper with other options (another window or sample count), so picking a variant changes the helper's options, not the automation."""
+    found: dict[tuple[Any, ...], str] = {}
+    for trigger in variant.helper_triggers:
+        family = (type(trigger), trigger.entity_id, trigger.id)
+        match = next((t for t in card.helper_triggers if (type(t), t.entity_id, t.id) == family), None)
+        if match is not None and match.helper_key in names:
+            found[trigger.helper_key] = names[match.helper_key]
+    return found
+
+
 @dataclass(frozen=True, slots=True)
 class SearchContext:
     search: _Search
@@ -1797,10 +1989,11 @@ def suggest(
     sun_events: SunEvents | None = None,
     options: SuggestOptions | None = None,
     should_stop: Callable[[], bool] | None = None,
+    taken: Iterable[str] = (),
 ) -> SuggestResult:
     """Search candidate automations that fire at the labeled anchors and nowhere they should not; see the module docstring.
 
-    `should_stop` is polled between trigger searches; when it returns True the search raises `SuggestCancelled` (it runs in an executor thread, which cannot be cancelled from outside).
+    `should_stop` is polled between trigger searches; when it returns True the search raises `SuggestCancelled` (it runs in an executor thread, which cannot be cancelled from outside). `taken` are entity ids that exist already (besides the timeline's): a helper a suggestion needs never gets one (`helper_names`).
     """
     options = options or SuggestOptions()
 
@@ -1867,16 +2060,19 @@ def suggest(
     if kept and not paired and ((best := kept[0][0].stats).missed or best.no_fire_violations or best.outside_nearby):
         check()
         relation = search.relation(anchors)
-    def rendered(item: _Scored) -> tuple[dict[str, Any], str]:
+    names = helper_names([card[0].candidate for card in kept], {*timeline.entity_ids, *taken})
+
+    def rendered(item: _Scored, ids: Mapping[tuple[Any, ...], str]) -> tuple[dict[str, Any], str, tuple[dict[str, Any], ...]]:
         explanation = explain(item.candidate, item.stats, words, relation, search.calendar_note(item.candidate, item.stats))
         alias = f"Suggested: {describe(item.candidate)[:80]}"
-        return render_automation(item.candidate, alias=alias, description=explanation), explanation
+        config = render_automation(item.candidate, alias=alias, description=explanation, helper_ids=ids)
+        return config, explanation, search.helpers(item.candidate, ids)
 
     suggestions = []
     for rank, (item, *others) in enumerate(kept):
-        config, explanation = rendered(item)
-        variants = tuple(Variant(other.candidate, other.stats, *rendered(other)) for other in others[:MAX_VARIANTS])
-        suggestions.append(Suggestion(rank, item.candidate, item.stats, config, explanation, variants=variants))
+        config, explanation, helpers = rendered(item, names)
+        variants = tuple(Variant(other.candidate, other.stats, *rendered(other, variant_names(item.candidate, other.candidate, names))) for other in others[:MAX_VARIANTS])
+        suggestions.append(Suggestion(rank, item.candidate, item.stats, config, explanation, variants=variants, helpers=helpers))
     return SuggestResult(
         suggestions, _hints(search, anchors, suggestions), search.evaluated, context=SearchContext(search, words, relation)
     )
