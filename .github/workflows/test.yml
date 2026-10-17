@@ -57,8 +57,12 @@ jobs:
           # tests need the exact build the installed core asks for.
           FRONTEND=$(python -c "import json,os,homeassistant.components.frontend as f;print(json.load(open(os.path.join(os.path.dirname(f.__file__),'manifest.json')))['requirements'][0])")
           pip install "$FRONTEND"
+          # ZHA's own device-trigger code runs in the sandbox (zha device triggers), so its packages must be importable.
+          pip install $(python scripts/integration_requirements.py zha)
 
       - name: Run the test suite
+        env:
+          EVENT_SIMULATOR_REQUIRE_ZHA: "1"
         run: pytest -q
 
   panel:

@@ -7,7 +7,7 @@ The scenario carries either `automation` (one config) or `automations` (a list o
 Timeline of a replay (all virtual time, see `vclock.py`)
 --------------------------------------------------------
 1. `start - BOOT_LEAD`: a `HomeAssistant` boots on the virtual loop with a temporary config dir (deleted afterwards). The scenario's `registry` snapshot is written into that dir's `.storage` first, so the entity/device/area/floor/label registries load it through their own load path (config entries as disabled stubs, never set up); registered entities with no initial state get HA's own `unavailable` placeholder at start, as live HA gives entities whose integration did not load. It loads the base registries, sets up only the `homeassistant` and `labs` integrations (turning on the scenario's `core.preview_features`, so Labs-gated triggers and conditions validate as they do live), then runs `async_start`; the automation integration and whatever it pulls in (`trace`, `blueprint`, trigger/condition platforms) come later. No recorder, http, frontend or network-facing integrations, and `skip_pip` is on, so nothing is installed or fetched. `BOOT_LEAD` absorbs any timers boot waits on, so the window starts with everything settled.
-2. `start`: the scenario's optional `helpers` (`[{domain, entity_id, options, title?}]`, core Trend and Derivative helpers; see `helpers.py` and `_Replay._setup_helpers`) are set up first, as config entries of those integrations with the requested entity ids, so they take in the seeded states and compute from the replayed source states on virtual time; a helper's own recorded states are not played (its state at the start is restored as its last state). Then initial states are seeded with their recorded `last_changed` / `last_updated` (`StateMachine.async_set(..., timestamp=...)`; an attribute-only update is reproduced by a second write at `last_updated`); states without them are stamped `start`, the same clamp the recorder applies. The automation's own entity is the exception: its recorded state is not seeded but stored as its last state before boot, so it loads enabled or disabled (and with its `last_triggered`) as live HA restores it. Then the automation is checked for platforms the sandbox cannot run (custom integrations' triggers/conditions, integration-specific device automations -> `unsupported_automation`, naming each by config path), validated with HA's own automation schema (invalid -> structured `invalid_automation` error) and set up. It attaches after `async_start`, so a `homeassistant: start` trigger does not fire, and at `start` exactly, so a time trigger at the window start does.
+2. `start`: the scenario's optional `helpers` (`[{domain, entity_id, options, title?}]`, core Trend and Derivative helpers; see `helpers.py` and `_Replay._setup_helpers`) are set up first, as config entries of those integrations with the requested entity ids, so they take in the seeded states and compute from the replayed source states on virtual time; a helper's own recorded states are not played (its state at the start is restored as its last state). Then initial states are seeded with their recorded `last_changed` / `last_updated` (`StateMachine.async_set(..., timestamp=...)`; an attribute-only update is reproduced by a second write at `last_updated`); states without them are stamped `start`, the same clamp the recorder applies. The automation's own entity is the exception: its recorded state is not seeded but stored as its last state before boot, so it loads enabled or disabled (and with its `last_triggered`) as live HA restores it. Then the scenario's optional `device_triggers` (`{domain: {device_id: data}}`, read on the live side) is seeded where those integrations' own `device_trigger` modules look for it (see `device_triggers.py`; ZHA's trigger cache), so their device triggers attach as live. Then the automation is checked for platforms the sandbox cannot run (custom integrations' triggers/conditions, integration-specific device automations other than the seeded device triggers -> `unsupported_automation`, naming each by config path), validated with HA's own automation schema (invalid -> structured `invalid_automation` error) and set up. It attaches after `async_start`, so a `homeassistant: start` trigger does not fire, and at `start` exactly, so a time trigger at the window start does.
 3. `[start, end)`: timeline events are written with `async_set` at their `at`; events at the same instant are written in list order. The optional `bus_events` (`[{at, event_type, data}]`, recorded events such as `zha_event` or `tag_scanned`) are fired on the bus at their `at` (`time_fired` set to it), after the state writes of the same instant, so event triggers replay and a condition reads the states of that instant. Home Assistant's own lifecycle and bookkeeping events (`state_changed`, `call_service`, `homeassistant_start`, ...) are refused: the sandbox's Home Assistant fires those itself. Calendar triggers ask a stub calendar per calendar entity for its events (see `_Replay._serve_calendars`): the scenario's optional `calendars` (`{entity_id: [{start, end, summary, description?, location?}]}`, the shape `calendar.get_events` answers with; see `calendars.py`), else the events the calendar's own recorded states name (a `calendar_from_states` warning, or `calendar_no_events` when there are none); the calendar's recorded states still replay as recorded. A recorded on/off of a replayed automation's own entity turns that automation on/off instead (`automation.turn_on` / `turn_off` semantics), so the entity's state, and every template reading it, is the sandbox's own. Every service call is intercepted at the `ServiceRegistry` (see `RecordingServiceRegistry`): recorded, answered with success (an empty response when one is asked for), and never executed, so recorded calls change no state.
 4. `end`: the automation's triggers are detached (`async_turn_off(stop_actions=False)`), so nothing new starts; the window is half-open and a run triggered at `end` itself is discarded. Runs already in flight (a `delay`, a `wait_for_trigger`, a queue) keep going for up to `overrun_seconds` of virtual time (default `DEFAULT_OVERRUN`, at most `MAX_OVERRUN`); a run still going at that bound is reported with outcome `unfinished` and a warning. Then HA is stopped.
 
@@ -109,7 +109,7 @@ from homeassistant.util import slugify
 import voluptuous as vol  # noqa: I001 - after homeassistant, see above
 from voluptuous.humanize import humanize_error
 
-from . import calendars as calendar_events, helpers as scenario_helpers
+from . import calendars as calendar_events, device_triggers as scenario_device_triggers, helpers as scenario_helpers
 from .vclock import VirtualClock, patch_homeassistant_clock
 
 _LOGGER = logging.getLogger(__name__)
@@ -264,6 +264,8 @@ class _Scenario:
     time_zone: Any = UTC
     # The Trend / Derivative helpers set up before the automations (see `_helpers`).
     helpers: list[scenario_helpers.Helper] = field(default_factory=list)
+    # Data for integration-specific device triggers, by domain and device id (see `device_triggers.py`).
+    device_triggers: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def error_result(code: str, message: str, warnings: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -460,11 +462,15 @@ def _parse_scenario(raw: dict[str, Any]) -> _Scenario:
     time_zone = _time_zone(core.get("time_zone"))
     calendars = _calendars(raw.get("calendars"), items, initial_states, events, time_zone, warnings)
     helpers = _helpers(raw.get("helpers"), initial_states, events, warnings)
+    try:
+        device_triggers = scenario_device_triggers.parse_device_triggers(raw.get("device_triggers"))
+    except ValueError as err:
+        raise ScenarioError("invalid_scenario", str(err)) from err
     for automation in automations:
         automation.own_initial = initial_states.pop(automation.entity_id, None)
 
     return _Scenario(
-        core, start, end, automations, initial_states, events, services, overrun, seed, preview_features, registry, warnings, multi, traces, time_limit, bus_events, calendars, time_zone, helpers
+        core, start, end, automations, initial_states, events, services, overrun, seed, preview_features, registry, warnings, multi, traces, time_limit, bus_events, calendars, time_zone, helpers, device_triggers
     )
 
 
@@ -795,10 +801,10 @@ def _parse_preview_features(value: Any) -> list[tuple[str, str]]:
 # --- platforms the sandbox cannot load --------------------------------------------------------------
 
 
-async def _check_platforms(hass: HomeAssistant, config: dict[str, Any]) -> None:
+async def _check_platforms(hass: HomeAssistant, config: dict[str, Any], device_triggers: dict[str, dict[str, Any]]) -> None:
     """Refuse, by name and config path, triggers/conditions/device automations the sandbox cannot run.
 
-    - Device triggers, conditions and actions of integration-specific platforms (zha, mqtt, hue, ...): they read that integration's runtime state, which the sandbox does not have. Those of entity-domain integrations (binary_sensor, light, sensor, ...) work from the registry snapshot and are allowed.
+    - Device triggers, conditions and actions of integration-specific platforms (zha, mqtt, hue, ...): they read that integration's runtime state, which the sandbox does not have. Those of entity-domain integrations (binary_sensor, light, sensor, ...) work from the registry snapshot and are allowed. So is a device trigger of an integration `device_triggers.SEEDERS` covers when the scenario's `device_triggers` carries its device: the seeded data stands in for the runtime state.
     - Trigger and condition platforms of integrations that are not built into Home Assistant: custom integrations are never loaded in the sandbox, since that would run third-party code in it.
     """
     problems: list[str] = []
@@ -809,7 +815,14 @@ async def _check_platforms(hass: HomeAssistant, config: dict[str, Any]) -> None:
             integration = await _integration(hass, domain)
             if integration is None:
                 problems.append(f"{path}: device {kind} from '{domain}', an integration that is not built into Home Assistant (custom integrations are not loaded in the sandbox)")
-            elif integration.integration_type != _GENERIC_DEVICE_AUTOMATION_TYPE:
+            elif integration.integration_type == _GENERIC_DEVICE_AUTOMATION_TYPE:
+                pass
+            elif kind == "trigger" and domain in scenario_device_triggers.SEEDERS:
+                if node["device_id"] not in device_triggers.get(domain, {}):
+                    problems.append(f"{path}: '{domain}' had no trigger data for device {node['device_id']} (the device is gone, or {domain} is not running on the live instance)")
+            elif kind == "trigger":
+                problems.append(f"{path}: device triggers from '{domain}' are not supported yet; only {', '.join(sorted(scenario_device_triggers.SEEDERS))} and entity domains (binary_sensor, light, sensor, switch, ...) replay")
+            else:
                 problems.append(
                     f"{path}: device {kind} from '{domain}' is specific to that integration and needs it running; only device {kind}s of entity domains (binary_sensor, light, sensor, switch, ...) replay"
                 )
@@ -1011,6 +1024,7 @@ class _Replay:
                     self._seed_states()
                     await self._settle_helpers()
                     self._serve_calendars()
+                    scenario_device_triggers.seed(self.hass, self.scenario.device_triggers)
                     await self._load_automations()
                 except ScenarioError as err:
                     return error_result(err.code, str(err), self.warnings)
@@ -1317,7 +1331,7 @@ class _Replay:
             config.pop("initial_state")
             self._warn(automation, "initial_state_ignored", "initial_state: false was ignored so the automation can run")
 
-        await _check_platforms(self.hass, config)
+        await _check_platforms(self.hass, config, self.scenario.device_triggers)
         try:
             await async_validate_config_item(self.hass, config["id"], config)
         except vol.Invalid as err:
