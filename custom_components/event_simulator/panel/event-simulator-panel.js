@@ -975,6 +975,39 @@ export function updateBusEvent(timeline, index, data) {
   return { ...timeline, events };
 }
 
+/* A stable key for a config's device triggers (anywhere in it, `wait_for_trigger` too), ""
+ * when it has none: the device lanes are fetched again only when this changes. */
+export function deviceTriggerKey(automation) {
+  const found = [];
+  const walk = (node) => {
+    if (Array.isArray(node)) node.forEach(walk);
+    else if (isObject(node)) {
+      if ((node.trigger ?? node.platform) === "device" && typeof node.domain === "string" && typeof node.device_id === "string") found.push(node);
+      else Object.values(node).forEach(walk);
+    }
+  };
+  walk(automation);
+  return found.length ? stableStringify(found) : "";
+}
+
+/* A device trigger kind in words, as the automation editor names it: the integration's
+ * translated trigger type with its translated subtype filled in, else the raw pair. */
+export function kindLabel(localize, domain, kind) {
+  const raw = `${kind.type} ${kind.subtype}`;
+  if (typeof localize !== "function") return raw;
+  const subtype = localize(`component.${domain}.device_automation.trigger_subtype.${kind.subtype}`) || kind.subtype;
+  return localize(`component.${domain}.device_automation.trigger_type.${kind.type}`, { subtype }) || raw;
+}
+
+/* The plain event lanes' filters for a run config: eventTriggerFilters, or, when an event
+ * trigger's type is a template (it could be any type), every type recorded in the window. */
+export function laneFilters(automation, busEvents) {
+  if (eventTriggerTypes(automation) !== null) return eventTriggerFilters(automation);
+  const filters = eventTriggerFilters(automation);
+  for (const e of busEvents || []) if (!filters.has(e.event_type)) filters.set(e.event_type, null);
+  return filters;
+}
+
 /* shiftTrack for a lane: bus events carry no state, so a lane has no state at the start. */
 export function shiftLane(lane, dt, win) {
   const next = shiftTrack(lane, dt, win);
@@ -2942,6 +2975,15 @@ class EventSimulatorPanel extends Base {
     this._busEvents = [];
     this._busDropped = [];
     this._busKey = null;
+    // Replay mode's lanes (#48): the device lanes event_simulator/device_lanes gave for the
+    // run config's device triggers (`_deviceKey` = deviceTriggerKey of that config), and the
+    // device and event-trigger lanes built from them and the bus events (`_lanesKey` = the
+    // window they hold; edits survive a rebuild in the same window).
+    this._deviceLanes = { lanes: [], unsupported: [] };
+    this._deviceKey = null;
+    this._lanes = [];
+    this._lanesKey = null;
+    this._kindDomains = new Set();
     // Events of the calendars the automation's calendar triggers read, or (Suggest mode) of
     // the calendar tracks (#37): a read-only lane each, and what a replay serves its calendar
     // triggers. `_calKey` is the window and calendars they were loaded for.
@@ -3064,6 +3106,10 @@ class EventSimulatorPanel extends Base {
     this._automation = null;
     this._replayHelpers = [];
     this._tracks = [];
+    this._deviceLanes = { lanes: [], unsupported: [] };
+    this._deviceKey = null;
+    this._lanes = [];
+    this._lanesKey = null;
     this._clearResult();
     this._clearEdits();
     this._cfgDraft = null;
@@ -3087,6 +3133,7 @@ class EventSimulatorPanel extends Base {
         ids = ids.slice(0, MAX_ENTITIES);
       }
       this._tracks = ids.map((entity_id) => ({ entity_id, initial: null, events: [] }));
+      this._refreshDeviceLanes();
       await this._loadHistory();
     } catch (e) {
       if (token !== this._requestToken) return;
@@ -3187,20 +3234,101 @@ class EventSimulatorPanel extends Base {
    * failed read) leaves the lane empty, and replays go without them. */
   async _loadBusEvents() {
     const { start, end } = this._window;
-    const key = `${start}-${end}`;
+    // Replay mode asks only for the types its lanes need; Suggest mode, and a config whose
+    // event type is a template, for every type.
+    let types = null;
+    if (this._mode === "replay") {
+      const config = this._configOrNull();
+      if (eventTriggerTypes(config) !== null) types = laneTypes(this._deviceLanes.lanes, eventTriggerFilters(config));
+    }
+    const key = `${start}-${end}-${types ? types.join(",") : "*"}`;
     if (this._busKey === key) return;
     this._busKey = key;
     this._busEvents = [];
     this._busDropped = [];
+    if (types && !types.length) {
+      this._rebuildLanes();
+      return this._scheduleTimeline();
+    }
     try {
-      const found = await this._hass.callWS(busEventsMessage(start, end));
+      const found = await this._hass.callWS(busEventsMessage(start, end, types));
       if (this._busKey !== key) return;
       this._busEvents = found.bus_events || [];
       this._busDropped = found.dropped_event_types || [];
     } catch (e) {
       if (this._busKey === key) this._busEvents = [];
     }
+    this._rebuildLanes();
     this._scheduleTimeline();
+  }
+
+  _configOrNull() {
+    try {
+      return this._runConfig();
+    } catch {
+      return null;
+    }
+  }
+
+  /* Fetch the device lanes again when the run config's device triggers changed, then the bus
+   * events their types need. */
+  async _refreshDeviceLanes() {
+    const config = this._configOrNull();
+    const key = this._automation ? deviceTriggerKey(config) : "";
+    if (key === this._deviceKey) return this._loadBusEvents();
+    this._deviceKey = key;
+    let found = { lanes: [], unsupported: [] };
+    if (key) {
+      try {
+        found = await this._hass.callWS(deviceLanesMessage(config));
+      } catch (e) {
+        found = { lanes: [], unsupported: [] };
+      }
+      if (this._deviceKey !== key) return;
+    }
+    this._deviceLanes = { lanes: found.lanes || [], unsupported: found.unsupported || [] };
+    this._loadKindNames();
+    this._lanesKey = null;
+    this._loadBusEvents();
+    this._rebuildLanes();
+  }
+
+  /* The integrations' device trigger names (`component.<domain>.device_automation.*`), once per domain. */
+  async _loadKindNames() {
+    for (const lane of this._deviceLanes.lanes) {
+      if (this._kindDomains.has(lane.domain) || typeof this._hass?.loadBackendTranslation !== "function") continue;
+      this._kindDomains.add(lane.domain);
+      try {
+        await this._hass.loadBackendTranslation("device_automation", lane.domain);
+        this._scheduleTimeline();
+      } catch {
+        // Raw type and subtype stand in.
+      }
+    }
+  }
+
+  /* Rebuild the lanes from the device lanes, the run config's event triggers and the bus
+   * events. In the same window an edited lane keeps its events (its kinds and filters follow
+   * the config); a new window starts from the recorder. */
+  _rebuildLanes() {
+    if (this._mode !== "replay") return;
+    const { start, end } = this._window;
+    const fresh = buildLanes({ deviceLanes: this._deviceLanes.lanes, filters: laneFilters(this._configOrNull(), this._busEvents), busEvents: this._busEvents, start, end });
+    const key = `${start}-${end}`;
+    if (this._lanesKey === key) {
+      const old = new Map(this._lanes.map((l) => [l.id, l]));
+      for (let i = 0; i < fresh.length; i++) {
+        const before = old.get(fresh[i].id);
+        if (before && timelineEdited(before, before.recorded)) fresh[i] = { ...fresh[i], events: before.events, ...(before.shift ? { shift: before.shift } : {}) };
+      }
+    }
+    this._lanesKey = key;
+    this._lanes = fresh;
+    this._markStale();
+  }
+
+  _lane(id) {
+    return this._lanes.find((l) => l.id === id) || null;
   }
 
   /* The calendars whose events the panel shows and a replay sends: in Replay mode those the
@@ -3326,6 +3454,7 @@ class EventSimulatorPanel extends Base {
     this._notice = null;
     this._hintSel = null;
     this._loadCalendars();
+    this._loadBusEvents();
     if (mode === "suggest") this._suggestScheduler.change();
     if (mode === "replay") {
       this._labelSel = null;
@@ -3933,8 +4062,10 @@ class EventSimulatorPanel extends Base {
       if (check.ok) this._cfgDraft = stableStringify(value) === stableStringify(this._savedConfig()) ? null : value;
     }
     this._markStale();
-    // An edit may name other calendars (its own key: one read per set of calendars).
+    // An edit may name other calendars (its own key: one read per set of calendars), other
+    // device triggers or event types (#48).
     this._loadCalendars();
+    if (valid && !this._cfgError) this._refreshDeviceLanes();
     this._updateConfigStatus();
     this._updateConfigDiff();
     this._updateDirty();
@@ -3948,6 +4079,7 @@ class EventSimulatorPanel extends Base {
     this._cfgError = null;
     this._renderConfig();
     this._markStale();
+    this._refreshDeviceLanes();
     this._render();
   }
 
@@ -4225,7 +4357,7 @@ class EventSimulatorPanel extends Base {
       return null;
     }
     const message = simulateSubscribeMessage(
-      buildScenario({ automation: this._runConfig(), start: this._window.start, end: this._window.end, tracks: this._tracks, busEvents: this._busEvents, calendars: this._calendars, helpers: this._replayHelpers })
+      buildScenario({ automation: this._runConfig(), start: this._window.start, end: this._window.end, tracks: this._tracks, busEvents: this._busEvents, calendars: this._calendars, helpers: this._replayHelpers, lanes: this._lanes })
     );
     const size = messageBytes(message);
     const tooLarge = messageSizeError(message, size);
@@ -4332,12 +4464,14 @@ class EventSimulatorPanel extends Base {
   }
 
   _prints() {
-    const parts = [this._entityId, this._window.start, this._window.end, this._labels, this._mode, this._tolerance, this._replayHelpers, ...this._tracks.flatMap((t) => [t.entity_id, t.initial, t.events, t.shift])];
+    const parts = [this._entityId, this._window.start, this._window.end, this._labels, this._mode, this._tolerance, this._replayHelpers, ...this._tracks.flatMap((t) => [t.entity_id, t.initial, t.events, t.shift]), ...this._lanes.flatMap((l) => [l.id, l.events])];
     const c = this._printCache;
     if (!c || c.parts.length !== parts.length || c.parts.some((x, i) => x !== parts[i]) || c.config !== this._runConfig()) {
       const payload = this._payload();
       const { labels, suggest_options, ...replay } = payload;
-      this._printCache = { parts, config: this._runConfig(), full: scenarioFingerprint(payload), replay: scenarioFingerprint({ ...replay, helpers: scenarioHelpers(this._replayHelpers) }) };
+      // What the lanes send (#48) is part of what a replay depends on.
+      const bus = this._lanes.flatMap((l) => l.events.map(stripMarks));
+      this._printCache = { parts, config: this._runConfig(), full: scenarioFingerprint(payload), replay: scenarioFingerprint({ ...replay, helpers: scenarioHelpers(this._replayHelpers), bus }) };
     }
     return this._printCache;
   }
@@ -5003,7 +5137,7 @@ class EventSimulatorPanel extends Base {
       edited ? `${edited} edited track${edited === 1 ? "" : "s"}` : "",
       this._cfgDraft ? "the edited automation config" : "",
     ].filter(Boolean);
-    const bus = this._busLaneEvents().length;
+    const bus = this._lanes.reduce((n, l) => n + l.events.length, 0);
     const { start, end } = this._window;
     const calendarEvents = this._calendarIds().reduce((n, id) => n + calendarLane(this._calendars[id], this._clock.serverTimeZone, start, end).length, 0);
     const fired = [
@@ -5267,8 +5401,13 @@ class EventSimulatorPanel extends Base {
     }
     if (this._mode === "replay" && (this._result || this._running)) parts.push(this._resultsRow(scale));
     if (this._mode === "replay" && this._result) for (const [id, states] of Object.entries(this._result.helperStates || {})) parts.push(this._helperRow(scale, id, states));
-    const bus = this._busLaneEvents();
-    if (bus.length) parts.push(this._busEventsRow(scale, bus));
+    if (this._mode === "suggest") {
+      const bus = this._busLaneEvents();
+      if (bus.length) parts.push(this._busEventsRow(scale, bus));
+    } else {
+      if (this._deviceLanes.unsupported.length) parts.push(this._unsupportedRow());
+      for (const lane of this._lanes) parts.push(this._laneRow(lane, scale));
+    }
     for (const id of this._calendarIds()) {
       if (this._calendars[id]) parts.push(this._calendarRow(scale, id));
     }
@@ -5282,19 +5421,52 @@ class EventSimulatorPanel extends Base {
     this._placeHintPopover(scale);
   }
 
-  /* The bus events the Events lane shows: all of them in Suggest mode (event triggers are
-   * mined from them), in Replay mode those the automation's event triggers listen to. */
+  /* Suggest mode's Events lane: every recorded bus event (event triggers are mined from them). */
   _busLaneEvents() {
-    if (!this._busEvents.length) return [];
     const { start, end } = this._window;
-    if (this._mode === "suggest") return busEventsFor(this._busEvents, null, start, end);
-    let config = null;
-    try {
-      config = this._runConfig();
-    } catch {
-      config = null;
+    return busEventsFor(this._busEvents, null, start, end);
+  }
+
+  /* The device triggers that cannot replay, and why (#48). */
+  _unsupportedRow() {
+    const items = this._deviceLanes.unsupported.map((u) => `<li>Device trigger at <span class="mono">${esc(u.path)}</span> (${esc(u.domain)}) can't be replayed: ${esc(u.message)}</li>`);
+    return `<div class="row lane-unsupported"><ul class="small">${items.join("")}</ul></div>`;
+  }
+
+  /* A device lane or an event-trigger lane (#48): one tick per event, a color per kind,
+   * ringed when a trigger of this automation uses it and dimmed when not. */
+  _laneRow(lane, scale) {
+    const view = laneView(lane, { dropped: this._busDropped });
+    const localize = this._hass?.localize?.bind(this._hass);
+    let out = this._gridLines(scale, BUS_H);
+    for (const m of view.marks) {
+      if (m.t < scale.t0 || m.t > scale.t1) continue;
+      const x = scale.toX(m.t).toFixed(1);
+      const what = lane.kind === "device" ? (m.kind >= 0 ? kindLabel(localize, lane.domain, lane.kinds[m.kind]) : "other") : lane.event_type;
+      const title = [`${what} ${this._clock.full(m.t)}`, m.title].filter(Boolean).join("\n");
+      out += `<line x1="${x}" x2="${x}" y1="3" y2="${BUS_H - 3}" class="bus-mark lane-mark b${Math.min(Math.max(m.kind, 0), BUS_CLASSES - 1)}${m.used ? " used" : " dim"}" data-index="${m.index}"><title>${esc(title)}</title></line>`;
     }
-    return busEventsFor(this._busEvents, eventTriggerTypes(config), start, end);
+    const n = lane.events.length;
+    const used = view.marks.filter((m) => m.used).length;
+    let meta;
+    if (lane.kind === "device") meta = `${n} press${n === 1 ? "" : "es"} · ${used} trigger${used === 1 ? "s" : ""} this automation`;
+    else meta = lane.filters == null ? `${n} event${n === 1 ? "" : "s"}` : `${n} event${n === 1 ? "" : "s"} · ${used} match${used === 1 ? "es" : ""} its trigger`;
+    const legend =
+      lane.kind === "device"
+        ? lane.kinds
+            .map((k, i) => `<span class="legend-item${k.used ? "" : " dim"}"><svg class="legend-mark" width="10" height="12" aria-hidden="true"><line x1="5" x2="5" y1="1" y2="11" class="bus-mark b${Math.min(i, BUS_CLASSES - 1)}"/></svg>${esc(kindLabel(localize, lane.domain, k))}</span>`)
+            .join(" ")
+        : "";
+    return `
+      <div class="row bus-row lane-row">
+        <div class="track-head">
+          <span class="name">${esc(lane.name)}</span>
+          ${lane.kind === "device" ? `<span class="eid mono">${esc(lane.domain)}</span>` : `<span class="eid mono">event trigger</span>`}
+          <span class="meta">${meta}${view.notice ? ` · <span class="lane-notice">${esc(view.notice)}</span>` : ""}</span>
+        </div>
+        ${legend ? `<div class="lane-legend small">${legend}</div>` : ""}
+        <svg class="bus lane" data-row="lane" data-lane="${esc(lane.id)}" width="${scale.width}" height="${BUS_H}">${out}</svg>
+      </div>`;
   }
 
   /* The Events lane (read-only): one tick per recorded bus event, a color per type, its data
@@ -6870,6 +7042,11 @@ class EventSimulatorPanel extends Base {
       .pop-group .nofire-btn.primary { background: var(--error-color, #db4437); border-color: var(--error-color, #db4437); }
       svg.hints, svg.fires, svg.bus { background: var(--secondary-background-color); border-radius: 4px; }
       .bus-mark { stroke-width: 2; stroke-linecap: round; }
+      .lane-mark.used { stroke-width: 4; }
+      .lane-mark.dim, .legend-item.dim { opacity: 0.35; }
+      .lane-notice { color: var(--warning-color, #ff9800); }
+      .lane-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 0 0 2px; color: var(--secondary-text-color); }
+      .lane-unsupported ul { margin: 4px 0; padding-left: 18px; color: var(--warning-color, #ff9800); }
       .cal-bar { fill: var(--info-color, #039be5); fill-opacity: 0.45; stroke: var(--info-color, #039be5); stroke-width: 1; }
       .bus-mark.b0 { stroke: var(--info-color, #039be5); }
       .bus-mark.b1 { stroke: var(--warning-color, #ff9800); }

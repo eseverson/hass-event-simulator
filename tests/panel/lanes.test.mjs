@@ -5,9 +5,11 @@ import { test } from "node:test";
 import {
   buildLanes,
   buildScenario,
+  deviceTriggerKey,
   eventTriggerFilters,
   insertBusEvent,
   kindIndex,
+  kindLabel,
   laneTypes,
   laneView,
   matchesData,
@@ -198,4 +200,28 @@ test("buildScenario without lanes keeps sending the automation's event types", (
 test("laneTypes asks for device and plain types once", () => {
   assert.deepEqual(laneTypes([BUTTON], new Map([["tag_scanned", null], ["zha_event", null]])), ["tag_scanned", "zha_event"]);
   assert.deepEqual(laneTypes([], new Map()), []);
+});
+
+test("deviceTriggerKey changes only with the config's device triggers", () => {
+  const trig = (type) => ({ trigger: "device", domain: "zha", device_id: "dev1", type, subtype: "button_1" });
+  const a = { triggers: [trig(SHORT)], actions: [{ action: "light.toggle" }] };
+  const b = { triggers: [trig(SHORT)], actions: [{ action: "light.turn_on" }], mode: "single" };
+  const c = { triggers: [trig(DOUBLE)], actions: [{ action: "light.toggle" }] };
+  assert.equal(deviceTriggerKey(a), deviceTriggerKey(b));
+  assert.notEqual(deviceTriggerKey(a), deviceTriggerKey(c));
+  assert.equal(deviceTriggerKey({ triggers: [{ trigger: "state", entity_id: "a.b" }] }), "");
+  assert.equal(deviceTriggerKey(null), "");
+  // One inside the actions counts too.
+  assert.notEqual(deviceTriggerKey({ triggers: [], actions: [{ wait_for_trigger: [trig(LONG)] }] }), "");
+});
+
+test("kindLabel uses Home Assistant's own trigger names, else the raw ones", () => {
+  const strings = {
+    "component.zha.device_automation.trigger_type.remote_button_short_press": '"{subtype}" pressed',
+    "component.zha.device_automation.trigger_subtype.button_1": "First button",
+  };
+  const localize = (key, args = {}) => (strings[key] || "").replace(/\{(\w+)\}/g, (_, k) => args[k] ?? "");
+  assert.equal(kindLabel(localize, "zha", BUTTON.kinds[0]), '"First button" pressed');
+  assert.equal(kindLabel(localize, "zha", BUTTON.kinds[1]), "remote_button_double_press button_1");
+  assert.equal(kindLabel(null, "zha", BUTTON.kinds[0]), "remote_button_short_press button_1");
 });
