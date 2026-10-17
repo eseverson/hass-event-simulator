@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 
 EVENT_TYPE = "zha_event"
 
@@ -20,9 +21,13 @@ def export(hass: HomeAssistant, device_id: str) -> dict[str, Any]:
         from homeassistant.components.zha.device_trigger import _get_device_trigger_data  # noqa: PLC0415, PLC2701 - only for zha device triggers
     except ImportError as err:
         raise Unreadable(f"ZHA's device trigger lookup is not available ({err})") from err
+    # ZHA's lookup logs an error for a device the registry lacks and raises StopIteration for one without a zha identifier; asked on every replay, so answer those here.
+    device = dr.async_get(hass).async_get(device_id)
+    if device is None or not any(domain == "zha" for domain, _ in device.identifiers):
+        raise KeyError(device_id)
     try:
         ieee, triggers = _get_device_trigger_data(hass, device_id)
-    except (TypeError, ValueError) as err:
+    except (TypeError, ValueError, StopIteration, RuntimeError) as err:
         raise Unreadable(f"ZHA's device trigger lookup failed ({type(err).__name__}: {err})") from err
     try:
         return {

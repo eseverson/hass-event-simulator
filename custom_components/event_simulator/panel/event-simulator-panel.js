@@ -975,6 +975,34 @@ export function updateBusEvent(timeline, index, data) {
   return { ...timeline, events };
 }
 
+/* The lanes rebuilt in the same window (the config, the device lanes or the bus events
+ * changed) with the edits so far kept. Where every lane still holds the same recording, each
+ * keeps its own timeline and recorded objects (so shifting back still finds them) and takes
+ * the fresh kinds, filters and name. Otherwise, if anything was edited, every event the old
+ * lanes held, plus what the recorder newly gave, is handed out again (restoreLanes). */
+export function mergeLanes(old, fresh, win) {
+  if (!old.length) return fresh;
+  const byId = new Map(old.map((l) => [l.id, l]));
+  const sameRecording = (a, b) => a.length === b.length && a.every((e, i) => itemKey(e) === itemKey(b[i]));
+  if (fresh.length === old.length && fresh.every((f) => byId.has(f.id) && sameRecording(byId.get(f.id).recorded.events, f.recorded.events))) {
+    return fresh.map((f) => {
+      const o = byId.get(f.id);
+      const { shift, ...rest } = f;
+      const out = { ...rest, events: o.events, recorded: o.recorded, ...(o.shift ? { shift: o.shift } : {}) };
+      out.edited = timelineEdited(out, out.recorded);
+      return out;
+    });
+  }
+  if (!old.some((l) => timelineEdited(l, l.recorded))) return fresh;
+  const known = new Set(old.flatMap((l) => l.recorded.events.map(itemKey)));
+  const events = [
+    ...old.flatMap((l) => [...(l.shift?.before ?? []), ...l.events, ...(l.shift?.after ?? [])]),
+    ...fresh.flatMap((l) => l.recorded.events).filter((e) => !known.has(itemKey(e))),
+  ];
+  const shifts = Object.fromEntries(old.filter((l) => trackOffset(l)).map((l) => [l.id, { offset: trackOffset(l) }]));
+  return restoreLanes(fresh, { events, shifts }, win);
+}
+
 /* A stable key for a config's device triggers (anywhere in it, `wait_for_trigger` too), ""
  * when it has none: the device lanes are fetched again only when this changes. */
 export function deviceTriggerKey(automation) {
@@ -1861,11 +1889,11 @@ export function scenarioPayload({ name, entityId, automation, start, end, tracks
     }
   }
   events.sort((a, b) => parseTime(a.at) - parseTime(b.at));
-  // Lanes (#48): once one is edited, every lane's events (parked ones too, with their
-  // `edited` marks) and each shifted lane's offset; nothing while they are as recorded.
-  const lanesEdited = (lanes || []).some((l) => l.edited ?? timelineEdited(l, l.recorded));
-  const bus_events = lanesEdited ? lanes.flatMap((l) => [...(l.shift?.before ?? []), ...l.events, ...(l.shift?.after ?? [])]).sort((a, b) => parseTime(a.at) - parseTime(b.at)) : [];
-  const lane_shifts = lanesEdited ? Object.fromEntries(lanes.filter((l) => trackOffset(l)).map((l) => [l.id, { offset: trackOffset(l) }])) : {};
+  // Lanes (#48): every lane's events (parked ones too, with their `edited` marks), as the
+  // tracks' are, so a scenario keeps its presses after the recorder purged them; and each
+  // shifted lane's offset.
+  const bus_events = (lanes || []).flatMap((l) => [...(l.shift?.before ?? []), ...l.events, ...(l.shift?.after ?? [])]).sort((a, b) => parseTime(a.at) - parseTime(b.at));
+  const lane_shifts = Object.fromEntries((lanes || []).filter((l) => trackOffset(l)).map((l) => [l.id, { offset: trackOffset(l) }]));
   return {
     name: String(name ?? "").trim(),
     automation_entity_id: entityId || null,
@@ -3174,6 +3202,7 @@ class EventSimulatorPanel extends Base {
     this._automation = null;
     this._replayHelpers = [];
     this._tracks = [];
+    this._pendingLanes = null;
     this._deviceLanes = { lanes: [], unsupported: [] };
     this._deviceKey = null;
     this._lanes = [];
@@ -3347,7 +3376,11 @@ class EventSimulatorPanel extends Base {
   async _refreshDeviceLanes() {
     const config = this._configOrNull();
     const key = this._automation ? deviceTriggerKey(config) : "";
-    if (key === this._deviceKey) return this._loadBusEvents();
+    if (key === this._deviceKey) {
+      // The event triggers may have changed (their filters, their types).
+      this._loadBusEvents();
+      return this._rebuildLanes();
+    }
     this._deviceKey = key;
     let found = { lanes: [], unsupported: [] };
     if (key) {
@@ -3362,7 +3395,6 @@ class EventSimulatorPanel extends Base {
     this._deviceReady = true;
     this._deviceLanes = { lanes: found.lanes || [], unsupported: found.unsupported || [] };
     this._loadKindNames();
-    this._lanesKey = null;
     this._loadBusEvents();
     this._rebuildLanes();
   }
@@ -3394,22 +3426,17 @@ class EventSimulatorPanel extends Base {
       else if (!this._busReady || !this._deviceReady) return;
       else {
         this._lanes = restoreLanes(fresh, this._pendingLanes.saved, { start, end });
+        for (const lane of this._lanes) lane.edited = timelineEdited(lane, lane.recorded);
         this._pendingLanes = null;
         this._lanesKey = key;
         this._savedPrint = this._fingerprint();
         return this._markStale();
       }
     }
-    if (this._lanesKey === key) {
-      const old = new Map(this._lanes.map((l) => [l.id, l]));
-      for (let i = 0; i < fresh.length; i++) {
-        const before = old.get(fresh[i].id);
-        if (before && timelineEdited(before, before.recorded)) fresh[i] = { ...fresh[i], events: before.events, ...(before.shift ? { shift: before.shift } : {}) };
-      }
-    }
-    for (const lane of fresh) lane.edited = timelineEdited(lane, lane.recorded);
+    const lanes = this._lanesKey === key ? mergeLanes(this._lanes, fresh, { start, end }) : fresh;
+    for (const lane of lanes) lane.edited = timelineEdited(lane, lane.recorded);
     this._lanesKey = key;
-    this._lanes = fresh;
+    this._lanes = lanes;
     const sel = this._laneSel && this._lane(this._laneSel.lane_id);
     if (this._laneSel && (!sel || this._laneSel.index >= sel.events.length)) this._laneSel = null;
     this._markStale();
@@ -4778,8 +4805,9 @@ class EventSimulatorPanel extends Base {
     this._savedPrint = this._fingerprint();
     // The lanes (#48): device lanes for the loaded config, its window's bus events, then the
     // saved lane edits on top (see _rebuildLanes).
-    const savedLanes = lanesFromScenario(record);
-    this._pendingLanes = savedLanes ? { key: `${start}-${end}`, saved: savedLanes } : null;
+    // A scenario saved before lanes existed has none: its lanes come from the recorder, and the
+    // saved baseline is taken again once they are in.
+    this._pendingLanes = { key: `${start}-${end}`, saved: lanesFromScenario(record) };
     this._refreshDeviceLanes();
     this._loading = null;
     this._scBusy = false;
@@ -6733,12 +6761,17 @@ class EventSimulatorPanel extends Base {
       if (!data.ok) return fail(data.error);
       if (stableStringify(data.value) !== stableStringify(lane.events[index].data)) timeline = updateBusEvent(timeline, index, data.value);
     }
-    const typed = this._clock.fromInput(root.getElementById("ln-time")?.value ?? "");
-    if (!Number.isFinite(typed)) return fail("The time is not valid.");
-    try {
-      ({ timeline, index } = moveEvent(timeline, index, typed, this._editOpts()));
-    } catch (e) {
-      return fail(e.message);
+    // Moved only when the time was retyped: the field shows whole seconds, and a recorded
+    // event's milliseconds must not be lost to an Apply of its kind or data.
+    const text = root.getElementById("ln-time")?.value ?? "";
+    if (text !== this._clock.toInput(parseTime(lane.events[sel.index].at), true)) {
+      const typed = this._clock.fromInput(text);
+      if (!Number.isFinite(typed)) return fail("The time is not valid.");
+      try {
+        ({ timeline, index } = moveEvent(timeline, index, typed, this._editOpts()));
+      } catch (e) {
+        return fail(e.message);
+      }
     }
     this._lnError = null;
     this._lnDraft = null;

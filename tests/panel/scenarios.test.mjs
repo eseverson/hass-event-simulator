@@ -268,11 +268,19 @@ test("a scenario with an edited lane saves every lane's events and shifts", () =
   assert.deepEqual(payload.lane_shifts, { "device:d1": { offset: 3600e3 } });
 });
 
-test("a scenario without lane edits saves no lane keys", () => {
+test("a scenario saves its lanes' events even unedited, so a purged recorder loses no press (final review #4)", () => {
   const payload = payloadOf({ ...base, lanes: freshLanes() });
-  assert.ok(!("bus_events" in payload));
+  assert.equal(payload.bus_events.length, 3);
+  assert.ok(payload.bus_events.every((e) => !("edited" in e)));
   assert.ok(!("lane_shifts" in payload));
+  assert.ok(!("bus_events" in payloadOf({ ...base, lanes: laneBuild({ deviceLanes: [DEVICE], filters: new Map(), busEvents: [], ...LWIN }) })));
   assert.equal(lanesFromScenario({}), null);
+});
+
+test("a loaded unedited lane is not edited", () => {
+  const saved = lanesFromScenario(JSON.parse(JSON.stringify(payloadOf({ ...base, lanes: freshLanes() }))));
+  const [restored] = restoreLanes(freshLanes(), saved, LWIN);
+  assert.equal(laneEdited(restored, restored.recorded), false);
 });
 
 test("a loaded lane adopts its recorded events and keeps the edited ones", () => {

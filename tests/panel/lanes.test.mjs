@@ -14,8 +14,10 @@ import {
   laneTypes,
   laneView,
   matchesData,
+  mergeLanes,
   parseEventData,
   newDeviceEvent,
+  shiftEvent,
   shiftLane,
   timelineEdited,
   updateBusEvent,
@@ -244,4 +246,51 @@ test("parseEventData: a JSON object, blank is {}, anything else is refused", () 
   assert.deepEqual(parseEventData(""), { ok: true, value: {} });
   assert.equal(parseEventData("[1]").ok, false);
   assert.match(parseEventData("{nope").error, /not valid JSON/);
+});
+
+// ---- rebuilding lanes in the same window (final review #1, #2, #5) ----------------
+
+const clone = (events) => JSON.parse(JSON.stringify(events));
+
+test("mergeLanes: same recordings keep the edits and the recorded objects, and take the new kinds", () => {
+  const [lane] = lanesOf([BUTTON]);
+  const { event } = newDeviceEvent(lane, 2, Date.parse("2026-10-16T01:00:00Z"));
+  const edited = { ...lane, ...insertBusEvent(lane, event, win).timeline };
+  const doubleUsed = { ...BUTTON, kinds: [kind(SHORT, false), kind(DOUBLE, true), kind(LONG, false)] };
+  const [merged] = mergeLanes([edited], lanesOf([doubleUsed], new Map(), clone(EVENTS)), win);
+  assert.equal(merged.events.length, 9);
+  assert.equal(merged.recorded, edited.recorded);
+  assert.deepEqual(merged.kinds.map((k) => k.used), [false, true, false]);
+  assert.equal(timelineEdited(merged, merged.recorded), true);
+});
+
+test("mergeLanes: an event lane's filters follow the config", () => {
+  const old = lanesOf([], new Map([["zha_event", [{ command: SHORT }]]]));
+  const [merged] = mergeLanes(old, lanesOf([], new Map([["zha_event", [{ command: DOUBLE }]]]), clone(EVENTS)), win);
+  assert.deepEqual(merged.filters, [{ command: DOUBLE }]);
+  assert.equal(laneView(merged).marks.filter((m) => m.used).length, 3);
+});
+
+test("mergeLanes: a lane shifted out and back after a refetch is recorded again", () => {
+  const [lane] = lanesOf([BUTTON]);
+  const out = shiftLane(lane, 3600e3, win);
+  const [merged] = mergeLanes([out], lanesOf([BUTTON], new Map(), clone(EVENTS)), win);
+  const back = shiftLane(merged, -3600e3, win);
+  assert.equal(back.shift, undefined);
+  assert.equal(timelineEdited(back, back.recorded), false);
+});
+
+test("mergeLanes: a device lane appearing takes its presses, edits included, from an edited event lane", () => {
+  const [eventLane] = lanesOf([], new Map([["zha_event", null]]));
+  const moved = { ...eventLane, ...shiftEvent(eventLane, 0, Date.parse("2026-10-16T00:55:00Z"), win).timeline };
+  const merged = mergeLanes([moved], lanesOf([BUTTON], new Map([["zha_event", null]]), clone(EVENTS)), win);
+  assert.deepEqual(merged.map((l) => [l.id, l.events.length]), [["device:dev1", 8], ["event:zha_event", 3]]);
+  assert.equal(merged[0].events[0].at, "2026-10-16T00:55:00.000Z");
+  assert.equal(timelineEdited(merged[0], merged[0].recorded), true);
+  assert.equal(timelineEdited(merged[1], merged[1].recorded), false);
+});
+
+test("mergeLanes: unedited lanes simply become the fresh ones", () => {
+  const fresh = lanesOf([BUTTON], new Map(), clone(EVENTS));
+  assert.equal(mergeLanes(lanesOf([]), fresh, win), fresh);
 });

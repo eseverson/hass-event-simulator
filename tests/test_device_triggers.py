@@ -132,3 +132,24 @@ async def test_simulate_fills_device_triggers(hass: HomeAssistant, setup, button
         msg = await client.receive_json()
     assert msg["success"], msg
     assert captured["device_triggers"] == {"zha": {button.id: ANY}}
+
+
+async def test_a_zha_trigger_on_a_non_zha_device_is_no_data(hass: HomeAssistant, button, monkeypatch: pytest.MonkeyPatch):
+    """With a gateway running (live), ZHA's own lookup raises StopIteration for a device without a zha identifier; that is a device it has no data for, not a failed command."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from homeassistant.components.zha import helpers as zha_helpers  # noqa: PLC0415
+
+    monkeypatch.setattr(zha_helpers, "get_zha_gateway_proxy", lambda _hass: SimpleNamespace(device_proxies={}))
+    entry = MockConfigEntry(domain="hue")
+    entry.add_to_hass(hass)
+    other = dr.async_get(hass).async_get_or_create(config_entry_id=entry.entry_id, identifiers={("hue", "x")}, name="Hue thing")
+    (unsupported,) = (await device_triggers.async_device_lanes(hass, automation(other.id, SHORT)))["unsupported"]
+    assert unsupported["reason"] == "no_data"
+    assert await device_triggers.async_export(hass, automation(other.id, SHORT)) == {}
+
+
+async def test_a_removed_device_does_not_make_zha_log_errors(hass: HomeAssistant, button, caplog: pytest.LogCaptureFixture):
+    """Every auto-run asks again, so ZHA's own 'not found in registry' error would flood the log."""
+    await device_triggers.async_device_lanes(hass, automation("gone", SHORT))
+    assert not [r for r in caplog.records if r.levelname == "ERROR" and "zha" in r.name]
