@@ -46,8 +46,10 @@ jobs:
           python -m pip install --upgrade pip
           VERSION="${{ matrix.homeassistant }}"
           if [ "$VERSION" = latest ]; then
-            # PyPI's `info.version` is the newest stable release, never a beta.
-            VERSION=$(python -c "import json,urllib.request;print(json.load(urllib.request.urlopen('https://pypi.org/pypi/homeassistant/json'))['info']['version'])")
+            # The core the newest harness release pins, not PyPI's newest core: the harness
+            # trails core releases by a day or so, and asking for a core no harness pins yet
+            # makes pip backtrack to an ancient harness (pytest 6, which Python 3.14 breaks).
+            VERSION=$(python -c "import json,re,urllib.request;info=json.load(urllib.request.urlopen('https://pypi.org/pypi/pytest-homeassistant-custom-component/json'))['info'];print(next(m.group(1) for r in info['requires_dist'] if (m:=re.fullmatch(r'homeassistant==(\S+)',r))))")
           fi
           echo "Home Assistant $VERSION"
           # The harness release that pins exactly this core.
