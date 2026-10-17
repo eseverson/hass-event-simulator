@@ -22,7 +22,7 @@ from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.util import dt as dt_util
 from homeassistant.util.yaml import parse_yaml
 
-from . import history, runner
+from . import device_triggers, history, runner
 from .const import DOMAIN
 from .history import (
     MAX_BUS_EVENTS,
@@ -98,6 +98,7 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_automation)
     websocket_api.async_register_command(hass, ws_history)
     websocket_api.async_register_command(hass, ws_bus_events)
+    websocket_api.async_register_command(hass, ws_device_lanes)
     websocket_api.async_register_command(hass, ws_calendar_events)
     websocket_api.async_register_command(hass, ws_scenarios_list)
     websocket_api.async_register_command(hass, ws_scenarios_get)
@@ -124,6 +125,20 @@ async def ws_automations(hass, connection, msg: dict[str, Any]) -> None:
 @_wrap
 async def ws_automation(hass, connection, msg: dict[str, Any]) -> None:
     connection.send_result(msg["id"], history.async_get_automation(hass, msg["entity_id"]))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): f"{DOMAIN}/device_lanes", vol.Required("automation"): vol.Any(dict, str)}
+)
+@websocket_api.async_response
+@_wrap
+async def ws_device_lanes(hass, connection, msg: dict[str, Any]) -> None:
+    """The device lanes for an automation config, edited or not (`device_triggers.async_device_lanes`): one per device its integration-specific device triggers name, with the bus event each of the device's triggers is, and the device triggers that cannot replay."""
+    config = msg["automation"]
+    if isinstance(config, str):
+        config = await hass.async_add_executor_job(parse_automation_yaml, config)
+    connection.send_result(msg["id"], await device_triggers.async_device_lanes(hass, config))
 
 
 @websocket_api.require_admin
@@ -690,7 +705,7 @@ def _cut_short(replay: dict[str, Any], end: datetime) -> str | None:
 async def async_simulate(hass: HomeAssistant, scenario: dict[str, Any]) -> dict[str, Any]:
     """Replay a scenario (validated by SIMULATE_SCENARIO) in the sandbox and return its result.
 
-    `scenario.automation` may be a config dict or YAML text. `core` (time zone, location, units, Labs preview features), `registry` (the registry entries the automation can see) and `services` default to this instance's own, so the panel need not send them. A refusal from the child (invalid scenario or automation) raises SimulatorError with the child's code.
+    `scenario.automation` may be a config dict or YAML text. `core` (time zone, location, units, Labs preview features), `registry` (the registry entries the automation can see), `device_triggers` (what its integration-specific device triggers read, `device_triggers.async_export`) and `services` default to this instance's own, so the panel need not send them. A refusal from the child (invalid scenario or automation) raises SimulatorError with the child's code.
     """
     scenario = dict(scenario)
     check_window(dt_util.parse_datetime(scenario["start"]), dt_util.parse_datetime(scenario["end"]))
@@ -710,6 +725,9 @@ async def async_simulate(hass: HomeAssistant, scenario: dict[str, Any]) -> dict[
             parse_automation_yaml, scenario["automation"]
         )
     scenario.setdefault("core", history.async_core_config(hass))
+    if "device_triggers" not in scenario:
+        # What integration-specific device triggers (zha, ...) read live, for the sandbox to seed (#48).
+        scenario["device_triggers"] = await device_triggers.async_export(hass, scenario["automation"])
     if "registry" not in scenario:
         event_ids = [
             event.get("entity_id") for event in scenario["events"] if isinstance(event, dict)
