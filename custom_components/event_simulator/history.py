@@ -712,6 +712,9 @@ def _start_state_stamps(
 
 
 def _alias(entity: Any) -> str:
+    """The automation's name as Home Assistant shows it: a name set in its entity settings (the registry's override, which never reaches the config), else the config's alias."""
+    if (entry := entity.registry_entry) is not None and entry.name:
+        return str(entry.name)
     if alias := (entity.raw_config or {}).get("alias"):
         return str(alias)
     return entity.name if isinstance(entity.name, str) else entity.entity_id

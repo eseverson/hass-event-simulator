@@ -70,6 +70,13 @@ async def test_list_automations(hass: HomeAssistant, automations):
     ]
 
 
+async def test_list_automations_names_them_as_home_assistant_shows_them(hass: HomeAssistant, automations):
+    """A name set in the entity's settings is what Home Assistant shows everywhere but the automation editor, so it wins over the config's alias (#49)."""
+    er.async_get(hass).async_update_entity("automation.door_light", name="Porch light on door")
+    await hass.async_block_till_done()
+    assert history.async_list_automations(hass)[0]["alias"] == "Porch light on door"
+
+
 async def test_list_automations_before_the_component_loads(hass: HomeAssistant):
     assert history.async_list_automations(hass) == []
 
