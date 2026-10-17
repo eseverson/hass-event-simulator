@@ -81,28 +81,18 @@ The selected suggestion's fires show on a **Fires** row: green on an anchor, red
 
 **Save** the setup as a named scenario to come back to it: the automation config (edited or not) and the automation it came from, the window, the tracked entities and the timeline, edits included. Scenarios are kept in `.storage/event_simulator.scenarios`, up to 100 of them. Loading one puts it back on screen as saved; it does not re-read the recorder, so a scenario still replays after the history behind it has been purged.
 
-## Suggest mode
+## How Suggest mode searches
 
-Switch the panel to **Suggest** mode to have the simulator analyze your history and propose automation triggers and conditions. See the [Suggest design spec](docs/superpowers/specs/2026-10-05-suggestions-design.md) for details.
+Suggest mode is a deterministic search: no ML models, no randomness, and every suggestion is explainable from the stats on its card. See the [Suggest design spec](docs/superpowers/specs/2026-10-05-suggestions-design.md) for details. It generates candidate triggers around the labeled anchors from state transitions, numeric thresholds, how fast a numeric sensor rises or falls (through a Trend or Derivative helper, offered only where it explains the labels better than any threshold does), time of day, sun events, calendar events and recorded bus events (a ZHA remote's `zha_event`, a `tag_scanned`, a phone's notification action: the event type plus the `event_data` keys that single out the labeled ones). When no single trigger hits every anchor, it joins up to 3 into an OR, possibly on different entities or of different kinds, each only when it hits the missed anchors more often than chance would. It then adds conditions greedily to remove unwanted fires. A fire in unlabeled time counts against a candidate only inside the labeled stretch (from the first label to the last); beyond it, it is only a hint to label. The top candidates are checked by replaying them in the sandbox so their stats are exact; one that fires thousands of times (a trigger on any change of a chatty sensor) is checked only while the replay stays short, and the rest keep the search's estimate and say so.
 
-**How it works.** Label periods in the history as should-fire or must-not-fire, then the simulator searches for trigger + condition combinations that match your labels. It generates candidates from state transitions, numeric thresholds, how fast a numeric sensor rises or falls (through a Trend or Derivative helper, offered only where it explains the labels better than any threshold does), time-of-day, sun events and recorded bus events (a ZHA remote's `zha_event`, a `tag_scanned`, a phone's notification action: the event type plus the `event_data` keys that single out the labeled ones), then adds conditions (greedily) to remove unwanted fires. Top candidates are validated by replaying them in the sandbox so the stats are exact. A suggestion that fires thousands of times (a trigger on any change of a chatty sensor) is checked only while the replay stays short; the rest keep the search's estimate and say so.
+**Limits:**
 
-**Understanding suggestion stats.** Each suggestion shows:
-
-- **anchors hit / total** — how many should-fire anchor times the automation fires within the tolerance window (default: 2 min before to 10 min after). Missed anchors link to the time so you can see the gap.
-- **no-fire violations** — fires inside labeled must-not-fire periods. Each is linked.
-- **outside fires** — fires in unlabeled time. If the candidate fires often where nothing is labeled, it is penalized.
-
-Click **Open in simulator** to load the suggestion into Replay mode on the same window and tracks, with your labels shown as an overlay row, so you can verify it by hand.
-
-**Limits.** Suggest mode is a deterministic search — no ML models, no randomness. Every suggestion is explainable from the stats shown. It works within the following constraints:
-
-- **No actions.** The simulator generates only triggers and conditions; the action is a placeholder (`logbook.log`) that you replace. Template triggers are not generated: a time an input_datetime or timestamp sensor holds, plus an offset, comes back as a time trigger at that entity ([#38](https://github.com/eseverson/hass-event-simulator/issues/38)), and labels that follow one sensor rising above another get a note saying that needs a template trigger. A tracked calendar's events (its own, plus those its recorded states name) give calendar triggers with an offset ("7 h before an event of calendar.trash starts"), optionally only for events of some names ([#37](https://github.com/eseverson/hass-event-simulator/issues/37)).
-- **No multi-entity "and" triggers.** Each candidate uses a single-entity trigger. Conditions across multiple entities are supported.
-- **Supported trigger platforms:** `state`, `numeric_state`, `time`, `sun`, `event` (event types the recorder stores, except Home Assistant's own bookkeeping such as `automation_triggered`, `call_service` or `*_registry_updated`; the panel shows them on an **Events** row, and up to 20,000 a window are read, the busiest types left out first).
-- **Supported condition platforms:** `state`, `numeric_state`, `time` (after/before, weekday), `sun` (before/after).
-- **Window:** up to 30 days (vs 7 for replay mode), because patterns need repetition.
-- **Entities:** same 50-track limit as replay mode.
+- **No actions.** Only triggers and conditions are generated; the action is a placeholder `logbook.log` that you replace.
+- **No template triggers.** Labels that follow one sensor rising above another get a note saying that needs a template trigger.
+- **Trigger platforms:** `state`, `numeric_state` (also on a Trend or Derivative helper), `time` (a clock time, or the time an input_datetime or timestamp sensor holds plus an offset), `sun`, `calendar` (with an offset, optionally only for events of some names; a calendar's events are its own plus those its recorded states name) and `event` (event types the recorder stores, except Home Assistant's own bookkeeping such as `automation_triggered`, `call_service` or `*_registry_updated`; the panel shows them on an **Events** row, and up to 20,000 a window are read, the busiest types left out first).
+- **Condition platforms:** `state`, `numeric_state`, `time` (after/before, weekday), `sun` (before/after).
+- **Window:** up to 30 days (7 for a replay), because patterns need repetition.
+- **Entities:** the same 50-track limit as a replay.
 
 ## How it works
 
@@ -118,9 +108,9 @@ The replay attaches the automation at the window start, writes each timeline cha
 
 **One automation at a time.** The automation under test is the only one in the sandbox, so automations that trigger each other cannot be replayed together.
 
-**Only state changes, recorded events and time drive a replay.** The timeline holds state changes, and an automation with `event` triggers also gets the recorded events of the types it listens to, fired at their times (shown on the **Events** row; a tag scan is the `tag_scanned` event). A `calendar` trigger fires on the events of its calendar around the window (shown on a row of their own): the calendar's own events, plus any its recorded states name that it no longer returns; when the calendar cannot answer, the events its recorded states name stand in, which can miss an event that overlapped another. Events the recorder does not store (it skips none by default, but `recorder: exclude: event_types` can) and triggers that wait for something else — a webhook, an MQTT message — have nothing to fire on, and a `homeassistant: start` trigger does not fire because the automation is attached after the sandbox has started.
+**Only state changes, recorded events and time drive a replay.** The timeline holds state changes, and an automation with `event` triggers also gets the recorded events of the types it listens to, fired at their times (shown on a lane per event type; a tag scan is the `tag_scanned` event). A `calendar` trigger fires on the events of its calendar around the window (shown on a row of their own): the calendar's own events, plus any its recorded states name that it no longer returns; when the calendar cannot answer, the events its recorded states name stand in, which can miss an event that overlapped another. Events the recorder does not store (it skips none by default, but `recorder: exclude: event_types` can) and triggers that wait for something else — a webhook, an MQTT message — have nothing to fire on, and a `homeassistant: start` trigger does not fire because the automation is attached after the sandbox has started.
 
-**Some trigger and condition platforms cannot run.** Custom integrations are never loaded in the sandbox, so a trigger or condition from one is refused, as are device triggers, conditions and actions specific to an integration such as ZHA, MQTT or Hue (they need that integration's runtime state, not just its code). The error names each one by its place in the config. Device automations of entity domains (`binary_sensor`, `light`, `sensor`, ...) work. Whether custom platforms should ever be loaded is an open question, [#14](https://github.com/eseverson/hass-event-simulator/issues/14).
+**Some trigger and condition platforms cannot run.** Custom integrations are never loaded in the sandbox, so a trigger or condition from one is refused. Device triggers replay for ZHA and for entity domains (`binary_sensor`, `light`, `sensor`, ...); a device trigger from another integration (Hue, deCONZ, MQTT, ...) is refused, as are device conditions and actions specific to an integration, because they need that integration's runtime state, not just its code. The error names each one by its place in the config. Whether custom platforms should ever be loaded is an open question.
 
 **History is what the recorder kept.** Entities excluded from the recorder have no history to load, and nothing older than the recorder's `purge_keep_days` is available. Attributes an integration keeps out of the recorder (an input_datetime's `has_date`, a light's `supported_color_modes`, ...) are filled in from the entity's current state, so a replay sees today's value for them.
 
@@ -159,10 +149,16 @@ custom_components/event_simulator/
   store.py          saved scenarios (.storage/event_simulator.scenarios)
   websocket.py      event_simulator/* commands used by the panel
   config_flow.py    single-instance config entry
+  packed.py         the packed timeline format replays and saves send
+  device_triggers/  live half of device-trigger replay: reads an integration's trigger data (ZHA)
   sandbox/
     __main__.py     child entry point: scenario JSON on stdin, result JSON on stdout
     engine.py       boots the throwaway Home Assistant and replays the scenario
     vclock.py       virtual-time asyncio event loop and the clock patch
+    device_triggers.py  seeds the device-trigger data the live side read
+    calendars.py    stub calendars for calendar triggers
+    helpers.py      Trend and Derivative helpers a suggestion needs
+  suggest/          the Suggest mode miner (pure Python, no Home Assistant imports)
   panel/            the sidebar panel (plain web component, no build step)
 ```
 
