@@ -23,8 +23,9 @@ INDOOR = "sensor.indoor_temperature"
 START = datetime(2026, 8, 1, tzinfo=UTC)
 DAYS = 30
 LABELS = 500
-# Generous: the whole request (mining included) takes a few seconds; before the fix the validation alone took 25 s.
-BOUND = 20.0
+# Generous: the whole request (mining included) takes about 10 s on a fast desktop and 23 s on a GitHub-hosted runner;
+# before the fix the validation alone took 25 s on the desktop. The run budget asserted below is the hardware-independent check.
+BOUND = 45.0
 
 
 def fan_history() -> tuple[dict[str, Any], list[datetime]]:
