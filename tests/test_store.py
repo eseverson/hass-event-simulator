@@ -386,3 +386,47 @@ async def test_helpers_round_trip(store: ScenarioStore, hass: HomeAssistant):
 def test_save_refuses_malformed_helpers(helpers: list[Any]):
     with pytest.raises(vol.Invalid):
         _FIELDS({**SCENARIO, "helpers": helpers})
+
+
+# ---- lanes (#48): edited presses and events ----------------------------------------
+
+BUS_EVENTS = [
+    {"at": "2026-10-04T07:00:00+00:00", "event_type": "zha_event", "data": {"device_ieee": "aa", "command": "remote_button_short_press"}},
+    {"at": "2026-10-04T08:00:00+00:00", "event_type": "zha_event", "data": {"device_ieee": "aa", "command": "remote_button_long_press"}, "edited": True},
+]
+LANE_SHIFTS = {"device:dev1": {"offset": 60000}}
+
+
+async def test_bus_events_and_lane_shifts_round_trip(store: ScenarioStore, hass: HomeAssistant):
+    saved = await store.async_save_scenario(_FIELDS({**SCENARIO, "bus_events": BUS_EVENTS, "lane_shifts": LANE_SHIFTS}))
+    reopened = ScenarioStore(hass)
+    await reopened.async_load()
+    scenario = reopened.get(saved["scenario_id"])
+    assert scenario["bus_events"] == BUS_EVENTS
+    assert scenario["lane_shifts"] == LANE_SHIFTS
+
+
+async def test_a_scenario_without_lane_edits_stores_neither_lane_key(store: ScenarioStore):
+    saved = await store.async_save_scenario(_FIELDS(SCENARIO))
+    scenario = store.get(saved["scenario_id"])
+    assert "bus_events" not in scenario
+    assert "lane_shifts" not in scenario
+
+
+async def test_too_many_bus_events_is_too_large(store: ScenarioStore):
+    with patch("custom_components.event_simulator.store.MAX_BUS_EVENTS", 1), pytest.raises(SimulatorError) as err:
+        await store.async_save_scenario(_FIELDS({**SCENARIO, "bus_events": BUS_EVENTS}))
+    assert err.value.code == "too_large"
+
+
+def test_bus_events_need_a_type_and_an_aware_time():
+    with pytest.raises(vol.Invalid):
+        _FIELDS({**SCENARIO, "bus_events": [{"at": "2026-10-04T07:00:00", "event_type": "x", "data": {}}]})
+    with pytest.raises(vol.Invalid):
+        _FIELDS({**SCENARIO, "bus_events": [{"at": "2026-10-04T07:00:00+00:00", "data": {}}]})
+
+
+async def test_bus_events_count_toward_the_stored_total(store: ScenarioStore):
+    with patch("custom_components.event_simulator.store.MAX_STORED_EVENTS", 2), pytest.raises(SimulatorError) as err:
+        await store.async_save_scenario(_FIELDS({**SCENARIO, "bus_events": BUS_EVENTS}))
+    assert err.value.code == "store_full"

@@ -25,7 +25,7 @@ from homeassistant.util.hass_dict import HassKey
 from homeassistant.util.ulid import ulid_now
 
 from .const import DOMAIN
-from .history import MAX_ENTITIES, MAX_EVENTS, MAX_SUGGEST_WINDOW, MAX_WINDOW, SimulatorError, check_window
+from .history import MAX_BUS_EVENTS, MAX_ENTITIES, MAX_EVENTS, MAX_SUGGEST_WINDOW, MAX_WINDOW, SimulatorError, check_window
 from .packed import event_count, pack_events, unpack_events
 from .suggest.labels import ANCHORS, KINDS
 
@@ -87,6 +87,20 @@ _TRACK_SHIFT = vol.Schema(
         vol.Optional("base", default=None): vol.Any(None, _STATE),
     }
 )
+
+# A bus event of a lane (#48): a recorded or edited press or event, `edited` marking the panel's own.
+_BUS_EVENT = vol.Schema(
+    {
+        vol.Required("at"): _aware_iso,
+        vol.Required("event_type"): vol.All(cv.string, vol.Length(min=1)),
+        vol.Optional("data", default=dict): dict,
+        vol.Optional("edited"): bool,
+    }
+)
+
+# A lane the panel shifted in time: its offset in ms. Its events, wherever they landed, are in `bus_events`.
+_LANE_SHIFT = vol.Schema({vol.Required("offset"): vol.Coerce(int)})
+
 
 def _check_label(label: dict[str, Any]) -> dict[str, Any]:
     """A period that ends after it starts; a should-fire one anchored (at its start by default), a must-not one not."""
@@ -153,9 +167,12 @@ SCENARIO_FIELDS: dict[vol.Marker, Any] = {
     vol.Optional("suggest_options"): _SUGGEST_OPTIONS,
     # The helpers it replays with (a scenario opened from a suggestion that needs one, #42), stored only when sent non-empty.
     vol.Optional("helpers"): HELPERS_SCHEMA,
+    # The lanes' bus events and shifts (#48), sent and stored only when a lane is edited.
+    vol.Optional("bus_events"): [_BUS_EVENT],
+    vol.Optional("lane_shifts"): {cv.string: _LANE_SHIFT},
 }
 
-_OPTIONAL_KEYS = ("track_shifts", "labels", "suggest_options", "helpers")
+_OPTIONAL_KEYS = ("track_shifts", "labels", "suggest_options", "helpers", "bus_events", "lane_shifts")
 _BODY_KEYS = tuple(
     marker.schema for marker in SCENARIO_FIELDS if marker.schema not in _OPTIONAL_KEYS
 )
@@ -222,11 +239,11 @@ class ScenarioStore:
         else:
             created = self.get(scenario_id)["created"]
         stored = sum(
-            event_count(other["events"])
+            _stored_count(other)
             for other_id, other in self._scenarios.items()
             if other_id != scenario_id
         )
-        if stored + (count := event_count(body.get("events"))) > MAX_STORED_EVENTS:
+        if stored + (count := _stored_count(body)) > MAX_STORED_EVENTS:
             raise SimulatorError(
                 "store_full",
                 f"Saved scenarios hold at most {MAX_STORED_EVENTS} state changes in all; "
@@ -259,11 +276,20 @@ def _check_limits(body: dict[str, Any]) -> None:
         raise SimulatorError(
             "too_large", f"A scenario holds at most {MAX_EVENTS} events; this one has {count}"
         )
+    if (count := len(body.get("bus_events") or ())) > MAX_BUS_EVENTS:
+        raise SimulatorError(
+            "too_large", f"A scenario holds at most {MAX_BUS_EVENTS} bus events; this one has {count}"
+        )
     if (count := len(body.get("entity_ids") or ())) > MAX_ENTITIES:
         raise SimulatorError(
             "too_large",
             f"A scenario tracks at most {MAX_ENTITIES} entities; this one has {count}",
         )
+
+
+def _stored_count(scenario: dict[str, Any]) -> int:
+    """What a scenario adds to the store file: its state changes and its lanes' bus events."""
+    return event_count(scenario.get("events")) + len(scenario.get("bus_events") or ())
 
 
 def _parse(value: str | datetime) -> datetime:

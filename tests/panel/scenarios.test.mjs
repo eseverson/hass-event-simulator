@@ -242,3 +242,56 @@ test("the save payload carries the helpers the replay sets up, and loading bring
   assert.deepEqual(helpersFromScenario({}), []);
   assert.deepEqual(helpersFromScenario({ helpers: [{ title: "no domain" }, "junk"] }), []);
 });
+
+// ---- lanes (#48) ---------------------------------------------------------------
+
+import { buildLanes as laneBuild, insertBusEvent as laneInsert, lanesFromScenario, restoreLanes, scenarioPayload as payloadOf, shiftLane as laneShift, timelineEdited as laneEdited } from "../../custom_components/event_simulator/panel/event-simulator-panel.js";
+
+const L0 = Date.parse("2026-10-04T00:00:00Z");
+const LWIN = { start: L0, end: L0 + 24 * 3600e3 };
+const KINDS = ["short", "double"].map((c, i) => ({ type: c, subtype: "b1", event_type: "zha_event", match: { device_ieee: "aa", command: c }, used: i === 0 }));
+const DEVICE = { id: "device:d1", domain: "zha", device_id: "d1", name: "Remote", event_type: "zha_event", kinds: KINDS };
+const press = (h, command) => ({ at: new Date(L0 + h * 3600e3).toISOString(), event_type: "zha_event", data: { device_ieee: "aa", command } });
+const RECORDED = [press(1, "short"), press(2, "double"), press(3, "short")];
+const freshLanes = () => laneBuild({ deviceLanes: [DEVICE], filters: new Map(), busEvents: RECORDED, ...LWIN });
+const base = { name: "x", entityId: "automation.a", automation: {}, start: LWIN.start, end: LWIN.end, tracks: [] };
+
+test("a scenario with an edited lane saves every lane's events and shifts", () => {
+  const [lane] = freshLanes();
+  const added = { ...lane, ...laneInsert(lane, press(5, "double"), LWIN).timeline };
+  added.edited = laneEdited(added, added.recorded);
+  const shifted = laneShift(added, 3600e3, LWIN);
+  shifted.edited = true;
+  const payload = payloadOf({ ...base, lanes: [shifted] });
+  assert.equal(payload.bus_events.length, 4);
+  assert.equal(payload.bus_events.filter((e) => e.edited).length, 4);
+  assert.deepEqual(payload.lane_shifts, { "device:d1": { offset: 3600e3 } });
+});
+
+test("a scenario without lane edits saves no lane keys", () => {
+  const payload = payloadOf({ ...base, lanes: freshLanes() });
+  assert.ok(!("bus_events" in payload));
+  assert.ok(!("lane_shifts" in payload));
+  assert.equal(lanesFromScenario({}), null);
+});
+
+test("a loaded lane adopts its recorded events and keeps the edited ones", () => {
+  const [lane] = freshLanes();
+  const edited = { ...lane, ...laneInsert(lane, press(5, "double"), LWIN).timeline, edited: true };
+  const saved = lanesFromScenario(JSON.parse(JSON.stringify(payloadOf({ ...base, lanes: [edited] }))));
+  const [restored] = restoreLanes(freshLanes(), saved, LWIN);
+  assert.equal(restored.events.length, 4);
+  assert.equal(restored.events[0], restored.recorded.events[0]);
+  assert.equal(restored.events.filter((e) => e.edited).length, 1);
+  assert.equal(laneEdited(restored, restored.recorded), true);
+});
+
+test("a loaded shifted lane is parked again", () => {
+  const [lane] = freshLanes();
+  const shifted = { ...laneShift(lane, 22 * 3600e3, LWIN), edited: true };
+  const saved = lanesFromScenario(JSON.parse(JSON.stringify(payloadOf({ ...base, lanes: [shifted] }))));
+  const [restored] = restoreLanes(freshLanes(), saved, LWIN);
+  assert.equal(restored.shift.offset, 22 * 3600e3);
+  assert.equal(restored.events.length, 1);
+  assert.equal(restored.shift.after.length, 2);
+});
