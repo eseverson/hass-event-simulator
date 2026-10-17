@@ -5679,7 +5679,7 @@ class EventSimulatorPanel extends Base {
     const legend =
       lane.kind === "device"
         ? lane.kinds
-            .map((k, i) => `<span class="legend-item${k.used ? "" : " dim"}"><svg class="legend-mark" width="10" height="12" aria-hidden="true"><line x1="5" x2="5" y1="1" y2="11" class="bus-mark b${Math.min(i, BUS_CLASSES - 1)}"/></svg>${esc(kindLabel(localize, lane.domain, k))}</span>`)
+            .map((k, i) => `<span class="legend-item${k.used ? " used" : ""}" title="${k.used ? "A trigger of this automation" : "No trigger of this automation uses it (drawn faded)"}"><svg class="legend-mark" width="10" height="12" aria-hidden="true"><line x1="5" x2="5" y1="1" y2="11" class="bus-mark b${Math.min(i, BUS_CLASSES - 1)}"/></svg>${esc(kindLabel(localize, lane.domain, k))}</span>`)
             .join(" ")
         : "";
     return `
@@ -7550,7 +7550,8 @@ class EventSimulatorPanel extends Base {
       svg.hints, svg.fires, svg.bus { background: var(--secondary-background-color); border-radius: 4px; }
       .bus-mark { stroke-width: 2; stroke-linecap: round; }
       .lane-mark.used { stroke-width: 4; }
-      .lane-mark.dim, .legend-item.dim { opacity: 0.35; }
+      .lane-mark.dim { opacity: 0.35; }
+      .lane-legend .legend-item.used { color: var(--primary-text-color); font-weight: 500; }
       .lane-notice { color: var(--warning-color, #ff9800); }
       .lane-sel { fill: none; stroke: var(--primary-text-color); stroke-width: 1; }
       .lane-edited { fill: var(--accent-color, #ff9800); }
