@@ -12,7 +12,7 @@
 
 **Tracking issue:** me/hass-event-simulator#48 — comment progress there as tasks land.
 
-**Status (2026-10-16):** Tasks 1–6 done (66b39fd, b558724, ebdfb53, cf90b98, 9e8075c, 7edb1d9) plus the final-review fix pass (a0e4add). Task 6 deviates toward the spec: lanes' events are always saved, not only when edited. Task 7 waits for the user's go-ahead to deploy to the live instance.
+**Status (2026-10-16):** Tasks 1–6 done (66b39fd, b558724, ebdfb53, cf90b98, 9e8075c, 7edb1d9) plus the final-review fix pass (a0e4add). Task 6 deviates toward the spec: lanes' events are always saved, not only when edited. Task 7: the user deployed it to the live instance; #48 closed.
 
 ## Global Constraints
 
@@ -360,6 +360,6 @@ git commit -m "feat(store): save edited presses and event lanes with a scenario"
 
 **Files:** none (verification only).
 
-- [ ] **Step 1:** Ask the user before copying `custom_components/event_simulator/` into `~/.config/homeassistant/custom_components/` and restarting Home Assistant: it is outside this repo and restarts their live instance.
-- [ ] **Step 2:** With their go-ahead, open "Outdoot String Light Switch", window 2026-10-15 17:50–18:30 local. Expected (spec success criteria): one device lane "Outdoor String Lights Button" with 8 presses, 5 ringed; Run gives five `fired` runs at the short presses, trigger platform `device`, none at the double presses. Drag, add long, change double→short, undo, save, reload: as in Task 5 and 6.
-- [ ] **Step 3:** Record the outcome on #48 and in this plan; close #48.
+- [x] **Step 1:** Ask the user before copying `custom_components/event_simulator/` into `~/.config/homeassistant/custom_components/` and restarting Home Assistant: it is outside this repo and restarts their live instance.
+- [x] **Step 2:** With their go-ahead, open "Outdoot String Light Switch", window 2026-10-15 17:50–18:30 local. Expected (spec success criteria): one device lane "Outdoor String Lights Button" with 8 presses, 5 ringed; Run gives five `fired` runs at the short presses, trigger platform `device`, none at the double presses. Drag, add long, change double→short, undo, save, reload: as in Task 5 and 6.
+- [x] **Step 3:** Record the outcome on #48 and in this plan; close #48.
