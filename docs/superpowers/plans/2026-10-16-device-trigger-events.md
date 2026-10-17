@@ -12,6 +12,8 @@
 
 **Tracking issue:** me/hass-event-simulator#48 — comment progress there as tasks land.
 
+**Status (2026-10-16):** Tasks 1–6 done (66b39fd, b558724, ebdfb53, cf90b98, 9e8075c, 7edb1d9) plus the final-review fix pass (a0e4add). Task 6 deviates toward the spec: lanes' events are always saved, not only when edited. Task 7 waits for the user's go-ahead to deploy to the live instance.
+
 ## Global Constraints
 
 - No monkeypatching of core or integration code in the live process, and no stand-in `hass` handed to integration code there. The live half may only read data an integration already keeps.
@@ -70,9 +72,9 @@
 - Produces: `scripts/integration_requirements.py <domain>` prints one requirement per line.
 - Produces: pytest fixture/marker `requires_zha` in `tests/conftest.py`: skips when `zha` is not importable, fails instead when `EVENT_SIMULATOR_REQUIRE_ZHA=1`.
 
-- [ ] **Step 1: Test setup.** Write `scripts/integration_requirements.py`: load the installed HA's `homeassistant/components/<domain>/manifest.json`, collect `requirements` of it and, recursively, of its `dependencies` and `after_dependencies`, print them deduplicated. Install into the venv: `.venv/bin/pip install $(.venv/bin/python scripts/integration_requirements.py zha)`. Check: `.venv/bin/python -c "import homeassistant.components.zha.device_trigger"` exits 0. In `test.yml`, after installing the frontend, add the same install with `$(python scripts/integration_requirements.py zha)`, and set `EVENT_SIMULATOR_REQUIRE_ZHA: "1"` on the pytest step.
+- [x] **Step 1: Test setup.** Write `scripts/integration_requirements.py`: load the installed HA's `homeassistant/components/<domain>/manifest.json`, collect `requirements` of it and, recursively, of its `dependencies` and `after_dependencies`, print them deduplicated. Install into the venv: `.venv/bin/pip install $(.venv/bin/python scripts/integration_requirements.py zha)`. Check: `.venv/bin/python -c "import homeassistant.components.zha.device_trigger"` exits 0. In `test.yml`, after installing the frontend, add the same install with `$(python scripts/integration_requirements.py zha)`, and set `EVENT_SIMULATOR_REQUIRE_ZHA: "1"` on the pytest step.
 
-- [ ] **Step 2: Write the failing tests** in `tests/test_engine_device_triggers.py`, all marked `requires_zha`, each scenario run through `run_child` (`tests/test_engine.py`) with `scenario()` (`tests/test_engine_fidelity.py`). Build the `registry` with `history.async_registry_snapshot` in a pytest-homeassistant `hass` holding a `MockConfigEntry(domain="zha")` and a device with `identifiers={("zha", IEEE)}` (pattern: `tests/test_engine_registry.py` `registries`), `IEEE = "a4:c1:38:ad:af:88:68:87"`. `PAYLOAD = {"ieee": IEEE, "triggers": [{"type": t, "subtype": "button_1", "data": {"endpoint_id": 1, "command": t}} for t in ("remote_button_short_press", "remote_button_double_press", "remote_button_long_press")]}`. Presses: `zha_event` with `{device_ieee: IEEE, device_id, unique_id: IEEE + ":1:0x0006", endpoint_id: 1, cluster_id: 6, command, args: [], params: {}}`.
+- [x] **Step 2: Write the failing tests** in `tests/test_engine_device_triggers.py`, all marked `requires_zha`, each scenario run through `run_child` (`tests/test_engine.py`) with `scenario()` (`tests/test_engine_fidelity.py`). Build the `registry` with `history.async_registry_snapshot` in a pytest-homeassistant `hass` holding a `MockConfigEntry(domain="zha")` and a device with `identifiers={("zha", IEEE)}` (pattern: `tests/test_engine_registry.py` `registries`), `IEEE = "a4:c1:38:ad:af:88:68:87"`. `PAYLOAD = {"ieee": IEEE, "triggers": [{"type": t, "subtype": "button_1", "data": {"endpoint_id": 1, "command": t}} for t in ("remote_button_short_press", "remote_button_double_press", "remote_button_long_press")]}`. Presses: `zha_event` with `{device_ieee: IEEE, device_id, unique_id: IEEE + ":1:0x0006", endpoint_id: 1, cluster_id: 6, command, args: [], params: {}}`.
 
 ```python
 def test_zha_device_trigger_fires_on_its_presses(results):
@@ -101,21 +103,21 @@ def test_malformed_device_triggers_is_invalid_scenario(results):
     assert results["malformed"]["error"]["code"] == "invalid_scenario"   # device_triggers = {"zha": {DEVICE_ID: {"ieee": 1}}}
 ```
 
-- [ ] **Step 3: Run to verify they fail**
+- [x] **Step 3: Run to verify they fail**
 
 Run: `.venv/bin/pytest tests/test_engine_device_triggers.py -v`
 Expected: FAIL (`short` refused with `unsupported_automation`).
 
-- [ ] **Step 4: Implement.**
+- [x] **Step 4: Implement.**
   - `sandbox/device_triggers.py`: `parse_device_triggers` accepts `None` (→ `{}`) or `{domain: {device_id: payload}}`; a domain without a seeder is kept out with no error; the ZHA payload is validated (`ieee` str, `triggers` list of `{type: str, subtype: str, data: dict}`). The ZHA seeder: `from homeassistant.components.zha.helpers import get_zha_data` imported inside the function; `get_zha_data(hass).device_trigger_cache[device_id] = (ieee, {(t["type"], t["subtype"]): t["data"] for t in triggers})`.
   - Engine: `_parse_scenario` stores `device_triggers=parse_device_triggers(raw.get("device_triggers"))`. In `run`, call `device_triggers.seed(self.hass, self.scenario.device_triggers)` after `_serve_calendars()` and before `_load_automations()`. `_check_platforms(hass, config, device_triggers)`: for a node with `trigger: device` / `platform: device` whose integration is not an entity domain, allow it when `domain in SEEDERS and node["device_id"] in device_triggers.get(domain, {})`; else refuse with `"{path}: device triggers from '{domain}' are not supported yet"` (no seeder) or `"{path}: '{domain}' had no trigger data for device {device_id}"` (seeder, no payload). Conditions and actions keep today's message. Add `device_triggers` to the module docstring's timeline step 2 and to the scenario format in `docs/superpowers/specs/2026-10-05-event-simulator-design.md`.
 
-- [ ] **Step 5: Run to verify they pass**, plus the whole suite (the old refusal message test in `tests/test_engine_registry.py` may need the new wording).
+- [x] **Step 5: Run to verify they pass**, plus the whole suite (the old refusal message test in `tests/test_engine_registry.py` may need the new wording).
 
 Run: `.venv/bin/pytest -q`
 Expected: all pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add custom_components/event_simulator/sandbox scripts/integration_requirements.py .github/workflows/test.yml tests/conftest.py tests/test_engine_device_triggers.py tests/test_engine_registry.py docs/superpowers/specs/2026-10-05-event-simulator-design.md
@@ -133,7 +135,7 @@ git commit -m "feat(sandbox): replay zha device triggers from their trigger data
 - Consumes: payload shape from Task 1.
 - Produces: `device_triggers.async_device_lanes(hass, config: dict) -> {"lanes": [DeviceLane], "unsupported": [Unsupported]}`; `device_triggers.async_export(hass, config: dict) -> dict[str, dict[str, Any]]` (the scenario's `device_triggers`); `device_triggers.ADAPTERS: dict[str, Adapter]`, where an adapter module exposes `export(hass, device_id) -> payload` (raises `KeyError` for no data, `device_triggers.Unreadable(Exception)` when ZHA's private lookup is missing) and `kinds(payload) -> list[dict]` (Kind without `used`). Websocket: `event_simulator/device_lanes` `{automation: dict | str}` → the `async_device_lanes` result (YAML parsed with `parse_automation_yaml`).
 
-- [ ] **Step 1: Write the failing tests** (`requires_zha`). Seed live ZHA data without a gateway: `get_zha_data(hass).device_trigger_cache[device.id] = (IEEE, {(…): {...}})` with a zha `MockConfigEntry` and registry device named "Outdoor String Lights Button".
+- [x] **Step 1: Write the failing tests** (`requires_zha`). Seed live ZHA data without a gateway: `get_zha_data(hass).device_trigger_cache[device.id] = (IEEE, {(…): {...}})` with a zha `MockConfigEntry` and registry device named "Outdoor String Lights Button".
 
 ```python
 async def test_lanes_name_the_device_and_flag_used_kinds(hass, button):
@@ -169,19 +171,19 @@ async def test_simulate_fills_device_triggers(hass, hass_ws_client, button):  # 
     assert captured["device_triggers"] == {"zha": {button.id: ANY}}
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `.venv/bin/pytest tests/test_device_triggers.py -v`
 Expected: FAIL (`ModuleNotFoundError: device_triggers`).
 
-- [ ] **Step 3: Implement.** Device triggers are found by walking the config for mappings with `trigger`/`platform` == `"device"` and a `domain` that is not an entity domain (reuse the engine's notion: integration type `"entity"` is generic; use `async_get_integration`). `zha.export` calls `homeassistant.components.zha.device_trigger._get_device_trigger_data(hass, device_id)` (imported inside the function; `AttributeError`/`ImportError` → `Unreadable`), returning `{"ieee": ieee, "triggers": [{"type": t, "subtype": s, "data": d} ...]}` in the dict's order. `zha.kinds` gives `event_type: "zha_event"`, `match: {"device_ieee": ieee, **data}`. Lane `name` is the device registry's `name_by_user or name`. `async_simulate` does `scenario.setdefault("device_triggers", await device_triggers.async_export(hass, scenario["automation"]))` after the YAML parse.
+- [x] **Step 3: Implement.** Device triggers are found by walking the config for mappings with `trigger`/`platform` == `"device"` and a `domain` that is not an entity domain (reuse the engine's notion: integration type `"entity"` is generic; use `async_get_integration`). `zha.export` calls `homeassistant.components.zha.device_trigger._get_device_trigger_data(hass, device_id)` (imported inside the function; `AttributeError`/`ImportError` → `Unreadable`), returning `{"ieee": ieee, "triggers": [{"type": t, "subtype": s, "data": d} ...]}` in the dict's order. `zha.kinds` gives `event_type: "zha_event"`, `match: {"device_ieee": ieee, **data}`. Lane `name` is the device registry's `name_by_user or name`. `async_simulate` does `scenario.setdefault("device_triggers", await device_triggers.async_export(hass, scenario["automation"]))` after the YAML parse.
 
-- [ ] **Step 4: Run to verify they pass**, then the full suite.
+- [x] **Step 4: Run to verify they pass**, then the full suite.
 
 Run: `.venv/bin/pytest -q`
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add custom_components/event_simulator/device_triggers custom_components/event_simulator/websocket.py tests/test_device_triggers.py
@@ -209,7 +211,7 @@ git commit -m "feat(device_triggers): read zha trigger data for lanes and replay
   - `busEventsMessage(start, end, types?: string[])` adds `event_types` when given; `deviceLanesMessage(automation) -> {type: "event_simulator/device_lanes", automation}`.
   - `buildScenario({..., lanes = null})`: when `lanes` is given, `bus_events` = every lane's events (marks stripped, sorted by time); otherwise today's behavior.
 
-- [ ] **Step 1: Write the failing tests** in `tests/panel/lanes.test.mjs` with the user's presses (short ×3 at 17:57:51/57/58:03, double ×3 at 58:07/10/13, short ×2 at 18:23:22/36, plus `attribute_updated` and `press_type` events of the same device, and a `zha_event` of another device):
+- [x] **Step 1: Write the failing tests** in `tests/panel/lanes.test.mjs` with the user's presses (short ×3 at 17:57:51/57/58:03, double ×3 at 58:07/10/13, short ×2 at 18:23:22/36, plus `attribute_updated` and `press_type` events of the same device, and a `zha_event` of another device):
 
 ```js
 test("a device lane holds only its kinds' events", () => {
@@ -249,19 +251,19 @@ test("laneTypes asks for device and plain types once", () => { /* ["tag_scanned"
 
 Add to `busevents.test.mjs`: `busEventsMessage(T0, T1, ["zha_event"])` carries `event_types: ["zha_event"]`.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `node --test tests/panel/lanes.test.mjs tests/panel/busevents.test.mjs`
 Expected: FAIL (`buildLanes` is not exported).
 
-- [ ] **Step 3: Implement** the functions above.
+- [x] **Step 3: Implement** the functions above.
 
-- [ ] **Step 4: Run to verify they pass**, plus the whole panel suite and `node --check`.
+- [x] **Step 4: Run to verify they pass**, plus the whole panel suite and `node --check`.
 
 Run: `node --check custom_components/event_simulator/panel/event-simulator-panel.js && node --test tests/panel/*.test.mjs`
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add custom_components/event_simulator/panel/event-simulator-panel.js tests/panel/lanes.test.mjs tests/panel/busevents.test.mjs
@@ -278,20 +280,20 @@ git commit -m "feat(panel): lane model for device presses and event-trigger even
 - Consumes: Task 3 functions; `event_simulator/device_lanes` from Task 2.
 - Produces: component state `this._deviceLanes` (last `device_lanes` answer), `this._lanes` (Lane[]), `this._lane(id)`; exported `deviceTriggerKey(automation) -> string` (stable string of the config's device triggers, `""` when none) used to refetch lanes only when it changes.
 
-- [ ] **Step 1: Write the failing test**: `deviceTriggerKey` is equal for configs differing only outside device triggers, and differs when a device trigger's `type` changes (Review Focus: edited trigger).
+- [x] **Step 1: Write the failing test**: `deviceTriggerKey` is equal for configs differing only outside device triggers, and differs when a device trigger's `type` changes (Review Focus: edited trigger).
 
-- [ ] **Step 2: Run to verify it fails** (`node --test tests/panel/lanes.test.mjs`).
+- [x] **Step 2: Run to verify it fails** (`node --test tests/panel/lanes.test.mjs`).
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - After an automation loads and whenever `deviceTriggerKey(this._runConfig())` changes, call `device_lanes` (latest answer wins, as `_busKey` does) and store `lanes`/`unsupported`.
   - `_loadBusEvents` requests `laneTypes(...)` (skip the request when empty in Replay mode; Suggest mode keeps requesting all types) and keeps `dropped_event_types`.
   - In Replay mode, rebuild `this._lanes` with `buildLanes` when lanes, filters, bus events or the window change, keeping edited lanes (match by `id`) unless the window changed. Draw one row per lane in place of the single Events row: device lane header = name, integration, `"8 presses · 5 trigger this automation"`; event lane header = event type and count. Marks: per-kind color within the lane (`bus-mark b{index}` classes), ringed when `used`, dimmed otherwise; tooltip = kind label, time, data. Kind labels: `hass.localize(`component.${domain}.device_automation.trigger_type.${type}`)` and `...trigger_subtype.${subtype}` after `hass.loadBackendTranslation("device_automation", domain)`, falling back to the raw strings. Show `laneView(...).notice` in the lane. List `unsupported` entries with the results' warnings as "Device trigger at triggers/0 (hue) can't be replayed: …".
   - Suggest mode keeps today's read-only all-types Events row.
   - The replay sends `buildScenario({..., lanes: this._lanes})`.
 
-- [ ] **Step 4: Verify.** `node --check` and `node --test tests/panel/*.test.mjs` pass. Then in a browser against a dev HA (the `run` skill, or the project's usual dev instance) with the Task 1 scenario data, confirm the lane draws and Run gives runs at the short presses. Note what was checked in the commit body if anything could not be.
+- [x] **Step 4: Verify.** `node --check` and `node --test tests/panel/*.test.mjs` pass. Then in a browser against a dev HA (the `run` skill, or the project's usual dev instance) with the Task 1 scenario data, confirm the lane draws and Run gives runs at the short presses. Note what was checked in the commit body if anything could not be.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add custom_components/event_simulator/panel/event-simulator-panel.js tests/panel/lanes.test.mjs
@@ -308,19 +310,19 @@ git commit -m "feat(panel): draw device and event-trigger lanes and replay them"
 - Consumes: Tasks 3–4.
 - Produces: lane rows are `svg[data-row="lane"][data-lane="<id>"]`; `_commit(label, changes, select)` accepts changes `{lane_id, timeline}` as well as `{entity_id, timeline}` and snapshots both in one undo entry; selection `{lane_id, index}`; exported `deviceEventKind(lane, index, kind) -> timeline` (replaces the event's data with `newDeviceEvent`'s data for that kind, keeping `at`).
 
-- [ ] **Step 1: Write the failing tests**: `deviceEventKind` changes a double press to a short press (data `command` becomes `remote_button_short_press`, `edited: true`, same `at`); `updateBusEvent` with invalid JSON is refused by the editor's parser (reuse `parseAttributes`-style `{ok:false, error}` for data text).
+- [x] **Step 1: Write the failing tests**: `deviceEventKind` changes a double press to a short press (data `command` becomes `remote_button_short_press`, `edited: true`, same `at`); `updateBusEvent` with invalid JSON is refused by the editor's parser (reuse `parseAttributes`-style `{ok:false, error}` for data text).
 
-- [ ] **Step 2: Run to verify they fail.**
+- [x] **Step 2: Run to verify they fail.**
 
-- [ ] **Step 3: Implement**, mirroring state tracks exactly:
+- [x] **Step 3: Implement**, mirroring state tracks exactly:
   - Drag a mark → `shiftEvent` (snaps, never passes a neighbor). Drag the lane / Shift-drag → `shiftTrack`, with the offset chip and Unshift. Double-click / double-tap on a lane → device lane: a kind picker then `newDeviceEvent` + `insertBusEvent`; event lane: copy of the nearest event's data via `insertBusEvent`, opened in the editor.
   - Click a mark → editor: time (typed → `moveEvent`), device lane kind select (→ `deviceEventKind`) with a note "data copied from the press at …" or "only the trigger's match data", event lane data as JSON (→ `updateBusEvent`), Delete (→ `deleteEvent`).
   - Reset lane / Reset all include lanes (`timeline: lane.recorded`); every commit marks results stale (Auto-run).
   - README "Edit the timeline": a paragraph on device lanes and event lanes, what ringed/dimmed means, and that only device triggers with an adapter (ZHA today) get a device lane.
 
-- [ ] **Step 4: Verify.** `node --test tests/panel/*.test.mjs` passes. In the browser: drag a short press (its run moves), add a long press (no new run), change a double to short (a new run), undo each, Reset all.
+- [x] **Step 4: Verify.** `node --test tests/panel/*.test.mjs` passes. In the browser: drag a short press (its run moves), add a long press (no new run), change a double to short (a new run), undo each, Reset all.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add custom_components/event_simulator/panel/event-simulator-panel.js tests/panel README.md
@@ -337,17 +339,17 @@ git commit -m "feat(panel): move, add, change and delete presses and events"
 - Consumes: Lane shape; `restoreShift`, `adoptRecorded`.
 - Produces: saved scenario keys `bus_events: [{at, event_type, data, edited?}]` (plain list, at most `MAX_BUS_EVENTS`) and `lane_shifts: {lane_id: {offset}}`; `scenarioPayload({..., lanes = []})` writes them only when some lane is edited; exported `lanesFromScenario(scenario) -> {events: BusEvent[], shifts: object} | null` (`null` for a scenario saved before this change); bus events count toward the store's 500,000-event total.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `test_store.py`: a save with `bus_events` and `lane_shifts` round-trips through `scenarios/get`; a save with more than `MAX_BUS_EVENTS` bus events is `too_large`; a stored scenario without the keys still loads.
   - `scenarios.test.mjs`: `scenarioPayload` with an edited lane includes `bus_events` with `edited` marks and `lane_shifts`; without edits it has neither; `lanesFromScenario({})` is `null`; after load, unedited events are adopted from the recorded lane (`adoptRecorded`) so the lane is not marked edited.
 
-- [ ] **Step 2: Run to verify they fail** (`.venv/bin/pytest tests/test_store.py -q`, `node --test tests/panel/scenarios.test.mjs`).
+- [x] **Step 2: Run to verify they fail** (`.venv/bin/pytest tests/test_store.py -q`, `node --test tests/panel/scenarios.test.mjs`).
 
-- [ ] **Step 3: Implement.** On load, when `lanesFromScenario` is not `null`, each rebuilt lane takes the saved events of its id's ownership (re-run `buildLanes` over the saved events), `restoreShift` with its saved offset, then `adoptRecorded` against the lane built from the recorder.
+- [x] **Step 3: Implement.** On load, when `lanesFromScenario` is not `null`, each rebuilt lane takes the saved events of its id's ownership (re-run `buildLanes` over the saved events), `restoreShift` with its saved offset, then `adoptRecorded` against the lane built from the recorder.
 
-- [ ] **Step 4: Run to verify they pass**, then `.venv/bin/pytest -q` and `node --test tests/panel/*.test.mjs`.
+- [x] **Step 4: Run to verify they pass**, then `.venv/bin/pytest -q` and `node --test tests/panel/*.test.mjs`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add custom_components/event_simulator/store.py custom_components/event_simulator/panel/event-simulator-panel.js tests/test_store.py tests/panel/scenarios.test.mjs
