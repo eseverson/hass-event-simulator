@@ -695,7 +695,7 @@ function stripMarks(item) {
 /* The scenario sent to event_simulator/simulate (see the design spec). Events from all
  * tracks merged into one list ordered by time, as the child replays them. `automation`
  * is always the config as an object, edited or not (see the config editor below). */
-export function buildScenario({ automation, start, end, tracks, busEvents = [], calendars = {}, helpers = [] }) {
+export function buildScenario({ automation, start, end, tracks, busEvents = [], calendars = {}, helpers = [], lanes = null }) {
   const initial_states = {};
   const events = [];
   for (const track of tracks) {
@@ -714,8 +714,10 @@ export function buildScenario({ automation, start, end, tracks, busEvents = [], 
     initial_states,
     events,
   };
-  // Recorded bus events, only those the automation's event triggers listen to (#35).
-  const bus = busEventsFor(busEvents, eventTriggerTypes(automation), start, end);
+  // The lanes' bus events (#48), or else the recorded ones the automation's event triggers listen to (#35).
+  const bus = lanes
+    ? lanes.flatMap((l) => l.events.filter((e) => parseTime(e.at) >= start && parseTime(e.at) < end).map(stripMarks)).sort((a, b) => parseTime(a.at) - parseTime(b.at))
+    : busEventsFor(busEvents, eventTriggerTypes(automation), start, end);
   if (bus.length) scenario.bus_events = bus;
   // The events of the calendars the automation's calendar triggers read (#37); a calendar
   // without them serves the events its recorded states name (the child does that).
@@ -788,12 +790,20 @@ export function calendarLane(events, tz, start, end, fmt = (ms) => new Date(ms).
 
 /* Recorded bus events (#35): zha_event, tag_scanned, ... of the window, from the recorder's
  * events table (history.async_get_bus_events), Home Assistant's own bookkeeping left out. */
-export function busEventsMessage(start, end) {
+export function busEventsMessage(start, end, types = null) {
   return {
     type: "event_simulator/bus_events",
     start: new Date(start).toISOString(),
     end: new Date(end).toISOString(),
+    // Only the types the lanes need (#48), so a busy unrelated type cannot crowd them out of the cap.
+    ...(types ? { event_types: types } : {}),
   };
+}
+
+/* The device lanes for a run config, edited or not (#48): `{lanes, unsupported}`, see
+ * device_triggers.async_device_lanes. */
+export function deviceLanesMessage(automation) {
+  return { type: "event_simulator/device_lanes", automation };
 }
 
 /* The event types an automation's event triggers listen to (`trigger: event` or the legacy
@@ -840,6 +850,135 @@ export function busEventLane(events, fmt = (ms) => new Date(ms).toISOString()) {
     return { t, index: indexOf.get(e.event_type), title: [`${e.event_type} ${fmt(t)}`, ...lines].join("\n") };
   });
   return { types, marks };
+}
+
+// ---- lanes: device presses and event-trigger events (#48) (pure) -----------------
+//
+// A lane is a timeline of bus events, `{id, kind, event_type, name, initial: null, events,
+// recorded, shift?}`, edited with the state tracks' own functions (shiftEvent, moveEvent,
+// deleteEvent, adoptRecorded, timelineEdited; shiftLane for shiftTrack). A device lane
+// (`kind: "device"`, id `device:<device_id>`) holds the events of its device's trigger
+// kinds, as event_simulator/device_lanes describes them; an event lane (`kind: "event"`,
+// id `event:<type>`) holds the events of one type a plain event trigger listens to that no
+// device lane took, so every event has one owner and is fired once.
+
+/* Whether event data fits a trigger's `event_data`, as core's event trigger decides: every
+ * key present with an equal value, a nested object matched as a subset in turn. */
+export function matchesData(data, match) {
+  if (!isObject(data)) return false;
+  return Object.entries(match || {}).every(([key, want]) => {
+    if (!(key in data)) return false;
+    if (isObject(want)) return matchesData(data[key], want);
+    return stableStringify(data[key]) === stableStringify(want);
+  });
+}
+
+/* The index of the first kind an event is, or -1. */
+export function kindIndex(kinds, event) {
+  return (kinds || []).findIndex((k) => k.event_type === event.event_type && matchesData(event.data, k.match));
+}
+
+const isTemplate = (v) => typeof v === "string" && (v.includes("{{") || v.includes("{%"));
+const hasTemplate = (v) => (isTemplate(v) ? true : Array.isArray(v) ? v.some(hasTemplate) : isObject(v) ? Object.values(v).some(hasTemplate) : false);
+
+/* The plain event triggers' filters by event type: a Map of type -> [event_data, ...], or
+ * -> null when a trigger of that type has no event_data (it takes every event) or one the
+ * panel cannot evaluate (templated). Templated event types name no lane. */
+export function eventTriggerFilters(automation) {
+  const filters = new Map();
+  const raw = automation?.triggers ?? automation?.trigger ?? [];
+  for (const trigger of asList(raw)) {
+    if (!isObject(trigger) || (trigger.trigger ?? trigger.platform) !== "event") continue;
+    const data = trigger.event_data;
+    const filter = isObject(data) && !hasTemplate(data) ? data : null;
+    for (const type of asList(trigger.event_type)) {
+      if (typeof type !== "string" || isTemplate(type)) continue;
+      const known = filters.get(type);
+      if (known === null) continue;
+      filters.set(type, filter === null ? null : [...(known || []), filter]);
+    }
+  }
+  return filters;
+}
+
+/* The event types the lanes need from event_simulator/bus_events, sorted. */
+export function laneTypes(deviceLanes, filters) {
+  const types = new Set([...(deviceLanes || []).map((l) => l.event_type).filter(Boolean), ...(filters?.keys() || [])]);
+  return [...types].sort();
+}
+
+/* The lanes for a window: a device lane per device (even with no events), then an event lane
+ * per filtered type with the events of that type no device lane took. */
+export function buildLanes({ deviceLanes = [], filters = new Map(), busEvents = [], start, end }) {
+  const inWindow = (busEvents || []).filter((e) => {
+    const t = parseTime(e.at);
+    return t >= start && t < end;
+  });
+  const taken = new Set();
+  const lane = (fields, events) => ({ ...fields, initial: null, events, recorded: { initial: null, events } });
+  const lanes = (deviceLanes || []).map((d) => {
+    const events = inWindow.filter((e) => kindIndex(d.kinds, e) >= 0);
+    for (const e of events) taken.add(e);
+    return lane({ id: d.id, kind: "device", event_type: d.event_type, name: d.name, domain: d.domain, device_id: d.device_id, kinds: d.kinds }, events);
+  });
+  for (const [type, filter] of filters || []) {
+    const events = inWindow.filter((e) => e.event_type === type && !taken.has(e));
+    lanes.push(lane({ id: `event:${type}`, kind: "event", event_type: type, name: type, filters: filter }, events));
+  }
+  return lanes;
+}
+
+/* What a lane draws: one mark per event, with its kind (device lanes; 0 on event lanes) and
+ * whether a trigger of this automation uses it (ringed) or not (dimmed), and the notice for a
+ * type the recorder query left out. */
+export function laneView(lane, { dropped = [] } = {}) {
+  const marks = lane.events.map((e, index) => {
+    const t = parseTime(e.at);
+    const lines = Object.entries(e.data || {}).map(([k, v]) => `${k}: ${v !== null && typeof v === "object" ? JSON.stringify(v) : v}`);
+    if (lane.kind === "device") {
+      const kind = kindIndex(lane.kinds, e);
+      return { t, index, kind, used: !!lane.kinds[kind]?.used, title: lines.join("\n") };
+    }
+    const used = lane.filters == null || lane.filters.some((f) => matchesData(e.data, f));
+    return { t, index, kind: 0, used, title: lines.join("\n") };
+  });
+  const notice = dropped.includes(lane.event_type) ? `${lane.event_type}: too many events in this window to load; shorten the window` : null;
+  return { marks, notice };
+}
+
+/* A new press of kind `kind` on a device lane at t: the data of the recorded press of that
+ * kind nearest to t (so args, cluster_id, ... look real), else the kind's match alone.
+ * Returns {event, copiedFrom: the copied press's `at` | null}. */
+export function newDeviceEvent(lane, kind, t) {
+  const k = lane.kinds[kind];
+  let nearest = null;
+  for (const e of lane.recorded?.events || []) {
+    if (kindIndex(lane.kinds, e) !== kind) continue;
+    if (!nearest || Math.abs(parseTime(e.at) - t) < Math.abs(parseTime(nearest.at) - t)) nearest = e;
+  }
+  const data = nearest ? structuredClone(nearest.data) : structuredClone(k.match);
+  return { event: { at: isoAt(Math.round(t)), event_type: k.event_type, data, edited: true }, copiedFrom: nearest ? nearest.at : null };
+}
+
+/* Add a bus event to a lane (its time clamped into the window). Returns {timeline, index}. */
+export function insertBusEvent(timeline, event, { start, end }) {
+  const at = Math.min(end - 1, Math.max(start, parseTime(event.at)));
+  return insertSorted(timeline, { ...event, at: isoAt(at), edited: true });
+}
+
+/* Replace the data of bus event `index`. */
+export function updateBusEvent(timeline, index, data) {
+  const ev = timeline.events[index];
+  if (!ev) throw new Error("No such event");
+  const events = timeline.events.slice();
+  events[index] = editedEvent(ev, { data });
+  return { ...timeline, events };
+}
+
+/* shiftTrack for a lane: bus events carry no state, so a lane has no state at the start. */
+export function shiftLane(lane, dt, win) {
+  const next = shiftTrack(lane, dt, win);
+  return next === lane ? lane : { ...next, initial: null };
 }
 
 /* Home Assistant's websocket closes the connection on a message over 4 MiB (aiohttp's

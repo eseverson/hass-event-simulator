@@ -7,6 +7,7 @@ import {
   busEventsFor,
   busEventsMessage,
   buildScenario,
+  deviceLanesMessage,
   eventTriggerTypes,
 } from "../../custom_components/event_simulator/panel/event-simulator-panel.js";
 
@@ -26,6 +27,20 @@ test("the bus_events request covers the window", () => {
     start: "2026-10-04T00:00:00.000Z",
     end: "2026-10-05T00:00:00.000Z",
   });
+});
+
+test("the bus_events request can ask for only the types the lanes need (#48)", () => {
+  assert.deepEqual(busEventsMessage(T0, T0 + 24 * H, ["zha_event"]), {
+    type: "event_simulator/bus_events",
+    start: "2026-10-04T00:00:00.000Z",
+    end: "2026-10-05T00:00:00.000Z",
+    event_types: ["zha_event"],
+  });
+});
+
+test("the device_lanes request carries the run config", () => {
+  const automation = { triggers: [], actions: [] };
+  assert.deepEqual(deviceLanesMessage(automation), { type: "event_simulator/device_lanes", automation });
 });
 
 test("an automation's event triggers name the types a replay needs", () => {
