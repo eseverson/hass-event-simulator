@@ -5,6 +5,7 @@ import { test } from "node:test";
 import {
   buildLanes,
   buildScenario,
+  deviceEventKind,
   deviceTriggerKey,
   eventTriggerFilters,
   insertBusEvent,
@@ -13,6 +14,7 @@ import {
   laneTypes,
   laneView,
   matchesData,
+  parseEventData,
   newDeviceEvent,
   shiftLane,
   timelineEdited,
@@ -224,4 +226,22 @@ test("kindLabel uses Home Assistant's own trigger names, else the raw ones", () 
   assert.equal(kindLabel(localize, "zha", BUTTON.kinds[0]), '"First button" pressed');
   assert.equal(kindLabel(localize, "zha", BUTTON.kinds[1]), "remote_button_double_press button_1");
   assert.equal(kindLabel(null, "zha", BUTTON.kinds[0]), "remote_button_short_press button_1");
+});
+
+test("deviceEventKind turns a double press into a short one, keeping its time", () => {
+  const [lane] = lanesOf([BUTTON]);
+  const next = deviceEventKind(lane, 3, 0);
+  assert.equal(next.events[3].at, lane.events[3].at);
+  assert.equal(next.events[3].data.command, SHORT);
+  assert.equal(next.events[3].edited, true);
+  assert.equal(kindIndex(BUTTON.kinds, next.events[3]), 0);
+  assert.equal(deviceEventKind(lane, 3, 1), lane);
+  assert.equal(lane.events[3].data.command, DOUBLE);
+});
+
+test("parseEventData: a JSON object, blank is {}, anything else is refused", () => {
+  assert.deepEqual(parseEventData(' {"tag_id": "front"} '), { ok: true, value: { tag_id: "front" } });
+  assert.deepEqual(parseEventData(""), { ok: true, value: {} });
+  assert.equal(parseEventData("[1]").ok, false);
+  assert.match(parseEventData("{nope").error, /not valid JSON/);
 });

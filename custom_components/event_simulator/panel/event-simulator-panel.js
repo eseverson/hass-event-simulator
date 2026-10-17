@@ -1008,6 +1008,28 @@ export function laneFilters(automation, busEvents) {
   return filters;
 }
 
+/* Device event `index` turned into a press of kind `kind`, at the same time: its data
+ * becomes newDeviceEvent's for that kind. The lane itself when it already is that kind. */
+export function deviceEventKind(lane, index, kind) {
+  const ev = lane.events[index];
+  if (!ev) throw new Error("No such event");
+  if (kindIndex(lane.kinds, ev) === kind) return lane;
+  return updateBusEvent(lane, index, newDeviceEvent(lane, kind, parseTime(ev.at)).event.data);
+}
+
+/* Event data typed as JSON: {ok, value} or {ok: false, error}. Blank means {}. */
+export function parseEventData(text) {
+  const src = String(text ?? "").trim();
+  if (!src) return { ok: true, value: {} };
+  try {
+    const value = JSON.parse(src);
+    if (!isObject(value)) return { ok: false, error: 'Event data must be a JSON object, like {"tag_id": "front"}.' };
+    return { ok: true, value };
+  } catch (e) {
+    return { ok: false, error: `Event data is not valid JSON: ${e.message}` };
+  }
+}
+
 /* shiftTrack for a lane: bus events carry no state, so a lane has no state at the start. */
 export function shiftLane(lane, dt, win) {
   const next = shiftTrack(lane, dt, win);
@@ -2984,6 +3006,13 @@ class EventSimulatorPanel extends Base {
     this._lanes = [];
     this._lanesKey = null;
     this._kindDomains = new Set();
+    // Lane editing: the selected event {lane_id, index}, an add waiting for its kind
+    // {lane_id, t}, the editor's unapplied input, and a drag on a lane (a mark, or the lane).
+    this._laneSel = null;
+    this._laneAdd = null;
+    this._lnDraft = null;
+    this._lnError = null;
+    this._laneDrag = null;
     // Events of the calendars the automation's calendar triggers read, or (Suggest mode) of
     // the calendar tracks (#37): a read-only lane each, and what a replay serves its calendar
     // triggers. `_calKey` is the window and calendars they were loaded for.
@@ -3322,8 +3351,11 @@ class EventSimulatorPanel extends Base {
         if (before && timelineEdited(before, before.recorded)) fresh[i] = { ...fresh[i], events: before.events, ...(before.shift ? { shift: before.shift } : {}) };
       }
     }
+    for (const lane of fresh) lane.edited = timelineEdited(lane, lane.recorded);
     this._lanesKey = key;
     this._lanes = fresh;
+    const sel = this._laneSel && this._lane(this._laneSel.lane_id);
+    if (this._laneSel && (!sel || this._laneSel.index >= sel.events.length)) this._laneSel = null;
     this._markStale();
   }
 
@@ -3500,6 +3532,11 @@ class EventSimulatorPanel extends Base {
 
   _clearEdits() {
     this._undo.clear();
+    this._laneSel = null;
+    this._laneAdd = null;
+    this._lnDraft = null;
+    this._lnError = null;
+    this._laneDrag = null;
     this._sel = null;
     this._selT = null;
     this._edDraft = null;
@@ -3524,14 +3561,25 @@ class EventSimulatorPanel extends Base {
     }
     this._sel = sel;
     this._selT = sel ? t : null;
-    if (sel) this._labelSel = null;
+    if (sel) {
+      this._labelSel = null;
+      this._laneSel = null;
+      this._laneAdd = null;
+    }
   }
 
   /* Replace tracks' timelines as one undoable edit. `changes` is [{entity_id, timeline}];
    * `select` is what to show in the editor afterwards. */
   _commit(label, changes, select = undefined) {
     const snapshots = [];
-    for (const { entity_id, timeline } of changes) {
+    for (const { entity_id, lane_id, timeline } of changes) {
+      if (lane_id) {
+        const lane = this._lane(lane_id);
+        if (!lane || (timeline.events === lane.events && timeline.shift === lane.shift)) continue;
+        snapshots.push({ lane_id, timeline: { events: lane.events, shift: lane.shift } });
+        this._setLaneTimeline(lane, timeline);
+        continue;
+      }
       const track = this._track(entity_id);
       if (!track || (timeline.initial === track.initial && timeline.events === track.events && timeline.shift === track.shift)) continue;
       snapshots.push({ entity_id, timeline: { initial: track.initial, events: track.events, shift: track.shift } });
@@ -3545,6 +3593,14 @@ class EventSimulatorPanel extends Base {
     this._edError = null;
     this._render();
     return true;
+  }
+
+  /* A lane's events and shift replaced (#48). */
+  _setLaneTimeline(lane, timeline) {
+    lane.events = timeline.events;
+    if (timeline.shift) lane.shift = timeline.shift;
+    else delete lane.shift;
+    lane.edited = timelineEdited(lane, lane.recorded);
   }
 
   /* A track's timeline replaced: its state at the start, its events, and its shift. */
@@ -3569,10 +3625,17 @@ class EventSimulatorPanel extends Base {
       this._notice = `Undid: ${entry.label}.`;
       return this._render();
     }
-    for (const { entity_id, timeline } of entry.snapshots) {
+    for (const { entity_id, lane_id, timeline } of entry.snapshots) {
+      if (lane_id) {
+        const lane = this._lane(lane_id);
+        if (lane) this._setLaneTimeline(lane, timeline);
+        continue;
+      }
       const track = this._track(entity_id);
       if (track) this._setTimeline(track, timeline);
     }
+    const laneSel = this._laneSel && this._lane(this._laneSel.lane_id);
+    if (this._laneSel && (!laneSel || this._laneSel.index >= laneSel.events.length)) this._laneSel = null;
     // Indexes may point elsewhere now; keep the selection only if it still exists.
     const sel = this._sel && this._track(this._sel.entity_id);
     if (sel && this._sel.index >= sel.events.length) this._select(null);
@@ -3582,12 +3645,14 @@ class EventSimulatorPanel extends Base {
     this._render();
   }
 
-  _resetTracks(entityIds) {
+  _resetTracks(entityIds, laneIds = []) {
     const changes = entityIds
       .map((id) => this._track(id))
       .filter((t) => t?.edited)
       .map((t) => ({ entity_id: t.entity_id, timeline: t.recorded }));
-    const label = entityIds.length === 1 ? `reset ${entityIds[0]}` : "reset all tracks";
+    for (const lane of laneIds.map((id) => this._lane(id)).filter((l) => l?.edited)) changes.push({ lane_id: lane.id, timeline: lane.recorded });
+    const one = entityIds.length + laneIds.length === 1;
+    const label = one ? `reset ${entityIds[0] ?? this._lane(laneIds[0])?.name ?? laneIds[0]}` : "reset all tracks";
     const notice = this._notice;
     this._notice = `Back to recorded history (${label}). Undo brings the edits back.`;
     if (!this._commit(label, changes, null)) this._notice = notice;
@@ -5194,7 +5259,7 @@ class EventSimulatorPanel extends Base {
             </div>
             <div class="edits">
               <button data-action="undo" ${this._undo.size ? "" : "disabled"} title="${esc(this._undo.peek() ? `Undo: ${this._undo.peek().label}` : "Nothing to undo")}">Undo</button>
-              <button data-action="reset-all" ${this._tracks.some((t) => t.edited) ? "" : "disabled"} title="Put every track back to its recorded history">Reset all</button>
+              <button data-action="reset-all" ${this._tracks.some((t) => t.edited) || this._lanes.some((l) => l.edited) ? "" : "disabled"} title="Put every track back to its recorded history">Reset all</button>
             </div>
             <div class="add">
               <input id="add-track" list="entity-ids" placeholder="Add track: entity id" autocomplete="off" spellcheck="false">
@@ -5210,7 +5275,7 @@ class EventSimulatorPanel extends Base {
             <div id="label-pop" class="label-pop" hidden></div>
             <div id="hint-pop" class="label-pop" hidden></div>
           </div>
-          ${this._labelSel ? this._labelEditorHtml() : this._editorHtml()}
+          ${this._labelSel ? this._labelEditorHtml() : this._laneSel || this._laneAdd ? this._laneEditorHtml() : this._editorHtml()}
           ${this._tracks.length === 0 && !this._loading
             ? this._mode === "suggest"
               ? `<div class="empty">Add the entities to learn from with Add track above, or seed them from an automation.</div>`
@@ -5436,7 +5501,11 @@ class EventSimulatorPanel extends Base {
   /* A device lane or an event-trigger lane (#48): one tick per event, a color per kind,
    * ringed when a trigger of this automation uses it and dimmed when not. */
   _laneRow(lane, scale) {
-    const view = laneView(lane, { dropped: this._busDropped });
+    const d = this._laneDrag?.lane_id === lane.id && this._laneDrag.moved ? this._laneDrag : null;
+    const shown = d?.preview ? { ...lane, ...d.preview } : lane;
+    const shifting = !!d && d.index === null;
+    const view = laneView(shown, { dropped: this._busDropped });
+    const selected = this._laneSel?.lane_id === lane.id ? this._laneSel.index : null;
     const localize = this._hass?.localize?.bind(this._hass);
     let out = this._gridLines(scale, BUS_H);
     for (const m of view.marks) {
@@ -5444,10 +5513,20 @@ class EventSimulatorPanel extends Base {
       const x = scale.toX(m.t).toFixed(1);
       const what = lane.kind === "device" ? (m.kind >= 0 ? kindLabel(localize, lane.domain, lane.kinds[m.kind]) : "other") : lane.event_type;
       const title = [`${what} ${this._clock.full(m.t)}`, m.title].filter(Boolean).join("\n");
+      const ev = shown.events[m.index];
+      if (m.index === selected) out += `<rect x="${(scale.toX(m.t) - 5).toFixed(1)}" y="1" width="10" height="${BUS_H - 2}" rx="2" class="lane-sel"/>`;
+      if (ev?.edited) out += `<circle cx="${x}" cy="3" r="2.5" class="lane-edited"/>`;
       out += `<line x1="${x}" x2="${x}" y1="3" y2="${BUS_H - 3}" class="bus-mark lane-mark b${Math.min(Math.max(m.kind, 0), BUS_CLASSES - 1)}${m.used ? " used" : " dim"}" data-index="${m.index}"><title>${esc(title)}</title></line>`;
     }
-    const n = lane.events.length;
+    const n = shown.events.length;
     const used = view.marks.filter((m) => m.used).length;
+    const offset = trackOffset(shown);
+    const [before, after] = parkedCounts(shown);
+    const parked = before + after;
+    const shiftChip =
+      offset || parked || shifting
+        ? `<span class="chip shift${shifting ? " live" : ""}" title="${esc(`Every event on this lane moved by ${formatOffset(offset)}${parked ? `; ${parked} now outside the window, left out of the replay but kept` : ""}`)}">shifted ${esc(formatOffset(offset))}${parked ? ` · ${parked} outside` : ""}</span>${shifting || !offset ? "" : ` <button class="link" data-action="unshift-lane" data-lane="${esc(lane.id)}">Unshift</button>`}`
+        : "";
     let meta;
     if (lane.kind === "device") meta = `${n} press${n === 1 ? "" : "es"} · ${used} trigger${used === 1 ? "s" : ""} this automation`;
     else meta = lane.filters == null ? `${n} event${n === 1 ? "" : "s"}` : `${n} event${n === 1 ? "" : "s"} · ${used} match${used === 1 ? "es" : ""} its trigger`;
@@ -5462,10 +5541,12 @@ class EventSimulatorPanel extends Base {
         <div class="track-head">
           <span class="name">${esc(lane.name)}</span>
           ${lane.kind === "device" ? `<span class="eid mono">${esc(lane.domain)}</span>` : `<span class="eid mono">event trigger</span>`}
+          ${lane.edited ? `<span class="chip edited">edited</span> <button class="link" data-action="reset-lane" data-lane="${esc(lane.id)}" title="Put this lane back to its recorded events">Reset</button>` : ""}
+          ${shiftChip}
           <span class="meta">${meta}${view.notice ? ` · <span class="lane-notice">${esc(view.notice)}</span>` : ""}</span>
         </div>
         ${legend ? `<div class="lane-legend small">${legend}</div>` : ""}
-        <svg class="bus lane" data-row="lane" data-lane="${esc(lane.id)}" width="${scale.width}" height="${BUS_H}">${out}</svg>
+        <svg class="bus lane${lane.edited ? " is-edited" : ""}${shifting ? " shifting" : ""}" data-row="lane" data-lane="${esc(lane.id)}" width="${scale.width}" height="${BUS_H}">${out}</svg>
       </div>`;
   }
 
@@ -6162,6 +6243,7 @@ class EventSimulatorPanel extends Base {
     if (!ev.target.closest?.("svg")) return;
     const row = ev.target.closest("svg[data-row]")?.dataset.row;
     if (this._mode === "suggest" && (row === "labels" || row === "axis")) return this._onLabelDown(ev, row);
+    if (row === "lane") return this._onLaneDown(ev);
     const hit = ev.target.closest("svg[data-row=track]") ? this._trackAt(ev) : null;
     // A mark is a handle for that one change; Shift + drag shifts the track from anywhere.
     const index = hit && !ev.shiftKey ? this._markHit(hit, ev) : null;
@@ -6313,6 +6395,7 @@ class EventSimulatorPanel extends Base {
     }
     const ld = this._labelDrag;
     if (ld && ld.pid === ev.pointerId) return this._onLabelMove(ev, ld);
+    if (this._laneDrag && this._laneDrag.id === ev.pointerId) return this._onLaneMove(ev);
     const moving = this._evDrag;
     if (moving && moving.id === ev.pointerId) {
       const dx = ev.clientX - moving.x;
@@ -6356,6 +6439,7 @@ class EventSimulatorPanel extends Base {
     }
     const ld = this._labelDrag;
     if (ld && ld.pid === ev.pointerId) return this._onLabelUp(ld);
+    if (this._laneDrag && this._laneDrag.id === ev.pointerId) return this._onLaneUp(ev);
     const moving = this._evDrag;
     if (moving && moving.id === ev.pointerId) {
       this._evDrag = null;
@@ -6420,6 +6504,249 @@ class EventSimulatorPanel extends Base {
       this._render();
       this.shadowRoot.getElementById("tl-wrap")?.focus({ preventScroll: true });
     }
+  }
+
+  // ---- lane editing (#48) ------------------------------------------------------
+  //
+  // As on state tracks: drag a mark to move that event, drag the lane (or Shift-drag) to
+  // shift all of it, tap a mark to edit it, tap twice on the lane to add one.
+
+  /* The lane under the pointer, its x and time, and the mark within reach (an index). */
+  _laneAt(ev) {
+    const svg = this._rowAt(ev.clientX, ev.clientY);
+    const lane = svg?.dataset.row === "lane" && this._lane(svg.dataset.lane);
+    if (!lane) return null;
+    const x = ev.clientX - svg.getBoundingClientRect().left;
+    const scale = this._scale();
+    const reach = ev.pointerType === "touch" ? 14 : 6;
+    const candidates = lane.events.map((e, index) => ({ x: scale.toX(parseTime(e.at)), index }));
+    return { lane, x, t: scale.toT(x), mark: findNearest(candidates, x, reach)?.index ?? null };
+  }
+
+  _onLaneDown(ev) {
+    const hit = this._laneAt(ev);
+    if (!hit) return;
+    const index = ev.shiftKey ? null : hit.mark;
+    this._laneDrag = { id: ev.pointerId, lane_id: hit.lane.id, index, x: ev.clientX, from: index !== null ? parseTime(hit.lane.events[index].at) : hit.t, moved: false, preview: null, dt: 0, touch: ev.pointerType === "touch" };
+    ev.currentTarget.setPointerCapture?.(ev.pointerId);
+  }
+
+  _onLaneMove(ev) {
+    const d = this._laneDrag;
+    const lane = this._lane(d.lane_id);
+    if (!lane) return;
+    const dx = ev.clientX - d.x;
+    if (Math.abs(dx) > (d.touch ? 6 : 3)) d.moved = true;
+    if (!d.moved) return;
+    const msPerPx = (this._view[1] - this._view[0]) / this._width;
+    if (d.index !== null) {
+      d.preview = shiftEvent(lane, d.index, d.from + dx * msPerPx, { ...this._editOpts(), step: snapStep(msPerPx) }).timeline;
+    } else {
+      const dt = snapDelta(dx * msPerPx, snapStep(msPerPx));
+      if (dt === d.dt && d.preview) return;
+      d.dt = dt;
+      d.preview = shiftLane(lane, dt, this._editOpts());
+    }
+    this._scheduleTimeline();
+  }
+
+  _onLaneUp(ev) {
+    const d = this._laneDrag;
+    this._laneDrag = null;
+    const lane = this._lane(d.lane_id);
+    if (!lane) return this._scheduleTimeline();
+    if (d.moved) {
+      if (!d.preview || d.preview === lane) return this._scheduleTimeline();
+      if (d.index !== null) {
+        this._laneSel = { lane_id: lane.id, index: d.index };
+        this._lnDraft = null;
+        return this._commit(lane.kind === "device" ? "move press" : "move event", [{ lane_id: lane.id, timeline: d.preview }]);
+      }
+      return this._shiftLaneBy(lane.id, d.dt, d.preview);
+    }
+    if (d.index !== null) {
+      this._selectLaneEvent({ lane_id: lane.id, index: d.index });
+      return;
+    }
+    // A second tap on the same spot adds an event there (see _onPointerUp for why not dblclick).
+    const msPerPx = (this._view[1] - this._view[0]) / this._width;
+    const t = Math.min(this._window.end - 1, Math.max(this._window.start, snapTime(d.from, snapStep(msPerPx), this._clock.offset)));
+    const last = this._lastTap;
+    this._lastTap = { lane_id: lane.id, x: ev.clientX, y: ev.clientY, at: ev.timeStamp };
+    if (last && last.lane_id === lane.id && ev.timeStamp - last.at < 450 && Math.abs(ev.clientX - last.x) < 8 && Math.abs(ev.clientY - last.y) < 8) {
+      this._lastTap = null;
+      return this._addLaneEvent(lane, t);
+    }
+    this._selectLaneEvent(null);
+  }
+
+  _selectLaneEvent(sel) {
+    this._laneSel = sel;
+    this._laneAdd = null;
+    this._lnDraft = null;
+    this._lnError = null;
+    if (sel) {
+      this._sel = null;
+      this._labelSel = null;
+    }
+    this._render();
+  }
+
+  _stepLaneEvent(step) {
+    const lane = this._laneSel && this._lane(this._laneSel.lane_id);
+    if (!lane) return;
+    const index = Math.min(lane.events.length - 1, Math.max(0, this._laneSel.index + step));
+    this._selectLaneEvent({ lane_id: lane.id, index });
+  }
+
+  /* Add an event at t: on a device lane, ask which kind first; on an event lane, a copy of
+   * the nearest event's data (or {}), selected so its data can be edited. */
+  _addLaneEvent(lane, t) {
+    if (lane.kind === "device") {
+      this._laneSel = null;
+      this._laneAdd = { lane_id: lane.id, t };
+      this._sel = null;
+      this._labelSel = null;
+      return this._render();
+    }
+    let nearest = null;
+    for (const e of lane.events) if (!nearest || Math.abs(parseTime(e.at) - t) < Math.abs(parseTime(nearest.at) - t)) nearest = e;
+    const event = { at: isoAt(t), event_type: lane.event_type, data: nearest ? structuredClone(nearest.data) : {} };
+    const { timeline, index } = insertBusEvent(lane, event, this._editOpts());
+    this._laneSel = { lane_id: lane.id, index };
+    this._lnDraft = null;
+    this._commit("add event", [{ lane_id: lane.id, timeline }]);
+  }
+
+  _addDeviceEvent(kind) {
+    const add = this._laneAdd;
+    const lane = add && this._lane(add.lane_id);
+    if (!lane || !lane.kinds[kind]) return;
+    const { event, copiedFrom } = newDeviceEvent(lane, kind, add.t);
+    const { timeline, index } = insertBusEvent(lane, event, this._editOpts());
+    this._laneAdd = null;
+    this._laneSel = { lane_id: lane.id, index };
+    this._lnDraft = null;
+    this._notice = copiedFrom ? `The new press copies the data of the recorded press at ${this._fullTime(parseTime(copiedFrom))}.` : "No press of that kind was recorded in this window, so the new one carries only the data its trigger matches.";
+    this._commit("add press", [{ lane_id: lane.id, timeline }]);
+  }
+
+  _deleteLaneEvent() {
+    const sel = this._laneSel;
+    const lane = sel && this._lane(sel.lane_id);
+    if (!lane || !lane.events[sel.index]) return;
+    const timeline = deleteEvent(lane, sel.index);
+    this._laneSel = timeline.events.length ? { lane_id: lane.id, index: Math.max(0, sel.index - 1) } : null;
+    this._lnDraft = null;
+    this._commit(lane.kind === "device" ? "delete press" : "delete event", [{ lane_id: lane.id, timeline }]);
+  }
+
+  _keepLaneDraft() {
+    // Kept so a re-render (a run finishing) does not wipe unapplied input.
+    const value = (name) => this.shadowRoot.getElementById(name)?.value;
+    this._lnDraft = { key: `${this._laneSel.lane_id}#${this._laneSel.index}`, time: value("ln-time"), kind: value("ln-kind"), data: value("ln-data") };
+  }
+
+  /* Apply the lane editor: the kind (device lane) or the data (event lane), then the time. */
+  _applyLaneEditor() {
+    const sel = this._laneSel;
+    const lane = sel && this._lane(sel.lane_id);
+    if (!lane || !lane.events[sel.index]) return;
+    const root = this.shadowRoot;
+    const fail = (message) => {
+      this._lnError = message;
+      this._render();
+    };
+    let timeline = lane;
+    let index = sel.index;
+    if (lane.kind === "device") {
+      const kind = Number(root.getElementById("ln-kind")?.value);
+      if (Number.isInteger(kind) && kind >= 0) timeline = deviceEventKind({ ...lane, ...timeline }, index, kind);
+    } else {
+      const data = parseEventData(root.getElementById("ln-data")?.value);
+      if (!data.ok) return fail(data.error);
+      if (stableStringify(data.value) !== stableStringify(lane.events[index].data)) timeline = updateBusEvent(timeline, index, data.value);
+    }
+    const typed = this._clock.fromInput(root.getElementById("ln-time")?.value ?? "");
+    if (!Number.isFinite(typed)) return fail("The time is not valid.");
+    try {
+      ({ timeline, index } = moveEvent(timeline, index, typed, this._editOpts()));
+    } catch (e) {
+      return fail(e.message);
+    }
+    this._lnError = null;
+    this._lnDraft = null;
+    this._laneSel = { lane_id: lane.id, index };
+    if (timeline.events === lane.events) return this._render();
+    this._commit(lane.kind === "device" ? "edit press" : "edit event", [{ lane_id: lane.id, timeline }]);
+  }
+
+  /* Shift a whole lane by dt ms as one undoable edit. */
+  _shiftLaneBy(laneId, dt, timeline = null) {
+    const lane = this._lane(laneId);
+    if (!lane || !dt) return this._scheduleTimeline();
+    const next = timeline ?? shiftLane(lane, dt, this._editOpts());
+    this._laneSel = null;
+    this._commit(trackOffset(next) === 0 ? "unshift lane" : "shift lane", [{ lane_id: lane.id, timeline: next }]);
+  }
+
+  /* The editor for the selected lane event, or the kind picker of a press being added. */
+  _laneEditorHtml() {
+    const localize = this._hass?.localize?.bind(this._hass);
+    if (this._laneAdd) {
+      const lane = this._lane(this._laneAdd.lane_id);
+      if (!lane) return "";
+      const buttons = lane.kinds.map((k, i) => `<button data-action="ln-add-kind" data-kind="${i}"${k.used ? ' class="primary small-btn"' : ""}>${esc(kindLabel(localize, lane.domain, k))}</button>`).join(" ");
+      return `
+      <div class="editor" id="editor">
+        <div class="editor-head">
+          <strong>${esc(lane.name)}</strong>
+          <span class="muted small">Add a press at ${esc(this._fullTime(this._laneAdd.t))}: which one?</span>
+          <button class="icon close" data-action="ln-close" aria-label="Close editor" title="Close (Esc)">×</button>
+        </div>
+        <div class="editor-actions">${buttons}</div>
+      </div>`;
+    }
+    const sel = this._laneSel;
+    const lane = this._lane(sel.lane_id);
+    const ev = lane?.events[sel.index];
+    if (!ev) return "";
+    const key = `${sel.lane_id}#${sel.index}`;
+    const draft = this._lnDraft?.key === key ? this._lnDraft : null;
+    const t = parseTime(ev.at);
+    const timeValue = draft?.time ?? this._clock.toInput(t, true);
+    const noun = lane.kind === "device" ? "Press" : "Event";
+    const tag = ev.edited ? `<span class="chip edited">edited</span>` : `<span class="chip none">recorded</span>`;
+    let field;
+    if (lane.kind === "device") {
+      const current = draft?.kind != null ? Number(draft.kind) : kindIndex(lane.kinds, ev);
+      const options = lane.kinds.map((k, i) => `<option value="${i}" ${i === current ? "selected" : ""}>${esc(kindLabel(localize, lane.domain, k))}${k.used ? " (triggers this automation)" : ""}</option>`).join("");
+      field = `<label class="fld"><span class="label">Kind</span><select id="ln-kind">${options}</select></label>`;
+    } else {
+      const dataValue = draft?.data ?? JSON.stringify(ev.data || {}, null, 2);
+      field = `<label class="fld grow"><span class="label">Data (JSON)</span><textarea id="ln-data" class="mono" rows="${Math.min(8, Math.max(2, dataValue.split("\n").length))}" spellcheck="false" placeholder="{}">${esc(dataValue)}</textarea></label>`;
+    }
+    return `
+      <div class="editor" id="editor">
+        <div class="editor-head">
+          <button class="icon" data-action="ln-prev" ${sel.index <= 0 ? "disabled" : ""} aria-label="Previous" title="Previous">‹</button>
+          <button class="icon" data-action="ln-next" ${sel.index >= lane.events.length - 1 ? "disabled" : ""} aria-label="Next" title="Next">›</button>
+          <strong>${esc(lane.name)}</strong>
+          <span class="muted small">${noun} ${sel.index + 1} of ${lane.events.length}</span>
+          ${tag}
+          <button class="icon close" data-action="ln-close" aria-label="Close editor" title="Close (Esc)">×</button>
+        </div>
+        <div class="editor-fields">
+          <label class="fld"><span class="label">Time</span><input id="ln-time" type="datetime-local" step="1" value="${esc(timeValue)}"></label>
+          ${field}
+        </div>
+        ${this._lnError ? `<div class="err small">${esc(this._lnError)}</div>` : ""}
+        <div class="editor-actions">
+          <button class="primary small-btn" data-action="ln-apply">Apply</button>
+          <button data-action="ln-delete" title="Delete (Del)">Delete ${noun.toLowerCase()}</button>
+          ${lane.edited ? `<button data-action="reset-lane" data-lane="${esc(lane.id)}">Reset lane to recorded</button>` : ""}
+        </div>
+      </div>`;
   }
 
   /* Shift a whole track by dt ms as one undoable edit (`timeline` when already worked
@@ -6627,7 +6954,14 @@ class EventSimulatorPanel extends Base {
     else if (action === "remove-track") this._removeTrack(el.dataset.entity);
     else if (action === "prev-run" || action === "next-run") this._stepRun(action === "next-run" ? 1 : -1);
     else if (action === "undo") this._undoEdit();
-    else if (action === "reset-all") this._resetTracks(this._tracks.map((t) => t.entity_id));
+    else if (action === "reset-all") this._resetTracks(this._tracks.map((t) => t.entity_id), this._lanes.map((l) => l.id));
+    else if (action === "reset-lane") this._resetTracks([], [el.dataset.lane]);
+    else if (action === "unshift-lane") this._shiftLaneBy(el.dataset.lane, -trackOffset(this._lane(el.dataset.lane)));
+    else if (action === "ln-apply") this._applyLaneEditor();
+    else if (action === "ln-delete") this._deleteLaneEvent();
+    else if (action === "ln-close") this._selectLaneEvent(null);
+    else if (action === "ln-prev" || action === "ln-next") this._stepLaneEvent(action === "ln-next" ? 1 : -1);
+    else if (action === "ln-add-kind") this._addDeviceEvent(Number(el.dataset.kind));
     else if (action === "reset-track") this._resetTracks([el.dataset.entity]);
     else if (action === "reset-shift") this._shiftTrackBy(el.dataset.entity, -trackOffset(this._track(el.dataset.entity)));
     else if (action === "ed-apply") this._applyEditor();
@@ -6709,6 +7043,7 @@ class EventSimulatorPanel extends Base {
     const id = ev.target.id;
     if (id === "automation") this._selectAutomation(ev.target.value);
     else if (id === "auto-run") this._setAutoRun(ev.target.checked);
+    else if (id === "ln-kind" && this._laneSel) this._keepLaneDraft();
     else if (id === "auto-suggest") this._setAutoSuggest(ev.target.checked);
     else if (id === "sg-kind-cond") this._setKindFilter({ conditions: ev.target.checked });
     else if (id === "lb-kind" && this._labelSel) this._updateLabel(this._labelSel, { kind: ev.target.value });
@@ -6723,6 +7058,7 @@ class EventSimulatorPanel extends Base {
 
   _onInput(ev) {
     const id = ev.target.id;
+    if ((id === "ln-time" || id === "ln-data") && this._laneSel) return this._keepLaneDraft();
     if ((id === "ed-time" || id === "ed-state" || id === "ed-attrs") && this._sel) {
       // Kept so a re-render (a history load, a run finishing) does not wipe unapplied input.
       const value = (name) => this.shadowRoot.getElementById(name)?.value;
@@ -6767,6 +7103,9 @@ class EventSimulatorPanel extends Base {
       this._labelError = null;
       return this._render();
     }
+    if ((this._laneSel || this._laneAdd) && ev.key === "Escape" && (!typing || ["ln-time", "ln-kind", "ln-data"].includes(origin.id))) {
+      return this._selectLaneEvent(null);
+    }
     if (this._sel && ev.key === "Escape" && (!typing || inEditor)) {
       this._select(null);
       return this._render();
@@ -6775,6 +7114,10 @@ class EventSimulatorPanel extends Base {
     if ((ev.key === "Delete" || ev.key === "Backspace") && this._labelSel && this._mode === "suggest") {
       ev.preventDefault();
       return this._deleteLabel(this._labelSel);
+    }
+    if ((ev.key === "Delete" || ev.key === "Backspace") && this._laneSel) {
+      ev.preventDefault();
+      return this._deleteLaneEvent();
     }
     if ((ev.key === "Delete" || ev.key === "Backspace") && this._sel?.index >= 0) {
       ev.preventDefault();
@@ -7045,6 +7388,9 @@ class EventSimulatorPanel extends Base {
       .lane-mark.used { stroke-width: 4; }
       .lane-mark.dim, .legend-item.dim { opacity: 0.35; }
       .lane-notice { color: var(--warning-color, #ff9800); }
+      .lane-sel { fill: none; stroke: var(--primary-text-color); stroke-width: 1; }
+      .lane-edited { fill: var(--accent-color, #ff9800); }
+      svg.lane { touch-action: pan-y; cursor: grab; }
       .lane-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 0 0 2px; color: var(--secondary-text-color); }
       .lane-unsupported ul { margin: 4px 0; padding-left: 18px; color: var(--warning-color, #ff9800); }
       .cal-bar { fill: var(--info-color, #039be5); fill-opacity: 0.45; stroke: var(--info-color, #039be5); stroke-width: 1; }
