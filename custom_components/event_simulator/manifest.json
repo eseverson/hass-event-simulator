@@ -1,9 +1,9 @@
 {
   "domain": "event_simulator",
   "name": "Event Simulator",
+  "after_dependencies": ["zha"],
   "codeowners": ["@eseverson"],
   "config_flow": true,
-  "after_dependencies": ["zha"],
   "dependencies": ["http", "frontend", "panel_custom", "websocket_api", "recorder", "automation"],
   "documentation": "https://github.com/eseverson/hass-event-simulator",
   "integration_type": "service",
