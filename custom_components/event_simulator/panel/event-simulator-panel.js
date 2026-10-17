@@ -2927,6 +2927,29 @@ function fireMarker(m, x, y) {
 }
 
 /* The window a preset names at `now`; Today and Yesterday are calendar days in zone tz. */
+/* Why a window cannot be used, or null: it must end after it starts and be at most
+ * `maxDays` long (Suggest mode allows longer windows than Replay). */
+export function windowError(start, end, { maxDays, suggest = false }) {
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return "The window must end after it starts.";
+  if (end - start > maxDays * DAY) {
+    return suggest
+      ? `The window can be at most ${maxDays} days long in Suggest mode.`
+      : `The window can be at most ${maxDays} days long (${MAX_SUGGEST_WINDOW / DAY} in Suggest mode).`;
+  }
+  return null;
+}
+
+/* The window the start and end fields describe, checked as a whole: {ok, start, end} or
+ * {ok: false, error}. Typing one segment at a time makes passing values (the 1st on the way
+ * to the 15th), so the fields only apply through this once the typing is done. */
+export function windowFromInputs(startText, endText, clock, opts) {
+  if (!startText || !endText) return { ok: false, error: "Enter a full start and end date and time." };
+  const start = clock.fromInput(startText);
+  const end = clock.fromInput(endText);
+  const error = windowError(start, end, opts);
+  return error ? { ok: false, error } : { ok: true, start, end };
+}
+
 export function presetWindow(id, now = Date.now(), tz) {
   const end = Math.ceil(now / 60e3) * 60e3;
   const preset = PRESETS.find((p) => p.id === id);
@@ -3524,17 +3547,13 @@ class EventSimulatorPanel extends Base {
   }
 
   _setWindow(start, end, preset = null) {
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
-      this._error = "The window must end after it starts.";
+    const error = windowError(start, end, this._windowOpts());
+    if (error) {
+      this._error = error;
       return this._render();
     }
-    if (end - start > this._maxWindow()) {
-      this._error =
-        this._mode === "suggest"
-          ? `The window can be at most ${MAX_SUGGEST_WINDOW / DAY} days long in Suggest mode.`
-          : `The window can be at most ${MAX_WINDOW / DAY} days long (${MAX_SUGGEST_WINDOW / DAY} in Suggest mode).`;
-      return this._render();
-    }
+    this._winDraft = null;
+    this._winError = null;
     this._preset = preset;
     this._window = { start, end };
     this._view = [start, end];
@@ -3547,6 +3566,33 @@ class EventSimulatorPanel extends Base {
     this._requestToken++;
     if (this._hasTimeline()) this._loadHistory();
     else this._render();
+  }
+
+  _windowOpts() {
+    return { maxDays: this._maxWindow() / DAY, suggest: this._mode === "suggest" };
+  }
+
+  /* The window fields as typed, applied once the typing is done (focus left them, or Enter):
+   * a window that cannot be used keeps the text and says why. */
+  _keepWindowDraft() {
+    const value = (id) => this.shadowRoot.getElementById(id)?.value ?? "";
+    this._winDraft = { start: value("win-start"), end: value("win-end") };
+  }
+
+  _applyWindowDraft() {
+    const draft = this._winDraft;
+    if (!draft) return;
+    const found = windowFromInputs(draft.start, draft.end, this._clock, this._windowOpts());
+    if (!found.ok) {
+      this._winError = found.error;
+      return this._render();
+    }
+    if (found.start === this._window.start && found.end === this._window.end) {
+      this._winDraft = null;
+      this._winError = null;
+      return this._render();
+    }
+    this._setWindow(found.start, found.end, null);
   }
 
   _maxWindow() {
@@ -4852,6 +4898,11 @@ class EventSimulatorPanel extends Base {
       this.shadowRoot.addEventListener("change", (ev) => this._onChange(ev));
       this.shadowRoot.addEventListener("input", (ev) => this._onInput(ev));
       this.shadowRoot.addEventListener("keydown", (ev) => this._onKeydown(ev));
+      // The window fields apply when focus leaves both of them (see _applyWindowDraft).
+      this.shadowRoot.addEventListener("focusout", (ev) => {
+        const out = ["win-start", "win-end"];
+        if (out.includes(ev.target.id) && !out.includes(ev.relatedTarget?.id)) this._applyWindowDraft();
+      });
       // `toggle` does not bubble; capture still sees it. Keeps <details> open across redraws.
       this.shadowRoot.addEventListener("toggle", (ev) => {
         const key = ev.target?.dataset?.key;
@@ -4990,10 +5041,11 @@ class EventSimulatorPanel extends Base {
           <div class="field">
             <span class="label">Window</span>
             <div class="window">
-              <input id="win-start" type="datetime-local" value="${this._clock.toInput(w.start)}" aria-label="Window start">
+              <input id="win-start" type="datetime-local" value="${esc(this._winDraft?.start ?? this._clock.toInput(w.start))}" aria-label="Window start"${this._winError ? ' aria-invalid="true"' : ""}>
               <span class="muted">to</span>
-              <input id="win-end" type="datetime-local" value="${this._clock.toInput(w.end)}" aria-label="Window end">
+              <input id="win-end" type="datetime-local" value="${esc(this._winDraft?.end ?? this._clock.toInput(w.end))}" aria-label="Window end"${this._winError ? ' aria-invalid="true"' : ""}>
             </div>
+            ${this._winError ? `<span class="err small">${esc(this._winError)} Esc puts back the current window.</span>` : ""}
             <div class="segmented">${presets}</div>
             ${this._clock.foreign ? `<span class="muted small zone-note" title="Settings › Profile › Time zone picks the browser's zone or the server's">Times are ${esc(this._zoneName())}; Home Assistant's zone is ${esc(this._clock.serverTimeZone)}.</span>` : ""}
           </div>
@@ -7148,15 +7200,12 @@ class EventSimulatorPanel extends Base {
     else if (id === "lb-kind" && this._labelSel) this._updateLabel(this._labelSel, { kind: ev.target.value });
     else if (id === "lb-anchor" && this._labelSel) this._updateLabel(this._labelSel, { anchor: ev.target.value });
     else if (id === "tol-before" || id === "tol-after") this._setTolerance(id === "tol-before" ? "before" : "after", ev.target.value);
-    else if (id === "win-start" || id === "win-end") {
-      const start = this._clock.fromInput(this.shadowRoot.getElementById("win-start").value);
-      const end = this._clock.fromInput(this.shadowRoot.getElementById("win-end").value);
-      this._setWindow(start, end, null);
-    }
+    else if (id === "win-start" || id === "win-end") this._keepWindowDraft();
   }
 
   _onInput(ev) {
     const id = ev.target.id;
+    if (id === "win-start" || id === "win-end") return this._keepWindowDraft();
     if ((id === "ln-time" || id === "ln-data") && this._laneSel) return this._keepLaneDraft();
     if ((id === "ed-time" || id === "ed-state" || id === "ed-attrs") && this._sel) {
       // Kept so a re-render (a history load, a run finishing) does not wipe unapplied input.
@@ -7229,6 +7278,22 @@ class EventSimulatorPanel extends Base {
   };
 
   _onKeydown(ev) {
+    if (["win-start", "win-end"].includes(ev.target.id) && (ev.key === "Enter" || ev.key === "Escape")) {
+      ev.preventDefault();
+      if (ev.key === "Enter") {
+        this._keepWindowDraft();
+        return this._applyWindowDraft();
+      }
+      this._winDraft = null;
+      this._winError = null;
+      // The redraw keeps a focused field's text, so put the current window back in it first.
+      const root = this.shadowRoot;
+      for (const [id, t] of [["win-start", this._window.start], ["win-end", this._window.end]]) {
+        const input = root.getElementById(id);
+        if (input) input.value = this._clock.toInput(t);
+      }
+      return this._render();
+    }
     if (["ed-time", "ed-state"].includes(ev.target.id) && ev.key === "Enter") {
       ev.preventDefault();
       return this._applyEditor();
