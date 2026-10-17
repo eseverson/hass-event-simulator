@@ -367,7 +367,7 @@ class Evaluator:
             value = step.attributes[i][condition.attribute]
         if value not in condition.state:
             return False
-        # Home Assistant measures `for:` from the state's last_changed, even for an attribute.
+        # Home Assistant measures `for:` from the state's last_changed (an attribute condition has no `for:`).
         return not condition.for_ or t - condition.for_ > step.changed[i]
 
     def _numeric_holds(self, condition: NumericStateCondition, t: float) -> bool:

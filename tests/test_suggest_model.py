@@ -204,6 +204,23 @@ def test_render_automation_shape():
     assert custom["actions"] == [{"action": "light.turn_on"}]
 
 
+def test_a_state_condition_held_in_any_of_several_states_renders_one_per_state():
+    """Home Assistant 2026.10 refuses `for` with a list of states (core #174083); `or` over the states, each with its own `for`, is what the list meant: in one of them, unchanged for that long."""
+    assert render_condition(StateCondition("person.me", ("home", "work"), for_=120)) == {
+        "condition": "or",
+        "conditions": [
+            {"condition": "state", "entity_id": "person.me", "state": "home", "for": {"hours": 0, "minutes": 2, "seconds": 0}},
+            {"condition": "state", "entity_id": "person.me", "state": "work", "for": {"hours": 0, "minutes": 2, "seconds": 0}},
+        ],
+    }
+
+
+def test_an_attribute_state_condition_cannot_have_a_duration():
+    """Home Assistant measures `for` from the entity's last_changed, not the attribute's, and 2026.10 refuses it."""
+    with pytest.raises(ValueError, match="attribute"):
+        StateCondition("calendar.x", ("Trash",), attribute="message", for_=60)
+
+
 async def test_rendered_automation_passes_home_assistant_validation(hass: HomeAssistant):
     config = render_automation(EVERYTHING, alias="Suggested")
     validated = await async_validate_config_item(hass, "suggested", config)

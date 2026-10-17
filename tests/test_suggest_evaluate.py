@@ -275,8 +275,9 @@ def test_state_condition_for_is_strict_and_uses_last_changed():
     assert ev.condition_holds(cond, T0 + 1)  # on since 23:00, attribute write does not reset it
     assert not ev.condition_holds(StateCondition(DOOR, ("off",), for_=60), T0 + 260)  # exactly 60 s: not longer
     assert ev.condition_holds(StateCondition(DOOR, ("off",), for_=60), T0 + 260.5)
-    # attribute + for: Home Assistant still measures the state's last_changed
-    assert ev.condition_holds(StateCondition(DOOR, (2,), attribute="a", for_=H), T0 + 150)
+    # attribute + for: Home Assistant 2026.10 refuses it, so no such condition is ever built
+    with pytest.raises(ValueError):
+        StateCondition(DOOR, (2,), attribute="a", for_=H)
 
 
 def test_numeric_state_condition():

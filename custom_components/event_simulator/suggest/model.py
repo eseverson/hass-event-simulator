@@ -280,6 +280,9 @@ class StateCondition:
         if not self.state:
             raise ValueError("state needs at least one value")
         _check_duration(self.for_, "for_")
+        if self.for_ and self.attribute is not None:
+            # Measured from the entity's last_changed, not the attribute's; Home Assistant 2026.10 refuses it (core #174083).
+            raise ValueError("for_ cannot be used with an attribute")
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,6 +492,10 @@ def render_condition(condition: Condition) -> dict[str, Any]:
             out: dict[str, Any] = {"condition": "state", "entity_id": condition.entity_id}
             if condition.attribute is not None:
                 out["attribute"] = condition.attribute
+            if condition.for_ and len(condition.state) > 1:
+                # Home Assistant 2026.10 refuses `for` with a list of states (core #174083): in one of
+                # them, unchanged for that long, is one condition per state.
+                return {"condition": "or", "conditions": [render_condition(StateCondition(condition.entity_id, (state,), for_=condition.for_)) for state in condition.state]}
             out["state"] = _values(condition.state)
             if condition.for_:
                 out["for"] = _period(condition.for_)
