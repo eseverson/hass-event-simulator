@@ -23,7 +23,7 @@ from custom_components.event_simulator.const import (
 
 @pytest.fixture
 async def setup(hass: HomeAssistant, tmp_path: Path):
-    entry = MockConfigEntry(domain=DOMAIN, unique_id=DOMAIN, data={})
+    entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
@@ -45,7 +45,7 @@ async def test_user_flow_creates_the_entry(hass: HomeAssistant):
 
 
 async def test_user_flow_refuses_a_second_entry(hass: HomeAssistant):
-    MockConfigEntry(domain=DOMAIN, unique_id=DOMAIN, data={}).add_to_hass(hass)
+    MockConfigEntry(domain=DOMAIN, data={}).add_to_hass(hass)
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
