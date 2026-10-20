@@ -463,7 +463,7 @@ export const OUTCOME_STYLE = {
 
 export function classifyOutcome(outcome, run = {}) {
   const o = String(outcome ?? "").toLowerCase();
-  if (o in OUTCOME_STYLE && o !== "other") return o;
+  if (Object.hasOwn(OUTCOME_STYLE, o) && o !== "other") return o;
   if (!o && run.error) return "error";
   return "other";
 }
