@@ -11,7 +11,7 @@ from pytest_homeassistant_custom_component.components.recorder.common import (
     async_wait_recording_done,
 )
 
-from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.core import Context, HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.util import dt as dt_util
 
 from custom_components.event_simulator import runner
@@ -79,14 +79,16 @@ async def test_without_the_calendar_its_recorded_states_name_the_events(
 
 
 async def test_the_calendar_answers_and_the_states_fill_in(
-    hass: HomeAssistant, setup, trash_history, hass_ws_client  # noqa: F811
+    hass: HomeAssistant, setup, trash_history, hass_ws_client, hass_admin_user  # noqa: F811
 ):
     """The calendar's own events win (with what states do not carry, a description); a past event it no longer returns still comes from the states."""
     start, pickups = trash_history
     asked: list[dict[str, Any]] = []
+    contexts: list[Context] = []
 
     async def get_events(call: ServiceCall) -> dict[str, Any]:
         asked.append(dict(call.data))
+        contexts.append(call.context)
         events = [{"start": str(day), "end": str(day + timedelta(days=1)), "summary": "Garbage", "description": "bins out"} for day in pickups[1:]]
         events.append({"start": f"{pickups[1]}T09:00:00", "end": "not a time", "summary": "broken"})
         return {TRASH: {"events": events}}
@@ -102,6 +104,8 @@ async def test_the_calendar_answers_and_the_states_fill_in(
     # Asked around the window, as far as a calendar trigger's offset reaches.
     assert asked[0]["start_date_time"] <= start - timedelta(days=2)
     assert asked[0]["end_date_time"] >= end + timedelta(days=2)
+    # Asked as the websocket user.
+    assert contexts[0].user_id == hass_admin_user.id
 
 
 async def test_a_calendar_trigger_is_suggested_and_validated_with_the_events(

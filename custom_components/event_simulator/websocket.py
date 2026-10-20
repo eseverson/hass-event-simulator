@@ -16,7 +16,7 @@ import voluptuous as vol
 import yaml
 
 from homeassistant.components import websocket_api
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import Context, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.util import dt as dt_util
@@ -196,7 +196,9 @@ async def ws_calendar_events(hass, connection, msg: dict[str, Any]) -> None:
     """The events of the calendars around the window (`history.async_get_calendar_events`): what the panel's calendar lane shows, and what a replay's calendar triggers fire on."""
     connection.send_result(
         msg["id"],
-        await history.async_get_calendar_events(hass, msg["entity_ids"], msg["start"], msg["end"]),
+        await history.async_get_calendar_events(
+            hass, msg["entity_ids"], msg["start"], msg["end"], context=connection.context(msg)
+        ),
     )
 
 
@@ -430,7 +432,7 @@ def ws_suggest_subscribe(
 
     async def run() -> None:
         try:
-            payload = await async_suggest(hass, msg, send, stop)
+            payload = await async_suggest(hass, msg, send, stop, context=connection.context(msg))
         except Exception as err:  # noqa: BLE001
             payload = {"error": _error_payload(err)}
         send(payload)
@@ -447,8 +449,10 @@ async def async_suggest(
     msg: dict[str, Any],
     progress: Callable[[dict[str, Any]], None],
     stop: threading.Event,
+    *,
+    context: Context | None = None,
 ) -> dict[str, Any]:
-    """Load the window's history, mine suggestions from it in the executor, validate the top ones exactly in one sandbox child, and return the result dict.
+    """Load the window's history, mine suggestions from it in the executor, validate the top ones exactly in one sandbox child, and return the result dict. `context` is the websocket caller's, for the calendars' `calendar.get_events` calls.
 
     Validation failing (the child crashed, timed out, refused the scenario) is not an error: the miner's own result comes back with every suggestion `exact: false` and a `warning`.
     """
@@ -468,7 +472,7 @@ async def async_suggest(
     timeline["bus_events"] = (await history.async_get_bus_events(hass, start, end))["bus_events"]
     # The events of the tracked calendars, for calendar triggers (#37): the calendar's own, plus those its recorded states name.
     timeline["calendars"] = (
-        await history.async_get_calendar_events(hass, entity_ids, start, end, timeline=timeline)
+        await history.async_get_calendar_events(hass, entity_ids, start, end, timeline=timeline, context=context)
     )["calendars"]
     progress(
         {

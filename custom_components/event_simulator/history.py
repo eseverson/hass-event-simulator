@@ -28,7 +28,7 @@ from homeassistant.components.recorder.history import (
     get_significant_states_with_session,
 )
 from homeassistant.const import STATE_UNAVAILABLE
-from homeassistant.core import HomeAssistant, State, callback, valid_entity_id
+from homeassistant.core import Context, HomeAssistant, State, callback, valid_entity_id
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import (
     area_registry as ar,
@@ -314,10 +314,11 @@ async def async_get_calendar_events(
     end: datetime,
     *,
     timeline: dict[str, Any] | None = None,
+    context: Context | None = None,
 ) -> dict[str, Any]:
     """The events of each calendar around [start, end) (`CALENDAR_MARGIN` either side), for calendar triggers: the scenario's `calendars`.
 
-    Returns `{calendars: {entity_id: [{start, end, summary, description?, location?}]}, sources: {entity_id: {calendar, states, error?}}}`. Each calendar is asked with `calendar.get_events` (a read-only service call on this instance), and the events its recorded states name (`timeline`, the window's `initial_states` / `events`, read here when not given) are added where the calendar does not return them: an event deleted since, or a past one it no longer serves. When the calendar cannot answer (its integration is not loaded, it is unavailable, it timed out), the recorded states alone stand in and `error` says why. `sources` counts the events from each. Only `calendar.` entities are read, at most `MAX_CALENDARS`, each capped at `MAX_CALENDAR_EVENTS`.
+    Returns `{calendars: {entity_id: [{start, end, summary, description?, location?}]}, sources: {entity_id: {calendar, states, error?}}}`. Each calendar is asked with `calendar.get_events` (a read-only service call on this instance, made with `context`: the websocket caller's), and the events its recorded states name (`timeline`, the window's `initial_states` / `events`, read here when not given) are added where the calendar does not return them: an event deleted since, or a past one it no longer serves. When the calendar cannot answer (its integration is not loaded, it is unavailable, it timed out), the recorded states alone stand in and `error` says why. `sources` counts the events from each. Only `calendar.` entities are read, at most `MAX_CALENDARS`, each capped at `MAX_CALENDAR_EVENTS`.
     """
     start, end = dt_util.as_utc(start), dt_util.as_utc(end)
     check_window(start, end, MAX_SUGGEST_WINDOW)
@@ -334,7 +335,7 @@ async def async_get_calendar_events(
     sources: dict[str, dict[str, Any]] = {}
     for entity_id in ids:
         recorded = recorded_by_calendar[entity_id]
-        live, error = await _async_calendar_get_events(hass, entity_id, lo, hi, tz)
+        live, error = await _async_calendar_get_events(hass, entity_id, lo, hi, tz, context)
         merged = [event for event in merge_events(live, recorded, tz) if event.start_local(tz) < hi and event.end_local(tz) >= lo]
         from_calendar = sum(any(event is mine for mine in live) for event in merged)
         source: dict[str, Any] = {"calendar": from_calendar, "states": len(merged) - from_calendar}
@@ -357,7 +358,9 @@ def _recorded_calendar_events(timeline: dict[str, Any], ids: list[str], tz: Any)
     return {entity_id: events_from_states(found, tz) for entity_id, found in states.items()}
 
 
-async def _async_calendar_get_events(hass: HomeAssistant, entity_id: str, start: datetime, end: datetime, tz: Any) -> tuple[list[Any], str | None]:
+async def _async_calendar_get_events(
+    hass: HomeAssistant, entity_id: str, start: datetime, end: datetime, tz: Any, context: Context | None = None
+) -> tuple[list[Any], str | None]:
     """The calendar's own events in [start, end) through `calendar.get_events`, and why there are none when it could not answer."""
     if not hass.services.has_service("calendar", "get_events"):
         return [], "the calendar integration is not loaded"
@@ -368,6 +371,7 @@ async def _async_calendar_get_events(hass: HomeAssistant, entity_id: str, start:
                 "get_events",
                 {"entity_id": entity_id, "start_date_time": start, "end_date_time": end},
                 blocking=True,
+                context=context,
                 return_response=True,
             )
     except TimeoutError:
