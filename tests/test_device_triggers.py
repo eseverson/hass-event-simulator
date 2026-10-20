@@ -1,6 +1,6 @@
 """#48: the live half of the device-trigger adapters — the panel's device lanes, and the `device_triggers` a replay carries.
 
-ZHA's data is put in its trigger cache with no gateway running, the state ZHA's own device trigger falls back to; nothing of ZHA is set up.
+ZHA's data is put in its trigger cache with no gateway running, the state ZHA's own device trigger falls back to; nothing of ZHA is set up beyond marking it loaded.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ async def button(hass: HomeAssistant) -> dr.DeviceEntry:
         config_entry_id=entry.entry_id, identifiers={("zha", IEEE)}, name="Outdoor String Lights Button"
     )
     get_zha_data(hass).device_trigger_cache[device.id] = (IEEE, {(t, "button_1"): {"endpoint_id": 1, "command": t} for t in TYPES})
+    hass.config.components.add("zha")
     return device
 
 
@@ -94,10 +95,41 @@ async def test_entity_domain_device_triggers_need_no_lane(hass: HomeAssistant):
     assert await device_triggers.async_device_lanes(hass, config) == {"lanes": [], "unsupported": []}
 
 
-async def test_changed_private_api_is_unreadable(hass: HomeAssistant, button, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delattr("homeassistant.components.zha.device_trigger._get_device_trigger_data")
+async def test_changed_zha_helpers_are_unreadable(hass: HomeAssistant, button, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delattr("homeassistant.components.zha.helpers.async_get_zha_device_proxy")
     (entry,) = (await device_triggers.async_device_lanes(hass, automation(button.id, SHORT)))["unsupported"]
     assert entry["reason"] == "unreadable"
+
+
+async def test_an_unexpected_zha_device_is_unreadable(hass: HomeAssistant, button, monkeypatch: pytest.MonkeyPatch):
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from homeassistant.components.zha import helpers as zha_helpers  # noqa: PLC0415
+
+    monkeypatch.setattr(zha_helpers, "async_get_zha_device_proxy", lambda _hass, _device_id: SimpleNamespace())
+    (entry,) = (await device_triggers.async_device_lanes(hass, automation(button.id, SHORT)))["unsupported"]
+    assert entry["reason"] == "unreadable"
+
+
+async def test_zha_not_loaded_is_no_data(hass: HomeAssistant, button):
+    hass.config.components.remove("zha")
+    (entry,) = (await device_triggers.async_device_lanes(hass, automation(button.id, SHORT)))["unsupported"]
+    assert entry["reason"] == "no_data"
+
+
+async def test_a_running_gateway_reads_the_live_device(hass: HomeAssistant, button, monkeypatch: pytest.MonkeyPatch):
+    """With a gateway running, the live device's triggers win over the cache, as in ZHA's own device trigger."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from zigpy.types import EUI64  # noqa: PLC0415
+
+    from homeassistant.components.zha import helpers as zha_helpers  # noqa: PLC0415
+
+    live = SimpleNamespace(ieee=EUI64.convert(IEEE), device_automation_triggers={(SHORT, "button_2"): {"endpoint_id": 2, "command": SHORT}})
+    monkeypatch.setattr(zha_helpers, "get_zha_gateway_proxy", lambda _hass: SimpleNamespace(device_proxies={EUI64.convert(IEEE): SimpleNamespace(device=live)}))
+    assert await device_triggers.async_export(hass, automation(button.id, SHORT)) == {
+        "zha": {button.id: {"ieee": IEEE, "triggers": [{"type": SHORT, "subtype": "button_2", "data": {"endpoint_id": 2, "command": SHORT}}]}}
+    }
 
 
 async def test_export_is_the_scenario_block(hass: HomeAssistant, button):
