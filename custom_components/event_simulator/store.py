@@ -18,11 +18,11 @@ from typing import Any
 import voluptuous as vol
 from voluptuous.humanize import humanize_error
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
-from homeassistant.util.hass_dict import HassKey
 from homeassistant.util.ulid import ulid_now
 
 from .const import DOMAIN
@@ -33,7 +33,6 @@ from .suggest.labels import ANCHORS, KINDS
 STORAGE_KEY = f"{DOMAIN}.scenarios"
 # 2: events packed (version 1 kept them as a plain list).
 STORAGE_VERSION = 2
-DATA_STORE: HassKey[ScenarioStore] = HassKey(f"{DOMAIN}_scenarios")
 
 MAX_SCENARIOS = 100
 MAX_NAME_LENGTH = 100
@@ -50,7 +49,6 @@ HELPER_DOMAINS = ("trend", "derivative")
 MAX_HELPERS = 20
 
 __all__ = [
-    "DATA_STORE",
     "HELPERS_SCHEMA",
     "LABEL_SCHEMA",
     "MAX_EVENTS",
@@ -60,6 +58,7 @@ __all__ = [
     "SCENARIO_FIELDS",
     "STORAGE_KEY",
     "TOLERANCE_SCHEMA",
+    "EventSimulatorConfigEntry",
     "ScenarioStore",
 ]
 
@@ -283,6 +282,10 @@ class ScenarioStore:
         self.get(scenario_id)
         del self._scenarios[scenario_id]
         await self._async_write()
+
+
+# The config entry carries the scenario store as its runtime data.
+type EventSimulatorConfigEntry = ConfigEntry[ScenarioStore]
 
 
 def _check_limits(body: dict[str, Any]) -> None:

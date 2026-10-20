@@ -13,7 +13,6 @@ from pathlib import Path
 
 from homeassistant.components import frontend, panel_custom
 from homeassistant.components.http import StaticPathConfig
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.loader import async_get_integration
 
@@ -27,7 +26,7 @@ from .const import (
     PANEL_URL_PATH,
     PANEL_WEBCOMPONENT,
 )
-from .store import DATA_STORE, ScenarioStore
+from .store import EventSimulatorConfigEntry, ScenarioStore
 
 _DATA_STATIC_REGISTERED = f"{DOMAIN}_static_registered"
 
@@ -38,18 +37,17 @@ def _module_url(version: str, panel_js: Path) -> str:
     return f"{PANEL_STATIC_URL}/{PANEL_JS_FILE}?v={version}-{digest}"
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: EventSimulatorConfigEntry) -> bool:
     store = ScenarioStore(hass)
     await store.async_load()
-    hass.data[DATA_STORE] = store
+    entry.runtime_data = store
     websocket.async_register(hass)
     await _async_register_panel(hass)
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: EventSimulatorConfigEntry) -> bool:
     frontend.async_remove_panel(hass, PANEL_URL_PATH, warn_if_unknown=False)
-    hass.data.pop(DATA_STORE, None)
     return True
 
 

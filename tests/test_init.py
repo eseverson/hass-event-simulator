@@ -104,3 +104,16 @@ async def test_a_reload_registers_the_static_path_once(hass: HomeAssistant, setu
     assert setup.state is ConfigEntryState.LOADED
     resp = await (await hass_client_no_auth()).get(f"{PANEL_STATIC_URL}/{PANEL_JS_FILE}")
     assert resp.status == 200
+
+
+async def test_scenarios_live_on_the_loaded_entry(hass: HomeAssistant, setup, hass_ws_client):
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id({"type": f"{DOMAIN}/scenarios/list"})
+    assert (await client.receive_json())["result"] == []
+
+    assert await hass.config_entries.async_unload(setup.entry_id)
+    await client.send_json_auto_id({"type": f"{DOMAIN}/scenarios/list"})
+    msg = await client.receive_json()
+
+    assert not msg["success"]
+    assert msg["error"]["code"] == "not_loaded"

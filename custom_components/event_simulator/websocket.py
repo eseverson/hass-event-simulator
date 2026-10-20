@@ -36,7 +36,6 @@ from .history import (
 from .packed import event_count, unpack_events
 from .runner import SandboxError
 from .store import (
-    DATA_STORE,
     HELPERS_SCHEMA,
     LABEL_SCHEMA,
     MAX_LABELS,
@@ -203,9 +202,10 @@ async def ws_calendar_events(hass, connection, msg: dict[str, Any]) -> None:
 
 
 def _store(hass: HomeAssistant) -> ScenarioStore:
-    if (store := hass.data.get(DATA_STORE)) is None:
+    """The loaded config entry's scenario store (the integration is single-instance)."""
+    if not (entries := hass.config_entries.async_loaded_entries(DOMAIN)):
         raise SimulatorError("not_loaded", "Event Simulator is not set up")
-    return store
+    return entries[0].runtime_data
 
 
 @websocket_api.require_admin
