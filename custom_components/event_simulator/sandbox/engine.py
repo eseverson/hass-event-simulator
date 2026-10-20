@@ -1,6 +1,6 @@
 """Replay engine: runs one scenario against one automation (or several independent ones) in a throwaway Home Assistant.
 
-Runs in the child process (see `__main__.py`). `run_scenario(scenario)` is the whole contract: a scenario dict in, a JSON-safe result dict out.
+Runs in the child process (see `__main__.py`), never in the live Home Assistant; the package docstring says why it may patch core there. `run_scenario(scenario)` is the whole contract: a scenario dict in, a JSON-safe result dict out.
 
 The scenario carries either `automation` (one config) or `automations` (a list of up to `MAX_AUTOMATIONS` configs, for validating many candidates against one timeline at the cost of one boot). Every service call is only recorded, so automations replayed together cannot affect each other: each runs as it would alone, with its own mode, its own entity (the own-entity handling below applies to each) and its own id (one without an id, or repeating an earlier one, gets `DEFAULT_AUTOMATION_ID` plus its index).
 
@@ -999,7 +999,10 @@ class _Replay:
         return self.clock.utcnow()
 
     async def run(self) -> dict[str, Any]:
-        original_store = automation_trace.async_store_trace
+        # Patched in this child process only: `automation/trace.py` (`trace_automation`) stores each run through its module-level `async_store_trace` (the trace integration's public export), so wrapping that name sees every run without the stored-traces limit dropping one.
+        original_store = getattr(automation_trace, "async_store_trace", None)
+        if original_store is None:
+            raise RuntimeError("homeassistant.components.automation.trace has no async_store_trace on this Home Assistant version; runs cannot be captured")
 
         def store_trace(hass: Any, trace: Any, stored_traces: int) -> None:
             self.runs.append((trace.key, trace))
@@ -1123,8 +1126,9 @@ class _Replay:
 
     async def _boot(self) -> None:
         self.hass = hass = HomeAssistant(self.config_dir)
-        # Replaced before anything registers a service, so every registration lands in the recording registry.
+        # Replaced on this child's own instance before anything registers a service, so every registration lands in the recording registry (a `ServiceRegistry` subclass using only its public methods).
         hass.services = RecordingServiceRegistry(hass, self._record_call)
+        # A minimal boot instead of `bootstrap.async_setup_hass` (which would set up `default_config`, http, the recorder ...): the same steps core's test harness takes to build a bare instance (`tests/common.py::async_test_home_assistant`), then the base registries.
         loader.async_setup(hass)
         hass.config.skip_pip = True
         hass.config.skip_pip_packages = []
@@ -1144,8 +1148,10 @@ class _Replay:
         await self._enable_preview_features(hass)
         await hass.async_start()
         await hass.async_block_till_done()
-        # Restore state is saved every 15 minutes (virtual), for a restart that never comes: thousands of file writes over a month, each an executor round trip.
-        restore_state.async_get(hass).async_dump_states = _skip_dump
+        # Restore state is saved every 15 minutes (virtual), for a restart that never comes: thousands of file writes over a month, each an executor round trip. Its timers call `self.async_dump_states()`, so the instance attribute replaces them; if that method is renamed, the dumps just go to the throwaway config dir again (slower, same result).
+        restore_data = restore_state.async_get(hass)
+        if hasattr(restore_data, "async_dump_states"):
+            restore_data.async_dump_states = _skip_dump
 
     async def _enable_preview_features(self, hass: HomeAssistant) -> None:
         """Set up `labs` (live HA always has it) and turn on the scenario's preview features, before the automation is validated."""
@@ -1276,6 +1282,7 @@ class _Replay:
                 stubs[entity_id] = _StubCalendar(entity_id, events)
             except HomeAssistantError as err:
                 raise ScenarioError("invalid_scenario", f"calendars[{entity_id!r}]: {err}") from err
+        # The calendar integration is never set up here, so this key is free: it is where `components/calendar/trigger.py::get_entity` looks the trigger's calendar up.
         self.hass.data[CALENDAR_COMPONENT] = _StubCalendars(stubs)
 
     def _loaded(self) -> list[_Automation]:
@@ -1682,10 +1689,12 @@ class RecordingServiceRegistry(ServiceRegistry):
     A blocking call, after firing `call_service`, waits as a live call to a device does for its I/O round trip: until nothing else is left to run at this virtual instant (`VirtualTimeEventLoop.when_idle`; no virtual time passes). Services whose live handler never suspends (`_INSTANT_DOMAINS` / `_INSTANT_SERVICES`) answer at once. The calling run is thus still in flight while everything already started at this instant runs: a run its own `event` step or `call_service` re-triggered, or the next of several changes recorded at one instant, meets it running, so `mode: single` drops that run (`failed_single`), `restart` stops the caller and `max` runs fill up, as they do live.
     """
 
-    __slots__ = ("_on_call", "intercepting")
+    __slots__ = ("_on_call", "_sandbox_hass", "intercepting")
 
     def __init__(self, hass: HomeAssistant, on_call: Callable[..., None]) -> None:
         super().__init__(hass)
+        # Its own reference rather than the base class's private `_hass` / `_services`: only public `ServiceRegistry` methods are used below.
+        self._sandbox_hass = hass
         self._on_call = on_call
         self.intercepting = False
 
@@ -1693,11 +1702,10 @@ class RecordingServiceRegistry(ServiceRegistry):
         return True if self.intercepting else super().has_service(domain, service)
 
     def supports_response(self, domain: str, service: str) -> SupportsResponse:
-        handler = self._services.get(domain.lower(), {}).get(service.lower())
-        if handler is None:
+        if not super().has_service(domain, service):
             # Unknown here (it may exist on the live instance): accept calls with or without a response.
             return SupportsResponse.OPTIONAL
-        return handler.supports_response
+        return super().supports_response(domain, service)
 
     async def async_call(
         self,
@@ -1715,12 +1723,12 @@ class RecordingServiceRegistry(ServiceRegistry):
         domain, service = domain.lower(), service.lower()
         data = dict(service_data or {})
         self._on_call(domain, service, data, target, context)
-        self._hass.bus.async_fire_internal(
+        self._sandbox_hass.bus.async_fire(
             EVENT_CALL_SERVICE,
             {ATTR_DOMAIN: domain, ATTR_SERVICE: service, ATTR_SERVICE_DATA: {**data, **(target or {})}},
             context=context,
         )
         if blocking and domain not in _INSTANT_DOMAINS and f"{domain}.{service}" not in _INSTANT_SERVICES:
-            when_idle = getattr(self._hass.loop, "when_idle", None)
+            when_idle = getattr(self._sandbox_hass.loop, "when_idle", None)
             await (when_idle() if when_idle is not None else asyncio.sleep(0))
         return {} if return_response else None

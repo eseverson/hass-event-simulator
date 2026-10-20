@@ -12,7 +12,7 @@ The loop's virtual time is the scenario's wall-clock Unix timestamp (`VirtualClo
 
 What `patch_homeassistant_clock` patches, and why
 ------------------------------------------------
-HA reads wall time through a handful of module-level functions (the same seams HA's own tests patch in `tests/common.py::_async_fire_time_changed` and `tests/patch_time.py`):
+This process is the sandbox child (see the package docstring): the patches only ever apply to its own throwaway Home Assistant. HA reads wall time through a handful of module-level functions, the same seams HA's own test harness patches: core's `tests/patch_time.py` rebinds `dt_util.utcnow`, `util.utcnow` and `helpers.event.time_tracker_utcnow` at import, and `tests/common.py::_async_fire_time_changed` patches `time_tracker_utcnow` / `time_tracker_timestamp` while it runs the loop's due `TimerHandle`s (both shipped to custom integrations as `pytest_homeassistant_custom_component.patch_time` / `.common`):
 
 - `homeassistant.util.dt.utcnow` — the main "now" for triggers, conditions, templates (`utcnow()`), traces, the sun helpers and `Script` (which binds it at import via `from homeassistant.util.dt import utcnow`).
 - `homeassistant.util.dt.now` — calls `datetime.now(tz)` directly rather than `utcnow`, so it needs its own patch; used by time triggers, `time` conditions and the `now()` template.
@@ -92,6 +92,7 @@ class VirtualTimeEventLoop(asyncio.SelectorEventLoop):
         super().__init__(selector)
         selector.loop = self
         self._now = float(start)
+        # asyncio's own attribute (set in `BaseEventLoop.__init__`, read by `_run_once` to pop due timers), widened for epoch-scale virtual time; on a Python without it this is inert and only sub-microsecond timers could spin.
         self._clock_resolution = _CLOCK_RESOLUTION
         self._real_work = 0
         self._real_work_lock = threading.Lock()
@@ -129,6 +130,7 @@ class VirtualTimeEventLoop(asyncio.SelectorEventLoop):
     def _jump(self, timeout: float) -> None:
         """Advance virtual time to the earliest scheduled timer (or by `timeout`)."""
         target = self._now + timeout
+        # asyncio's timer heap, read the way HA's `util/async_.py::get_scheduled_timer_handles` (used by its test harness above) reads it; without it the jump is by `timeout`, which asyncio computed from that same heap.
         scheduled = getattr(self, "_scheduled", None)
         if scheduled:
             # Land exactly on the timer's `when` rather than now + (when - now), which can be off by a rounding step.
@@ -140,7 +142,8 @@ class VirtualTimeEventLoop(asyncio.SelectorEventLoop):
         self._vt_default_executor = executor
 
     def run_in_executor(self, executor: Any, func: Callable[..., Any], *args: Any) -> asyncio.Future[Any]:
-        self._check_closed()
+        if self.is_closed():
+            raise RuntimeError("Event loop is closed")
         if executor is None:
             if self._vt_default_executor is None:
                 self.set_default_executor(concurrent.futures.ThreadPoolExecutor(thread_name_prefix="asyncio"))

@@ -35,6 +35,7 @@ def _seed_zha(hass: HomeAssistant, devices: dict[str, dict[str, Any]]) -> None:
     """ZHA's trigger cache, its fallback when the gateway has no such device (here: no gateway at all)."""
     from homeassistant.components.zha.helpers import get_zha_data  # noqa: PLC0415 - only when a scenario has zha device triggers
 
+    # Only the sandbox child's own throwaway Home Assistant, never the live one. This is the cache ZHA's own `async_setup_entry` (`components/zha/__init__.py`, "Load and cache device trigger information early") fills from the device registry so device triggers attach before, or without, a radio; ZHA's `device_trigger` reads it unmodified.
     cache = get_zha_data(hass).device_trigger_cache
     for device_id, payload in devices.items():
         cache[device_id] = (payload["ieee"], {(t["type"], t["subtype"]): t["data"] for t in payload["triggers"]})
