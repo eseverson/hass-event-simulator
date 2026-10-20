@@ -19,6 +19,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 import voluptuous as vol
 
+# Automation entities and their `raw_config` / `referenced_entities`, read as core's automation integration reads them itself: its `automation/config` websocket (`websocket_config` in homeassistant/components/automation/__init__.py) and `automations_with_entity` / `_automations_with_x` there. Read only.
 from homeassistant.components.automation import DATA_COMPONENT
 from homeassistant.components.labs.const import LABS_DATA
 from homeassistant.components.recorder import get_instance
@@ -42,6 +43,7 @@ from homeassistant.helpers.recorder import session_scope
 from homeassistant.helpers.template import Template, is_template_string
 from homeassistant.util import dt as dt_util
 from homeassistant.util.json import json_loads
+from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
 
 from .sandbox.calendars import MAX_CALENDAR_EVENTS, MAX_CALENDARS, events_from_states, merge_events, parse_event
 
@@ -139,12 +141,18 @@ def async_core_config(hass: HomeAssistant) -> dict[str, Any]:
         "latitude": config.latitude,
         "longitude": config.longitude,
         "elevation": config.elevation,
-        "unit_system": config.units._name,  # noqa: SLF001 - the name core config stores
+        "unit_system": _unit_system_name(config.units),
         "preview_features": _enabled_preview_features(hass),
     }
 
 
+def _unit_system_name(units: Any) -> str:
+    """The `unit_system` name core config takes for these units (`homeassistant.util.unit_system.get_unit_system`): core only ever holds one of its two singletons."""
+    return "us_customary" if units is US_CUSTOMARY_SYSTEM else "metric"
+
+
 def _enabled_preview_features(hass: HomeAssistant) -> list[list[str]]:
+    """Every enabled Labs preview feature: the sandbox mirrors them all, and Labs' public `async_is_preview_feature_enabled` only answers for one named feature, with no public way to list them. This reads the same set that helper and Labs' own `labs/list` websocket (`websocket_list_preview_features` in homeassistant/components/labs/websocket_api.py) read, without changing it."""
     if (labs_data := hass.data.get(LABS_DATA)) is None:
         return []
     return sorted(
@@ -603,23 +611,10 @@ def async_registry_snapshot(
             for device in devices.values()
             if not getattr(device, "parent_device_id", None)
         ],
-        # Areas, floors and labels have no per-entry storage form; their registries'
-        # save data is small and filtered here.
-        "areas": [
-            area
-            for area in area_reg._data_to_save()["areas"]  # noqa: SLF001
-            if area["id"] in area_ids
-        ],
-        "floors": [
-            floor
-            for floor in floor_reg._data_to_save()["floors"]  # noqa: SLF001
-            if floor["floor_id"] in floor_ids
-        ],
-        "labels": [
-            label
-            for label in label_reg._data_to_save()["labels"]  # noqa: SLF001
-            if label["label_id"] in label_ids
-        ],
+        # Areas, floors and labels have no per-entry storage form (no `as_storage_fragment`); their registries' save data is small and filtered here.
+        "areas": [area for area in _saved(area_reg)["areas"] if area["id"] in area_ids],
+        "floors": [floor for floor in _saved(floor_reg)["floors"] if floor["floor_id"] in floor_ids],
+        "labels": [label for label in _saved(label_reg)["labels"] if label["label_id"] in label_ids],
         "config_entries": [
             {"entry_id": entry.entry_id, "domain": entry.domain, "title": entry.title}
             for entry_id in sorted(entry_ids)
@@ -642,8 +637,15 @@ def async_registry_snapshot(
 
 def _store_data(registry: Any, *skip: str) -> dict[str, Any]:
     """A registry's save data other than the `skip` keys (its entry lists, which the snapshot filters)."""
-    data = registry._data_to_save()  # noqa: SLF001
-    return {key: _fragment(value) for key, value in data.items() if key not in skip}
+    return {key: _fragment(value) for key, value in _saved(registry).items() if key not in skip}
+
+
+def _saved(registry: Any) -> dict[str, Any]:
+    """What the registry would write to its store, built in memory (the `.storage` file is not read), read only, and used only to seed the sandbox's throwaway config dir.
+
+    The sandbox loads its registries through their normal load path, so the snapshot must be in exactly the store format this Home Assistant loads; re-serializing the public entry fields would drift from it on every `STORAGE_VERSION` bump, and area, floor and label entries have no `as_storage_fragment` as entity and device entries do.
+    """
+    return registry._data_to_save()  # noqa: SLF001 - the registry's own store format, see the docstring
 
 
 def _fragment(fragment: Any) -> dict[str, Any]:

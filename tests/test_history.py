@@ -487,6 +487,12 @@ async def test_bus_events_in_the_window_without_home_assistant_bookkeeping(hass:
     assert [e["event_type"] for e in only["bus_events"]] == ["tag_scanned"]
 
 
+async def test_core_config_names_the_metric_system(hass: HomeAssistant):
+    await hass.config.async_update(unit_system="metric")
+
+    assert history.async_core_config(hass)["unit_system"] == "metric"
+
+
 async def test_a_recorder_read_that_fails_is_a_readable_error(hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch):
     """A database error, or a recorder schema this code does not expect, surfaces as `recorder_failed` rather than a traceback."""
 
