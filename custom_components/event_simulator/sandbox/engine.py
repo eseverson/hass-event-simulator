@@ -291,6 +291,7 @@ def run_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
 
     random.seed(parsed.seed)
     clock = VirtualClock(parsed.start - BOOT_LEAD)
+    # In `TMPDIR`, which the runner points at its scratch dir: removed below, and with that dir if the child is killed before this cleanup runs.
     config_dir = tempfile.mkdtemp(prefix="event_simulator_")
     try:
         _write_registry_storage(config_dir, parsed.registry, parsed.start - BOOT_LEAD)

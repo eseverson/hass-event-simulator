@@ -228,6 +228,25 @@ async def test_child_gets_a_minimal_environment(
     assert set(result["env"]) <= set(runner.ENV_PASSTHROUGH) | {"LC_CTYPE"}
     assert result["cwd"] != os.getcwd()
     assert not os.path.exists(result["cwd"])  # the scratch directory is removed afterwards
+    assert result["env"]["TMPDIR"] == result["cwd"]
+
+
+async def test_a_killed_child_leaves_no_temp_dir(hass: HomeAssistant):
+    """The child's temp files live in the scratch dir, so they go with it even when the child never gets to clean up."""
+    child = fake_child(
+        """
+        import os, signal, sys, tempfile
+        print("tmp", tempfile.mkdtemp(prefix="event_simulator_"), file=sys.stderr, flush=True)
+        os.kill(os.getpid(), signal.SIGKILL)
+        """
+    )
+
+    with pytest.raises(SandboxError) as caught:
+        await async_run_scenario(hass, SCENARIO, timeout=30, command=child)
+
+    left = caught.value.stderr_tail.split()[1]
+    assert os.path.basename(left).startswith("event_simulator_")
+    assert not os.path.exists(left)
 
 
 async def test_concurrent_replays_are_capped(hass: HomeAssistant, tmp_path: Path):

@@ -2,7 +2,7 @@
 
 The child (`sandbox/`, started with `sandbox.child_command()`) reads the scenario JSON on stdin and writes one result JSON on stdout; see the design spec. This module owns everything that can go wrong around that: a child that hangs (wall-clock timeout, then killed), crashes (nonzero exit, surfaced with the tail of its stderr), prints something that is not a result, or floods its output. A cancelled caller (the websocket client went away, Home Assistant is stopping) kills the child too, so no replay outlives the request that started it.
 
-The child gets a minimal environment and a scratch working directory, so nothing the live process holds in its environment (supervisor tokens, credentials) reaches it.
+The child gets a minimal environment and a scratch working directory, so nothing the live process holds in its environment (supervisor tokens, credentials) reaches it. The scratch directory is also its `TMPDIR`, so the temporary config dir it boots in is removed with it even when the child is killed before its own cleanup runs.
 """
 
 from __future__ import annotations
@@ -102,9 +102,12 @@ async def async_run_scenario(
             await hass.async_add_executor_job(shutil.rmtree, cwd, True)
 
 
-def child_env(hass: HomeAssistant) -> dict[str, str]:
-    """The child's environment: the passthrough variables, plus Home Assistant's `deps` dir when packages live there."""
+def child_env(hass: HomeAssistant, scratch: str | None = None) -> dict[str, str]:
+    """The child's environment: the passthrough variables, plus Home Assistant's `deps` dir when packages live there, and `scratch` as its `TMPDIR`."""
     env = {key: os.environ[key] for key in ENV_PASSTHROUGH if key in os.environ}
+    if scratch is not None:
+        # A SIGKILLed child (timeout, flood, cancel) never runs its own cleanup: whatever it put in its temp dir goes with the scratch dir.
+        env["TMPDIR"] = scratch
     deps = hass.config.path("deps")
     if deps in sys.path:
         env["PYTHONPATH"] = os.pathsep.join(filter(None, (deps, env.get("PYTHONPATH"))))
@@ -123,7 +126,7 @@ async def _async_run(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
-        env=child_env(hass),
+        env=child_env(hass, cwd),
         # Its own process group, so a kill reaches anything it started and a Ctrl-C meant for Home Assistant does not reach it.
         start_new_session=True,
     )
