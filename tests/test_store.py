@@ -206,47 +206,6 @@ async def test_scenarios_are_stored_packed(store: ScenarioStore, hass_storage):
     assert stored["data"]["scenarios"][saved["scenario_id"]]["events"] == pack_events(SCENARIO["events"])
 
 
-def _week_of_power(count: int) -> list[dict[str, Any]]:
-    """A chatty sensor: a recorded change every 15 s, as history.async_get_timeline returns it."""
-    events = []
-    for i in range(count):
-        at = f"2026-10-04T{i * 15 // 3600 % 24:02d}:{i * 15 // 60 % 60:02d}:{i * 15 % 60:02d}.123456+00:00"
-        events.append(
-            {
-                "at": at,
-                "entity_id": "sensor.power",
-                "state": f"{300 + i % 997 / 10:.1f}",
-                "attributes": {"unit_of_measurement": "W", "device_class": "power", "friendly_name": "House power"},
-                "last_changed": at,
-                "last_updated": at,
-            }
-        )
-    return events
-
-
-async def test_a_version_1_store_is_migrated_to_packed_events(hass: HomeAssistant, hass_storage):
-    """Scenarios saved before events were packed load, read back the same, and are rewritten packed on the next save."""
-    old = {**SCENARIO, "events": [*SCENARIO["events"], *_week_of_power(3)]}
-    hass_storage[STORAGE_KEY] = {
-        "version": 1,
-        "minor_version": 1,
-        "key": STORAGE_KEY,
-        "data": {"scenarios": {"01OLD": {**old, "scenario_id": "01OLD", "created": "c", "updated": "u"}}},
-    }
-    store = ScenarioStore(hass)
-    await store.async_load()
-
-    scenario = store.get("01OLD")
-    assert unpack_events(scenario["events"]) == old["events"]
-    assert {k: scenario[k] for k in SCENARIO if k != "events"} == {k: SCENARIO[k] for k in SCENARIO if k != "events"}
-    assert store.summaries()[0]["event_count"] == 4
-
-    await store.async_save_scenario({**SCENARIO, "name": "new"})
-    stored = hass_storage[STORAGE_KEY]
-    assert stored["version"] == 2
-    assert stored["data"]["scenarios"]["01OLD"]["events"] == pack_events(old["events"])
-
-
 async def test_save_refuses_once_the_store_holds_too_many_events(store: ScenarioStore):
     """Every save rewrites the whole store file, so the total is capped as well as each scenario."""
     events = SCENARIO["events"] * 3

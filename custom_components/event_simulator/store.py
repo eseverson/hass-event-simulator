@@ -31,7 +31,7 @@ from .packed import event_count, pack_events, unpack_events
 from .suggest.labels import ANCHORS, KINDS
 
 STORAGE_KEY = f"{DOMAIN}.scenarios"
-# 2: events packed (version 1 kept them as a plain list).
+# 2: events packed. Version 1 (a plain event list) was never released, so there is no migration from it.
 STORAGE_VERSION = 2
 
 MAX_SCENARIOS = 100
@@ -186,21 +186,6 @@ _BODY_KEYS = tuple(
 )
 
 
-class _ScenarioFile(Store[dict[str, Any]]):
-    """The store file, migrated forward on load."""
-
-    async def _async_migrate_func(
-        self, old_major_version: int, old_minor_version: int, old_data: dict[str, Any]
-    ) -> dict[str, Any]:
-        scenarios = dict(old_data.get("scenarios") or {})
-        if old_major_version < 2:
-            for scenario_id, scenario in scenarios.items():
-                events = scenario.get("events")
-                if isinstance(events, list):
-                    scenarios[scenario_id] = {**scenario, "events": pack_events(events)}
-        return {**old_data, "scenarios": scenarios}
-
-
 class ScenarioStore:
     """Load, save and delete named scenarios, keyed by a generated id.
 
@@ -209,7 +194,7 @@ class ScenarioStore:
 
     def __init__(self, hass: HomeAssistant) -> None:
         self._hass = hass
-        self._store = _ScenarioFile(hass, STORAGE_VERSION, STORAGE_KEY)
+        self._store: Store[dict[str, Any]] = Store(hass, STORAGE_VERSION, STORAGE_KEY)
         self._scenarios: dict[str, dict[str, Any]] = {}
 
     async def async_load(self) -> None:
