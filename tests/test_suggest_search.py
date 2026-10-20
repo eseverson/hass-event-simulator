@@ -10,6 +10,8 @@ import random
 import time
 from datetime import UTC, date, datetime, timedelta
 
+import pytest
+
 from homeassistant.components.automation.config import async_validate_config_item
 from homeassistant.core import HomeAssistant
 
@@ -31,7 +33,9 @@ from custom_components.event_simulator.suggest.score import score_candidate
 from custom_components.event_simulator.suggest.search import (
     KIND_COVERAGE,
     MAX_CARDS,
+    SuggestCancelled,
     SuggestOptions,
+    _Search,
     clock_triggers,
     dedupe,
     describe,
@@ -1051,9 +1055,8 @@ def test_a_chatty_timestamp_sensor_meeting_labels_by_chance_is_not_suggested():
 INDOOR_T, OUTDOOR_T = "sensor.living_room_temperature", "sensor.outdoor_temperature_2"
 
 
-def test_labels_at_one_sensor_rising_above_another_name_the_template_it_needs():
-    """Open the windows when it gets warmer inside than outside: both drift, so no threshold on either is the moment."""
-    rng = random.Random(41)
+def warmer_inside(rng):
+    """Inside drifts, outside follows the day: the moments it gets warmer inside than outside, which no threshold on either sensor is."""
     days = 4
     unit = {"unit_of_measurement": "°C"}
     changes = []
@@ -1070,7 +1073,12 @@ def test_labels_at_one_sensor_rising_above_another_name_the_template_it_needs():
             anchors.append(at + 1)
         previous = warmer
     assert len(anchors) >= 3
-    tl = with_states(timeline({}, [], days), {INDOOR_T: ("21.0", unit), OUTDOOR_T: ("15.0", unit)}, changes)
+    return with_states(timeline({}, [], days), {INDOOR_T: ("21.0", unit), OUTDOOR_T: ("15.0", unit)}, changes), anchors
+
+
+def test_labels_at_one_sensor_rising_above_another_name_the_template_it_needs():
+    """Open the windows when it gets warmer inside than outside: both drift, so no threshold on either is the moment."""
+    tl, anchors = warmer_inside(random.Random(41))
     result = run(tl, Labels([fire(at) for at in anchors]))
     note = f"The labeled moments line up with {INDOOR_T} rising above {OUTDOOR_T}; that needs a template trigger"
     assert note in top(result).explanation, top(result).explanation
@@ -1083,3 +1091,47 @@ def test_no_template_note_when_a_suggestion_already_fits():
     tl, anchors = boot_dryer(random.Random(38))
     result = run(tl, Labels([fire(at) for at in anchors[:3]]))
     assert "template" not in top(result).explanation
+
+
+# Cancellation: `should_stop` is polled inside the hot loops, not only between them
+
+
+def stop_once_inside(monkeypatch: pytest.MonkeyPatch, method: str) -> tuple[list[bool], object]:
+    """A `should_stop` that turns true once `_Search.<method>` is entered, and whether `SuggestCancelled` then came out of that method."""
+    entered, raised = [False], []
+    original = getattr(_Search, method)
+
+    def wrapped(self, *args, **kwargs):
+        entered[0] = True
+        try:
+            return original(self, *args, **kwargs)
+        except SuggestCancelled:
+            raised.append(True)
+            raise
+
+    monkeypatch.setattr(_Search, method, wrapped)
+    return raised, lambda: entered[0]
+
+
+def test_the_trigger_search_stops_inside_its_loops(monkeypatch: pytest.MonkeyPatch):
+    tl, labels, sun = door_after_sunset(random.Random(7))
+    raised, should_stop = stop_once_inside(monkeypatch, "side")
+    with pytest.raises(SuggestCancelled):
+        suggest(tl, labels, time_zone="UTC", sun_events=sun, should_stop=should_stop)
+    assert raised
+
+
+def test_the_relation_search_stops_inside_its_loops(monkeypatch: pytest.MonkeyPatch):
+    tl, anchors = warmer_inside(random.Random(41))
+    raised, should_stop = stop_once_inside(monkeypatch, "relation")
+    with pytest.raises(SuggestCancelled):
+        suggest(tl, Labels([fire(at) for at in anchors]), time_zone="UTC", should_stop=should_stop)
+    assert raised
+
+
+def test_growing_conditions_stops_inside_its_loops(monkeypatch: pytest.MonkeyPatch):
+    tl, labels, sun = door_after_sunset(random.Random(7))
+    raised, should_stop = stop_once_inside(monkeypatch, "grow")
+    with pytest.raises(SuggestCancelled):
+        suggest(tl, labels, time_zone="UTC", sun_events=sun, should_stop=should_stop)
+    assert raised

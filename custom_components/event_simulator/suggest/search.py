@@ -891,9 +891,15 @@ def _event_pair_order(pair: tuple[str, Any]) -> tuple[Any, ...]:
     return (EVENT_KEYS.index(key) if key in EVENT_KEYS else len(EVENT_KEYS), key, str(pair[1]))
 
 
+def _never_stop() -> None:
+    pass
+
+
 class _Search:
-    def __init__(self, timeline: Timeline, labels: Labels, evaluator: Evaluator, options: SuggestOptions) -> None:
+    def __init__(self, timeline: Timeline, labels: Labels, evaluator: Evaluator, options: SuggestOptions, check: Callable[[], None] = _never_stop) -> None:
         self.timeline = timeline
+        # Raises `SuggestCancelled` once `suggest`'s `should_stop` says so: polled once per trigger, pair or condition step in the hot loops, so a client that went away frees the executor thread within one evaluation.
+        self.check = check
         self.labels = labels
         self.ev = evaluator
         self.options = options
@@ -955,6 +961,7 @@ class _Search:
     def triggers(self, anchors: Sequence[Anchor], trigger_id: str | None, min_hits: int) -> set[Trigger]:
         found: set[Trigger] = set()
         for entity_id in self.timeline.entity_ids:
+            self.check()
             if self.is_numeric(entity_id):
                 found |= self._numeric_triggers(entity_id, anchors, trigger_id, min_hits)
             else:
@@ -1153,6 +1160,7 @@ class _Search:
             members = [e for e in group if e in entities]
             for k, a in enumerate(members):
                 for b in members[k + 1 :]:
+                    self.check()
                     sa, sb = self.timeline[a], self.timeline[b]
                     # Around the anchors first (cheap), the whole window only for a pair crossing near enough of them.
                     near = [0, 0]
@@ -1439,6 +1447,7 @@ class _Search:
         min_hits = max(1, math.ceil(len(anchors) * self.options.min_recall))
         screened = []
         for trigger in self.triggers(anchors, trigger_id, min_hits):
+            self.check()
             hits, must_not, near, unlabeled, fires = self.screen(trigger, anchors)
             if hits:
                 single = Candidate((trigger,))
@@ -1526,6 +1535,7 @@ class _Search:
 
         def info(trigger: Trigger) -> _Part:
             if (found := memo.get(trigger)) is None:
+                self.check()
                 found = memo[trigger] = self._part(trigger, anchors)
             return found
 
@@ -1746,6 +1756,7 @@ class _Search:
         for condition in self.condition_pool(
             [fires[j].at for j in good], [fires[j].at for j in chosen if kinds[j] in ("no_fire", "unlabeled")]
         ):
+            self.check()
             if labels.while_periods and not self._while_ok(condition):
                 continue
             bits = "".join("1" if self.ev.condition_holds(condition, t) else "0" for t in reversed(times))
@@ -1758,6 +1769,7 @@ class _Search:
         for _ in range(self.options.max_conditions):
             grown = []
             for conditions, m in frontier:
+                self.check()
                 bad_nf, bad_near, bad_far = ((m & mask).bit_count() for mask in (must_not_mask, near_mask, far_mask))
                 options = []
                 for condition, cm in pool:
@@ -1993,7 +2005,7 @@ def suggest(
 ) -> SuggestResult:
     """Search candidate automations that fire at the labeled anchors and nowhere they should not; see the module docstring.
 
-    `should_stop` is polled between trigger searches; when it returns True the search raises `SuggestCancelled` (it runs in an executor thread, which cannot be cancelled from outside). `taken` are entity ids that exist already (besides the timeline's): a helper a suggestion needs never gets one (`helper_names`).
+    `should_stop` is polled between trigger searches and inside their loops (`_Search.check`); when it returns True the search raises `SuggestCancelled` (it runs in an executor thread, which cannot be cancelled from outside). `taken` are entity ids that exist already (besides the timeline's): a helper a suggestion needs never gets one (`helper_names`).
     """
     options = options or SuggestOptions()
 
@@ -2008,7 +2020,7 @@ def suggest(
     if not labels.anchors:
         return SuggestResult()
     evaluator = Evaluator(timeline, time_zone=time_zone, sun_events=sun_events)
-    search = _Search(timeline, labels, evaluator, options)
+    search = _Search(timeline, labels, evaluator, options, check)
     anchors = labels.anchors
     paired = any(label.anchor == "both" for label in labels.fire_periods)
     starts = [a for a in anchors if a.edge == "start"]
