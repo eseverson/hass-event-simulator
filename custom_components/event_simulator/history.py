@@ -15,12 +15,14 @@ import re
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 import voluptuous as vol
 
 from homeassistant.components.automation import DATA_COMPONENT
 from homeassistant.components.labs.const import LABS_DATA
 from homeassistant.components.recorder import get_instance
+# The recorder has no public API for reading bus events by type over a window, or a state row's own timestamps, so the tables are queried read-only, as core's logbook does (homeassistant/components/logbook/queries/common.py selects over these same `Events` / `EventTypes` / `EventData` models, and logbook/processor.py resolves ids with `states_meta_manager.get_many`). A schema this code does not expect surfaces as a `recorder_failed` SimulatorError, not a traceback.
 from homeassistant.components.recorder.db_schema import EventData, Events, EventTypes, States
 from homeassistant.components.recorder.history import (
     get_significant_states_with_session,
@@ -388,7 +390,10 @@ def _read_bus_events(
     hass: HomeAssistant, start: datetime, end: datetime, wanted: set[str] | None, max_events: int
 ) -> dict[str, Any]:
     """Recorder executor: `async_get_bus_events`'s result (see `_query_bus_events`)."""
-    rows, dropped = _query_bus_events(hass, start, end, wanted, max_events)
+    try:
+        rows, dropped = _query_bus_events(hass, start, end, wanted, max_events)
+    except SQLAlchemyError as err:
+        raise _recorder_failed(err) from err
     return {
         "bus_events": [
             {"at": dt_util.utc_from_timestamp(at).isoformat(), "event_type": event_type, "data": data}
@@ -683,24 +688,32 @@ def _read_recorder(
     Both reads share one session so the timestamps describe the same rows the
     start states came from.
     """
-    with session_scope(hass=hass, read_only=True) as session:
-        states = get_significant_states_with_session(
-            hass,
-            session,
-            start,
-            end,
-            entity_ids,
-            include_start_time_state=True,
-            significant_changes_only=False,
-            minimal_response=False,
-            no_attributes=False,
-        )
-        starting = [
-            entity_id
-            for entity_id, entity_states in states.items()
-            if entity_states and entity_states[0].last_updated <= start
-        ]
-        return states, _start_state_stamps(hass, session, starting, start)
+    try:
+        with session_scope(hass=hass, read_only=True) as session:
+            states = get_significant_states_with_session(
+                hass,
+                session,
+                start,
+                end,
+                entity_ids,
+                include_start_time_state=True,
+                significant_changes_only=False,
+                minimal_response=False,
+                no_attributes=False,
+            )
+            starting = [
+                entity_id
+                for entity_id, entity_states in states.items()
+                if entity_states and entity_states[0].last_updated <= start
+            ]
+            return states, _start_state_stamps(hass, session, starting, start)
+    except SQLAlchemyError as err:
+        raise _recorder_failed(err) from err
+
+
+def _recorder_failed(err: SQLAlchemyError) -> SimulatorError:
+    """A recorder read that failed (a database error, or a schema this code does not expect), as a readable error."""
+    return SimulatorError("recorder_failed", f"The recorder database could not be read: {type(err).__name__}: {err}")
 
 
 def _start_state_stamps(

@@ -9,6 +9,7 @@ import pytest
 from pytest_homeassistant_custom_component.components.recorder.common import (
     async_wait_recording_done,
 )
+from sqlalchemy.exc import OperationalError
 
 from homeassistant.components import labs
 from homeassistant.core import HomeAssistant
@@ -484,3 +485,23 @@ async def test_bus_events_in_the_window_without_home_assistant_bookkeeping(hass:
     # Only some types.
     only = await history.async_get_bus_events(hass, start, start + timedelta(hours=1), event_types=["tag_scanned", "call_service"])
     assert [e["event_type"] for e in only["bus_events"]] == ["tag_scanned"]
+
+
+async def test_a_recorder_read_that_fails_is_a_readable_error(hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch):
+    """A database error, or a recorder schema this code does not expect, surfaces as `recorder_failed` rather than a traceback."""
+
+    def broken(*args, **kwargs):
+        raise OperationalError("SELECT", {}, Exception("no such column: events.time_fired_ts"))
+
+    monkeypatch.setattr(history, "get_significant_states_with_session", broken)
+    monkeypatch.setattr(history, "_query_bus_events", broken)
+    start = dt_util.utcnow() - timedelta(hours=2)
+
+    with pytest.raises(SimulatorError) as err:
+        await history.async_get_timeline(hass, ["sensor.x"], start, start + timedelta(hours=1))
+    assert err.value.code == "recorder_failed"
+    assert "no such column" in str(err.value)
+
+    with pytest.raises(SimulatorError) as err:
+        await history.async_get_bus_events(hass, start, start + timedelta(hours=1))
+    assert err.value.code == "recorder_failed"
