@@ -229,6 +229,7 @@ class Timeline:
         self.end = end
         self._entities = entities
         self._bus = bus_events or {}
+        # Home Assistant passes its loaded tzinfo (`dt_util.get_default_time_zone()`); a name is for tests and offline use. All of this runs in an executor thread.
         self.tz = ZoneInfo(time_zone) if isinstance(time_zone, str) else time_zone or UTC
         self._calendars: dict[str, CalendarEvents | None] = {
             entity_id: CalendarEvents.build(entity_id, events, self.tz) for entity_id, events in (calendars or {}).items()
@@ -284,6 +285,7 @@ class Timeline:
                 found = bus[event_type] = BusEvents(event_type, [], [])
             found.times.append(at)
             found.data.append(event.get("data") or {})
+        # As in `__init__`: a loaded tzinfo from Home Assistant, a name only from tests and offline use; executor thread either way.
         tz = ZoneInfo(time_zone) if isinstance(time_zone, str) else time_zone or UTC
         return cls(start_ts, end_ts, entities, bus, parse_calendars(calendars, tz), tz)
 

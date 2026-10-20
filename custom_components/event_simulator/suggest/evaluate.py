@@ -106,6 +106,7 @@ class Evaluator:
         self.timeline = timeline
         self.start = timeline.start
         self.end = timeline.end
+        # Home Assistant passes its loaded tzinfo (`dt_util.get_default_time_zone()`); a name is for tests and offline use. All of this runs in an executor thread.
         self.tz = ZoneInfo(time_zone) if isinstance(time_zone, str) else time_zone
         self._sun_events = sun_events
         self._sun_cache: dict[date, tuple[float | None, float | None]] = {}
