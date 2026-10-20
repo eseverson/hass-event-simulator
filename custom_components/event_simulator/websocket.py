@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import date, datetime
+from datetime import date, datetime, tzinfo
 from functools import partial
 import logging
 import threading
@@ -492,7 +492,7 @@ async def async_suggest(
             end,
             msg["labels"],
             msg["options"],
-            hass.config.time_zone,
+            dt_util.get_default_time_zone(),
             async_sun_events(hass),
             stop.is_set,
             taken,
@@ -527,7 +527,7 @@ def _mine(
     end: datetime,
     raw_labels: list[dict[str, Any]],
     options: dict[str, Any],
-    time_zone: str,
+    time_zone: str | tzinfo,
     sun_events: Callable[[date], dict[str, datetime | None]],
     should_stop: Callable[[], bool],
     taken: frozenset[str] = frozenset(),
