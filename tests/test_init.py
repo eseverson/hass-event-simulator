@@ -85,11 +85,22 @@ def test_module_url_changes_when_the_panel_file_changes(tmp_path: Path):
     assert first != second
 
 
-async def test_panel_module_is_served_with_revalidation(hass: HomeAssistant, setup, hass_client):
-    client = await hass_client()
+async def test_panel_module_is_served_cached_at_its_versioned_url(hass: HomeAssistant, setup, hass_client_no_auth):
+    """A static path, loaded by `<script type="module">` without a token; the URL changes with the file, so a month of caching is safe."""
+    module_url = hass.data[DATA_PANELS][PANEL_URL_PATH].config["_panel_custom"]["module_url"]
+    client = await hass_client_no_auth()
 
-    resp = await client.get(f"{PANEL_STATIC_URL}/{PANEL_JS_FILE}")
+    resp = await client.get(module_url)
 
     assert resp.status == 200
-    assert resp.headers["Cache-Control"] == "no-cache"
+    assert "max-age=" in resp.headers["Cache-Control"]
     assert "event-simulator-panel" in await resp.text()
+
+
+async def test_a_reload_registers_the_static_path_once(hass: HomeAssistant, setup, hass_client_no_auth):
+    assert await hass.config_entries.async_reload(setup.entry_id)
+    await hass.async_block_till_done()
+
+    assert setup.state is ConfigEntryState.LOADED
+    resp = await (await hass_client_no_auth()).get(f"{PANEL_STATIC_URL}/{PANEL_JS_FILE}")
+    assert resp.status == 200
