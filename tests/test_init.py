@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,8 @@ from custom_components.event_simulator.const import (
     PANEL_STATIC_URL,
     PANEL_URL_PATH,
 )
+
+VERSION = json.loads((Path(__file__).parents[1] / "custom_components" / DOMAIN / "manifest.json").read_text())["version"]
 
 
 @pytest.fixture
@@ -61,7 +64,7 @@ async def test_setup_registers_an_admin_only_panel(hass: HomeAssistant, setup):
     assert panel.require_admin is True
     config = panel.config["_panel_custom"]
     assert config["name"] == "event-simulator-panel"
-    assert config["module_url"].startswith(f"{PANEL_STATIC_URL}/{PANEL_JS_FILE}?v=0.1.0-")
+    assert config["module_url"].startswith(f"{PANEL_STATIC_URL}/{PANEL_JS_FILE}?v={VERSION}-")
 
 
 async def test_unload_removes_the_panel(hass: HomeAssistant, setup):
