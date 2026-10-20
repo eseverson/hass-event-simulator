@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any
 
 import voluptuous as vol
+from voluptuous.humanize import humanize_error
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
@@ -101,6 +102,14 @@ _BUS_EVENT = vol.Schema(
 # A lane the panel shifted in time: its offset in ms. Its events, wherever they landed, are in `bus_events`.
 _LANE_SHIFT = vol.Schema({vol.Required("offset"): vol.Coerce(int)})
 
+# A scenario's events and bus events, checked one by one in the executor when it is saved (`_checked_timeline`): there can be tens of thousands.
+_EVENTS = vol.Schema([_EVENT])
+_BUS_EVENTS = vol.Schema([_BUS_EVENT])
+# Only the shape of a packed timeline (packed.py) is checked in the websocket schema, which runs on the event loop; its rows are checked when it is unpacked.
+_PACKED_SHAPE = vol.Schema(
+    {vol.Required("entity_ids"): list, vol.Required("attributes"): list, vol.Required("rows"): list}
+)
+
 
 def _check_label(label: dict[str, Any]) -> dict[str, Any]:
     """A period that ends after it starts; a should-fire one anchored (at its start by default), a must-not one not."""
@@ -158,8 +167,8 @@ SCENARIO_FIELDS: dict[vol.Marker, Any] = {
     vol.Required("end"): _aware_iso,
     vol.Optional("entity_ids", default=list): [cv.entity_id],
     vol.Optional("initial_states", default=dict): {cv.entity_id: _STATE},
-    # A plain list, or packed as the panel sends it.
-    vol.Optional("events", default=list): vol.All(vol.Any(list, unpack_events), [_EVENT]),
+    # A plain list, or packed as the panel sends it. Each event is checked when it is saved, in the executor (`_checked_timeline`).
+    vol.Optional("events", default=list): vol.Any(list, _PACKED_SHAPE),
     # Only sent when a track is shifted, and only stored then.
     vol.Optional("track_shifts"): {cv.entity_id: _TRACK_SHIFT},
     # Suggest mode: the labeled periods and the options, stored only when sent non-empty.
@@ -167,8 +176,8 @@ SCENARIO_FIELDS: dict[vol.Marker, Any] = {
     vol.Optional("suggest_options"): _SUGGEST_OPTIONS,
     # The helpers it replays with (a scenario opened from a suggestion that needs one, #42), stored only when sent non-empty.
     vol.Optional("helpers"): HELPERS_SCHEMA,
-    # The lanes' bus events and shifts (#48), sent and stored only when a lane is edited.
-    vol.Optional("bus_events"): [_BUS_EVENT],
+    # The lanes' bus events and shifts (#48), sent and stored only when a lane is edited. Each bus event is checked when it is saved, as the events are.
+    vol.Optional("bus_events"): list,
     vol.Optional("lane_shifts"): {cv.string: _LANE_SHIFT},
 }
 
@@ -200,6 +209,7 @@ class ScenarioStore:
     """
 
     def __init__(self, hass: HomeAssistant) -> None:
+        self._hass = hass
         self._store = _ScenarioFile(hass, STORAGE_VERSION, STORAGE_KEY)
         self._scenarios: dict[str, dict[str, Any]] = {}
 
@@ -225,7 +235,10 @@ class ScenarioStore:
     async def async_save_scenario(
         self, body: dict[str, Any], scenario_id: str | None = None
     ) -> dict[str, Any]:
-        """Create a scenario, or overwrite `scenario_id`; return its summary."""
+        """Create a scenario, or overwrite `scenario_id`; return its summary.
+
+        Refused `invalid_format` when an event or bus event is malformed (they are checked here rather than in the websocket schema, so the work runs in the executor).
+        """
         _check_limits(body)
         now = dt_util.utcnow().isoformat()
         if scenario_id is None:
@@ -250,11 +263,15 @@ class ScenarioStore:
                 f"the others hold {stored} and this one has {count}, so delete some first",
             )
 
+        events, bus_events = await self._hass.async_add_executor_job(
+            _checked_timeline, body.get("events") or [], body.get("bus_events") or []
+        )
         scenario = {
             "scenario_id": scenario_id,
             **{key: body.get(key) for key in _BODY_KEYS},
             **{key: body[key] for key in _OPTIONAL_KEYS if body.get(key)},
-            "events": pack_events(body.get("events") or []),
+            **({"bus_events": bus_events} if bus_events else {}),
+            "events": events,
             "created": created,
             "updated": now,
         }
@@ -285,6 +302,23 @@ def _check_limits(body: dict[str, Any]) -> None:
             "too_large",
             f"A scenario tracks at most {MAX_ENTITIES} entities; this one has {count}",
         )
+
+
+def _checked_timeline(
+    events: list[Any] | dict[str, Any], bus_events: list[Any]
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Executor: a scenario's events checked (`_EVENT`, unpacked first when packed) and packed, and its bus events checked (`_BUS_EVENT`)."""
+    try:
+        if isinstance(events, dict):
+            events = unpack_events(events)
+        checked = _EVENTS(events)
+    except vol.Invalid as err:
+        raise SimulatorError("invalid_format", f"Invalid events: {humanize_error(events, err)}") from err
+    try:
+        checked_bus = _BUS_EVENTS(bus_events)
+    except vol.Invalid as err:
+        raise SimulatorError("invalid_format", f"Invalid bus_events: {humanize_error(bus_events, err)}") from err
+    return pack_events(checked), checked_bus
 
 
 def _stored_count(scenario: dict[str, Any]) -> int:

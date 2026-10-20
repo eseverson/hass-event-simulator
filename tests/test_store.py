@@ -419,11 +419,42 @@ async def test_too_many_bus_events_is_too_large(store: ScenarioStore):
     assert err.value.code == "too_large"
 
 
-def test_bus_events_need_a_type_and_an_aware_time():
+@pytest.mark.parametrize(
+    "bus_event",
+    [
+        {"at": "2026-10-04T07:00:00", "event_type": "x", "data": {}},
+        {"at": "2026-10-04T07:00:00+00:00", "data": {}},
+    ],
+)
+async def test_bus_events_need_a_type_and_an_aware_time(store: ScenarioStore, bus_event: dict[str, Any]):
+    with pytest.raises(SimulatorError) as err:
+        await store.async_save_scenario(_FIELDS({**SCENARIO, "bus_events": [bus_event]}))
+    assert err.value.code == "invalid_format"
+    assert store.summaries() == []
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        [{"at": "2026-10-04T07:12:03", "entity_id": "binary_sensor.door", "state": "on"}],
+        [{"at": "2026-10-04T07:12:03+00:00", "entity_id": "not an entity", "state": "on"}],
+        {"entity_ids": ["binary_sensor.door"], "attributes": [{}], "rows": [["2026-10-04T07:12:03+00:00", 3, "on", 0]]},
+    ],
+)
+async def test_save_checks_each_event_in_the_executor(store: ScenarioStore, events: Any):
+    """The websocket schema checks only the events' shape (it runs on the event loop); each event is checked on save."""
+    body = _FIELDS({**SCENARIO, "events": events})
+    with pytest.raises(SimulatorError) as err:
+        await store.async_save_scenario(body)
+    assert err.value.code == "invalid_format"
+    assert store.summaries() == []
+
+
+def test_the_schema_checks_only_the_shape_of_the_events():
     with pytest.raises(vol.Invalid):
-        _FIELDS({**SCENARIO, "bus_events": [{"at": "2026-10-04T07:00:00", "event_type": "x", "data": {}}]})
+        _FIELDS({**SCENARIO, "events": "not a list"})
     with pytest.raises(vol.Invalid):
-        _FIELDS({**SCENARIO, "bus_events": [{"at": "2026-10-04T07:00:00+00:00", "data": {}}]})
+        _FIELDS({**SCENARIO, "events": {"rows": []}})
 
 
 async def test_bus_events_count_toward_the_stored_total(store: ScenarioStore):

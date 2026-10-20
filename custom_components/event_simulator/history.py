@@ -227,11 +227,23 @@ async def async_get_timeline(
     if not entity_ids:
         return {"initial_states": {}, "events": []}
 
-    states, stamps = await get_instance(hass).async_add_executor_job(
-        partial(_read_recorder, hass, list(entity_ids), start, end)
+    # The live states are read here, on the event loop; everything proportional to the recorded rows runs in the recorder's executor.
+    unrecorded = {entity_id: _unrecorded_attributes(hass, entity_id) for entity_id in entity_ids}
+    return await get_instance(hass).async_add_executor_job(
+        partial(_read_timeline, hass, list(entity_ids), start, end, unrecorded, max_events)
     )
 
-    unrecorded = {entity_id: _unrecorded_attributes(hass, entity_id) for entity_id in states}
+
+def _read_timeline(
+    hass: HomeAssistant,
+    entity_ids: list[str],
+    start: datetime,
+    end: datetime,
+    unrecorded: dict[str, dict[str, Any]],
+    max_events: int,
+) -> dict[str, Any]:
+    """Recorder executor: `async_get_timeline`'s result, refused as `too_many_events` before any event is built."""
+    states, stamps = _read_recorder(hass, entity_ids, start, end)
     initial_states: dict[str, dict[str, Any]] = {}
     changes: list[State] = []
     for entity_id, entity_states in states.items():
@@ -243,7 +255,7 @@ async def async_get_timeline(
                 last_changed, last_updated = stamp
                 initial_states[entity_id] = {
                     "state": state.state,
-                    "attributes": _with_unrecorded(state, unrecorded[entity_id]),
+                    "attributes": _with_unrecorded(state, unrecorded.get(entity_id) or {}),
                     "last_changed": last_changed.isoformat(),
                     "last_updated": last_updated.isoformat(),
                 }
@@ -259,7 +271,7 @@ async def async_get_timeline(
             "at": state.last_updated.isoformat(),
             "entity_id": state.entity_id,
             "state": state.state,
-            "attributes": _with_unrecorded(state, unrecorded[state.entity_id]),
+            "attributes": _with_unrecorded(state, unrecorded.get(state.entity_id) or {}),
             "last_changed": state.last_changed.isoformat(),
             "last_updated": state.last_updated.isoformat(),
         }
@@ -288,16 +300,9 @@ async def async_get_bus_events(
     start, end = dt_util.as_utc(start), dt_util.as_utc(end)
     check_window(start, end, MAX_SUGGEST_WINDOW)
     wanted = None if event_types is None else set(event_types)
-    rows, dropped = await get_instance(hass).async_add_executor_job(
+    return await get_instance(hass).async_add_executor_job(
         partial(_read_bus_events, hass, start, end, wanted, max_events)
     )
-    return {
-        "bus_events": [
-            {"at": dt_util.utc_from_timestamp(at).isoformat(), "event_type": event_type, "data": data}
-            for at, event_type, data in rows
-        ],
-        "dropped_event_types": dropped,
-    }
 
 
 async def async_get_calendar_events(
@@ -321,13 +326,12 @@ async def async_get_calendar_events(
         timeline = await async_get_timeline(hass, ids, start, end, max_window=MAX_SUGGEST_WINDOW)
     tz = dt_util.get_default_time_zone()
     lo, hi = start - CALENDAR_MARGIN, end + CALENDAR_MARGIN
+    # The timeline can hold a Suggest window of state changes, so it is read in the executor.
+    recorded_by_calendar = await hass.async_add_executor_job(_recorded_calendar_events, timeline, ids, tz)
     calendars: dict[str, list[dict[str, Any]]] = {}
     sources: dict[str, dict[str, Any]] = {}
     for entity_id in ids:
-        states = [item.get("attributes") or {} for item in timeline.get("events") or () if item.get("entity_id") == entity_id]
-        if (initial := (timeline.get("initial_states") or {}).get(entity_id)) is not None:
-            states.append(initial.get("attributes") or {})
-        recorded = events_from_states(states, tz)
+        recorded = recorded_by_calendar[entity_id]
         live, error = await _async_calendar_get_events(hass, entity_id, lo, hi, tz)
         merged = [event for event in merge_events(live, recorded, tz) if event.start_local(tz) < hi and event.end_local(tz) >= lo]
         from_calendar = sum(any(event is mine for mine in live) for event in merged)
@@ -337,6 +341,18 @@ async def async_get_calendar_events(
         sources[entity_id] = source
         calendars[entity_id] = [event.as_dict() for event in merged[:MAX_CALENDAR_EVENTS]]
     return {"calendars": calendars, "sources": sources}
+
+
+def _recorded_calendar_events(timeline: dict[str, Any], ids: list[str], tz: Any) -> dict[str, list[Any]]:
+    """Executor: the events each calendar's recorded states in `timeline` name (`events_from_states`), the timeline read in one pass."""
+    states: dict[str, list[dict[str, Any]]] = {entity_id: [] for entity_id in ids}
+    for item in timeline.get("events") or ():
+        if (found := states.get(item.get("entity_id"))) is not None:
+            found.append(item.get("attributes") or {})
+    for entity_id, found in states.items():
+        if (initial := (timeline.get("initial_states") or {}).get(entity_id)) is not None:
+            found.append(initial.get("attributes") or {})
+    return {entity_id: events_from_states(found, tz) for entity_id, found in states.items()}
 
 
 async def _async_calendar_get_events(hass: HomeAssistant, entity_id: str, start: datetime, end: datetime, tz: Any) -> tuple[list[Any], str | None]:
@@ -370,8 +386,22 @@ async def _async_calendar_get_events(hass: HomeAssistant, entity_id: str, start:
 
 def _read_bus_events(
     hass: HomeAssistant, start: datetime, end: datetime, wanted: set[str] | None, max_events: int
+) -> dict[str, Any]:
+    """Recorder executor: `async_get_bus_events`'s result (see `_query_bus_events`)."""
+    rows, dropped = _query_bus_events(hass, start, end, wanted, max_events)
+    return {
+        "bus_events": [
+            {"at": dt_util.utc_from_timestamp(at).isoformat(), "event_type": event_type, "data": data}
+            for at, event_type, data in rows
+        ],
+        "dropped_event_types": dropped,
+    }
+
+
+def _query_bus_events(
+    hass: HomeAssistant, start: datetime, end: datetime, wanted: set[str] | None, max_events: int
 ) -> tuple[list[tuple[float, str, dict[str, Any]]], list[str]]:
-    """Recorder executor: count the window's events by type, keep the quietest types up to `max_events`, and read those."""
+    """Count the window's events by type, keep the quietest types up to `max_events`, and read those."""
     start_ts, end_ts = start.timestamp(), end.timestamp()
     in_window = (Events.time_fired_ts >= start_ts) & (Events.time_fired_ts < end_ts)
     with session_scope(hass=hass, read_only=True) as session:

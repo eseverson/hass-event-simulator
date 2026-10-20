@@ -33,7 +33,7 @@ from .history import (
     SimulatorError,
     check_window,
 )
-from .packed import unpack_events
+from .packed import event_count, unpack_events
 from .runner import SandboxError
 from .store import (
     DATA_STORE,
@@ -277,8 +277,8 @@ SIMULATE_SCENARIO = vol.Schema(
         vol.Optional("core"): dict,
         vol.Optional("services"): dict,
         vol.Optional("initial_states", default=dict): dict,
-        # A plain list, or packed (packed.py) to fit the websocket's 4 MiB message limit.
-        vol.Optional("events", default=list): vol.Any(list, unpack_events),
+        # A plain list, or packed (packed.py) to fit the websocket's 4 MiB message limit; unpacked in the executor (`_scenario_events`).
+        vol.Optional("events", default=list): vol.Any(list, dict),
         # Recorded bus events fired at their times (`event_simulator/bus_events`), for event triggers.
         vol.Optional("bus_events"): vol.All(list, vol.Length(max=MAX_BUS_EVENTS)),
         # Calendar events by calendar (`event_simulator/calendar_events`), for calendar triggers; the child checks each event.
@@ -591,28 +591,16 @@ async def _async_validate(
     replayed = [result.suggestions[n] for n in chosen]
     configs = [{**suggestion.config, "actions": []} for suggestion in replayed]
     entity_ids = sorted(set().union(*(s.candidate.entity_ids for s in replayed)))
-    wanted = set(entity_ids)
     event_types = set().union(*(s.candidate.event_types for s in replayed))
     calendars = set().union(*(s.candidate.calendars for s in replayed))
+    # A Suggest window of state changes is filtered in the executor.
+    read = await hass.async_add_executor_job(_validation_timeline, timeline, set(entity_ids), event_types, calendars)
     scenario = {
         "version": 1,
         "start": start.isoformat(),
         "end": end.isoformat(),
         "automations": configs,
-        "initial_states": {
-            entity_id: state
-            for entity_id, state in timeline["initial_states"].items()
-            if entity_id in wanted
-        },
-        "events": [event for event in timeline["events"] if event["entity_id"] in wanted],
-        "bus_events": [
-            event for event in timeline.get("bus_events") or () if event["event_type"] in event_types
-        ],
-        "calendars": {
-            entity_id: events
-            for entity_id, events in (timeline.get("calendars") or {}).items()
-            if entity_id in calendars
-        },
+        **read,
         # Each helper once: cards needing the same helper share its entity (search.helper_names).
         "helpers": list({helper["entity_id"]: helper for s in replayed for helper in s.helpers}.values()),
         "core": history.async_core_config(hass),
@@ -635,6 +623,28 @@ async def _async_validate(
     return await hass.async_add_executor_job(
         partial(_apply_replay, result, replay, chosen, unchecked, end, capped)
     )
+
+
+def _validation_timeline(
+    timeline: dict[str, Any], wanted: set[str], event_types: set[str], calendars: set[str]
+) -> dict[str, Any]:
+    """Executor: the scenario's `initial_states`, `events`, `bus_events` and `calendars`, only what the replayed suggestions read."""
+    return {
+        "initial_states": {
+            entity_id: state
+            for entity_id, state in timeline["initial_states"].items()
+            if entity_id in wanted
+        },
+        "events": [event for event in timeline["events"] if event["entity_id"] in wanted],
+        "bus_events": [
+            event for event in timeline.get("bus_events") or () if event["event_type"] in event_types
+        ],
+        "calendars": {
+            entity_id: events
+            for entity_id, events in (timeline.get("calendars") or {}).items()
+            if entity_id in calendars
+        },
+    }
 
 
 def _approximate(result: SuggestResult, message: str) -> SuggestResult:
@@ -709,13 +719,12 @@ async def async_simulate(hass: HomeAssistant, scenario: dict[str, Any]) -> dict[
     """
     scenario = dict(scenario)
     check_window(dt_util.parse_datetime(scenario["start"]), dt_util.parse_datetime(scenario["end"]))
-    if (count := len(scenario["events"])) > MAX_EVENTS:
+    if (count := event_count(scenario["events"])) > MAX_EVENTS:
         raise SimulatorError(
             "too_many_events", f"{count} events in the scenario; the limit is {MAX_EVENTS}"
         )
-    entity_ids = set(scenario["initial_states"]) | {
-        event.get("entity_id") for event in scenario["events"] if isinstance(event, dict)
-    }
+    scenario["events"], event_ids = await hass.async_add_executor_job(_scenario_events, scenario["events"])
+    entity_ids = set(scenario["initial_states"]) | set(event_ids)
     if (count := len(entity_ids)) > MAX_ENTITIES:
         raise SimulatorError(
             "too_many_entities", f"{count} entities in the scenario; the limit is {MAX_ENTITIES}"
@@ -729,9 +738,6 @@ async def async_simulate(hass: HomeAssistant, scenario: dict[str, Any]) -> dict[
         # What integration-specific device triggers (zha, ...) read live, for the sandbox to seed (#48).
         scenario["device_triggers"] = await device_triggers.async_export(hass, scenario["automation"])
     if "registry" not in scenario:
-        event_ids = [
-            event.get("entity_id") for event in scenario["events"] if isinstance(event, dict)
-        ]
         timeline_ids = [
             entity_id
             for entity_id in dict.fromkeys([*scenario["initial_states"], *event_ids])
@@ -751,6 +757,16 @@ async def async_simulate(hass: HomeAssistant, scenario: dict[str, Any]) -> dict[
             str(error.get("code") or "sandbox_failed"), str(error.get("message") or "")
         )
     return result
+
+
+def _scenario_events(events: list[Any] | dict[str, Any]) -> tuple[list[Any], list[Any]]:
+    """Executor: a scenario's events, unpacked when packed, and the entity ids they name, in order of first appearance."""
+    if isinstance(events, dict):
+        try:
+            events = unpack_events(events)
+        except vol.Invalid as err:
+            raise SimulatorError("invalid_format", f"The packed events are malformed: {err}") from err
+    return events, list(dict.fromkeys(event.get("entity_id") for event in events if isinstance(event, dict)))
 
 
 def parse_automation_yaml(text: str) -> dict[str, Any]:
