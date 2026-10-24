@@ -2,7 +2,7 @@
 
 [![Release](https://img.shields.io/github/v/release/eseverson/hass-event-simulator?style=flat-square)](https://github.com/eseverson/hass-event-simulator/releases)
 [![License](https://img.shields.io/github/license/eseverson/hass-event-simulator?style=flat-square)](LICENSE)
-[![HACS](https://img.shields.io/badge/HACS-Custom-orange.svg?style=flat-square)](https://hacs.xyz)
+[![HACS](https://img.shields.io/badge/HACS-Default-41BDF5.svg?style=flat-square)](https://hacs.xyz)
 [![Validate](https://img.shields.io/github/actions/workflow/status/eseverson/hass-event-simulator/validate.yml?branch=main&label=validate&style=flat-square)](https://github.com/eseverson/hass-event-simulator/actions/workflows/validate.yml)
 [![Tests](https://img.shields.io/github/actions/workflow/status/eseverson/hass-event-simulator/test.yml?branch=main&label=tests&style=flat-square)](https://github.com/eseverson/hass-event-simulator/actions/workflows/test.yml)
 
@@ -25,9 +25,11 @@ Nothing it does touches the live instance: the replay runs in a separate process
 
 ## Install
 
-Through HACS, add this repository as a custom repository with category **Integration**, then install it. Or copy `custom_components/event_simulator/` into your config directory yourself.
+Search for **Event Simulator** in **Settings → Marketplace** on Home Assistant 2026.11 and newer, or in HACS on older versions, and install it.
 
-Either way:
+If it doesn't show up yet, add this repository as a custom repository with category **Integration** (on 2026.11 and newer, custom repositories need a GitHub connection), or copy `custom_components/event_simulator/` into your config directory yourself.
+
+Then:
 
 1. Restart Home Assistant.
 2. Settings → Devices & services → Add integration → **Event Simulator**.
